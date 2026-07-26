@@ -64,9 +64,235 @@ describe("SQLitePlatformStore", () => {
     });
 
     expect(store.listTaskEvents(task.id, "user-1", 1)).toEqual([
-      expect.objectContaining({ sequence: 2, type: "AGENT_MESSAGE_DELTA" }),
+      expect.objectContaining({
+        sequence: 2,
+        type: "AGENT_MESSAGE_DELTA",
+        itemId: "item-1",
+      }),
     ]);
     expect(store.listTaskEvents(task.id, "user-2", 0)).toBeNull();
+  });
+
+  test("derives stable item boundaries for events without a protocol item id", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Plan boundaries",
+      now: NOW,
+    });
+
+    const first = store.appendTaskEvent({
+      taskId: task.id,
+      threadId: "runtime-thread-1",
+      turnId: "runtime-turn-1",
+      type: "PLAN_UPDATED",
+      payload: { explanation: null, plan: [] },
+      now: NOW,
+    });
+    const second = store.appendTaskEvent({
+      taskId: task.id,
+      threadId: "runtime-thread-1",
+      turnId: "runtime-turn-1",
+      type: "PLAN_UPDATED",
+      payload: { explanation: "next", plan: [] },
+      now: new Date(NOW.getTime() + 1),
+    });
+
+    expect(first.itemId).toBe("plan:runtime-turn-1");
+    expect(second.itemId).toBe(first.itemId);
+  });
+
+  test("fails closed on raw reasoning fields before event persistence", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Reason safely",
+      now: NOW,
+    });
+
+    store.appendTaskEvent({
+      taskId: task.id,
+      threadId: "runtime-thread-1",
+      turnId: "runtime-turn-1",
+      type: "REASONING_SUMMARY_DELTA",
+      payload: {
+        itemId: "reason-1",
+        delta: "Inspect the code.",
+        reasoningTextDelta: "raw secret",
+        content: "raw content",
+        encrypted_content: "ciphertext",
+      } as never,
+      now: NOW,
+    });
+
+    const events = store.listTaskEvents(task.id, "user-1", 0);
+    expect(events).toEqual([
+      expect.objectContaining({
+        payload: { itemId: "reason-1", delta: "Inspect the code." },
+      }),
+    ]);
+    const persisted = database.sqlite
+      .prepare("SELECT payload_json FROM task_events WHERE task_id = ?")
+      .get(task.id);
+    expect(JSON.stringify(persisted)).not.toMatch(
+      /raw secret|raw content|ciphertext|reasoningTextDelta|encrypted_content/,
+    );
+  });
+
+  test("isolates personal settings by Feishu user and never stores shared account config", () => {
+    const defaults = store.getUserSettings("user-1", NOW);
+    const updated = store.patchUserSettings(
+      "user-1",
+      {
+        general: { theme: "DARK" },
+        personalization: { instructions: "Answer concisely." },
+      },
+      new Date(NOW.getTime() + 1),
+    );
+
+    expect(defaults).toMatchObject({
+      general: { language: "zh-CN", theme: "SYSTEM" },
+      execution: { permissionMode: "DEFAULT", approvalPreference: "ASK" },
+    });
+    expect(updated).toMatchObject({
+      general: { theme: "DARK" },
+      personalization: { instructions: "Answer concisely." },
+    });
+    expect(store.getUserSettings("user-2", NOW)).toMatchObject({
+      general: { theme: "SYSTEM" },
+      personalization: { instructions: "" },
+    });
+    const persisted = database.sqlite
+      .prepare("SELECT settings_json FROM user_settings WHERE user_id = 'user-1'")
+      .get();
+    expect(JSON.stringify(persisted)).not.toMatch(/codexHome|accountAlias|rawToml|credential/i);
+  });
+
+  test("upserts observable subagent summaries and enforces parent ownership", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Delegate",
+      now: NOW,
+    });
+
+    store.upsertSubagent({
+      threadId: "agent-thread-1",
+      parentTaskId: task.id,
+      parentRuntimeThreadId: "runtime-thread-1",
+      parentTurnId: "runtime-turn-1",
+      ownerId: "user-1",
+      sessionId: null,
+      name: "Repository audit",
+      role: "subagent",
+      model: "gpt-5",
+      effort: "HIGH",
+      status: "ACTIVE",
+      resultSummary: null,
+      now: NOW,
+    });
+    store.upsertSubagent({
+      threadId: "agent-thread-1",
+      parentTaskId: task.id,
+      parentRuntimeThreadId: "runtime-thread-1",
+      parentTurnId: "runtime-turn-1",
+      ownerId: "user-1",
+      sessionId: null,
+      name: "Repository audit",
+      role: "subagent",
+      model: "gpt-5",
+      effort: "HIGH",
+      status: "DONE",
+      resultSummary: "No critical findings",
+      now: new Date(NOW.getTime() + 20),
+    });
+    store.appendSubagentEvent({
+      threadId: "agent-thread-1",
+      turnId: "agent-turn-1",
+      type: "AGENT_MESSAGE_DELTA",
+      payload: { itemId: "child-message-1", delta: "Inspecting" },
+      now: new Date(NOW.getTime() + 10),
+    });
+
+    expect(store.listSubagents(task.id, "user-1", new Date(NOW.getTime() + 30))).toEqual([
+      expect.objectContaining({
+        threadId: "agent-thread-1",
+        parentThreadId: task.id,
+        status: "DONE",
+        resultSummary: "No critical findings",
+      }),
+    ]);
+    expect(
+      store.getSubagentDetail("agent-thread-1", "user-1", new Date(NOW.getTime() + 30)),
+    ).toMatchObject({
+      items: [
+        {
+          id: "child-message-1",
+          threadId: "agent-thread-1",
+          turnId: null,
+          sequence: 1,
+          type: "AGENT_MESSAGE_DELTA",
+          timestamp: new Date(NOW.getTime() + 10).toISOString(),
+          payload: { itemId: "child-message-1", delta: "Inspecting" },
+        },
+      ],
+    });
+    expect(store.getSubagentDetail("agent-thread-1", "user-2", NOW)).toBeNull();
+    expect(store.listSubagents(task.id, "user-2", NOW)).toBeNull();
+  });
+
+  test("keeps a subagent owner and parent chain immutable and terminal status monotonic", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Agents", now: NOW });
+    const firstTask = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "First parent",
+      now: NOW,
+    });
+    const secondTask = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Second parent",
+      now: NOW,
+    });
+    const base = {
+      threadId: "agent-thread-stable",
+      parentTaskId: firstTask.id,
+      parentRuntimeThreadId: "runtime-parent-1",
+      parentTurnId: null,
+      ownerId: "user-1",
+      sessionId: null,
+      name: "Stable child",
+      role: "subagent",
+      model: null,
+      effort: null,
+      resultSummary: null,
+      now: NOW,
+    };
+    store.upsertSubagent({ ...base, status: "DONE" });
+
+    expect(() =>
+      store.upsertSubagent({
+        ...base,
+        parentTaskId: secondTask.id,
+        parentRuntimeThreadId: "runtime-parent-2",
+        parentTurnId: "parent-turn-2",
+        status: "ACTIVE",
+      }),
+    ).toThrow(/conflict/i);
+    store.upsertSubagent({
+      ...base,
+      status: "ACTIVE",
+      now: new Date(NOW.getTime() + 1),
+    });
+    expect(store.getSubagent("agent-thread-stable", "user-1", NOW)).toMatchObject({
+      parentThreadId: firstTask.id,
+      parentTurnId: null,
+      status: "DONE",
+    });
   });
 
   test("persists queued turn prompts so FIFO promotion survives process memory loss", () => {
@@ -233,7 +459,134 @@ describe("SQLitePlatformStore", () => {
     expect(JSON.stringify(store.listAudit({ actorUserId: "user-1" }))).not.toContain("codex_home");
   });
 
+  test("recovers an account atomically and is idempotent after an interrupted transaction", () => {
+    database.sqlite
+      .prepare(
+        `INSERT INTO codex_accounts (
+          id, alias, codex_home, status, auth_status, weekly_remaining,
+          quota_updated_at, allow_unknown_quota, created_at
+        ) VALUES ('account-atomic', 'Atomic', '/tmp/atomic', 'AVAILABLE', 'AUTHENTICATED',
+          80, ?, 0, ?)`,
+      )
+      .run(NOW.getTime(), NOW.getTime());
+    const project = store.createProject({ ownerId: "user-1", name: "Recovery", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Recover me",
+      now: NOW,
+    });
+    store.createTurn({
+      id: "platform-turn-atomic",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Run",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    store.bindTurnRuntime("platform-turn-atomic", "runtime-turn-secret", NOW);
+    store.bindTaskRuntime(task.id, {
+      accountId: "account-atomic",
+      accountAlias: "Atomic",
+      leaseId: "lease-atomic",
+      threadId: "runtime-thread-secret",
+      now: NOW,
+    });
+    store.setCurrentTurn(task.id, "runtime-turn-secret", "RUNNING", NOW);
+    database.sqlite
+      .prepare(
+        `INSERT INTO user_turn_slots (
+          account_id, user_id, slot_index, task_id, turn_id, status, acquired_at, heartbeat_at
+        ) VALUES ('account-atomic', 'user-1', 0, ?, 'platform-turn-atomic', 'RUNNING', ?, ?)`,
+      )
+      .run(task.id, NOW.getTime(), NOW.getTime());
+    database.sqlite
+      .prepare(
+        `INSERT INTO turns (
+          id, task_id, codex_turn_id, prompt, status, config_snapshot_json, started_at
+        )
+        SELECT 'platform-turn-slot-only', task_id, 'runtime-turn-slot-only',
+               'Damaged second slot', 'RUNNING', config_snapshot_json, started_at
+        FROM turns WHERE id = 'platform-turn-atomic'`,
+      )
+      .run();
+    database.sqlite
+      .prepare(
+        `INSERT INTO user_turn_slots (
+          account_id, user_id, slot_index, task_id, turn_id, status, acquired_at, heartbeat_at
+        ) VALUES ('account-atomic', 'user-1', 1, ?, 'platform-turn-slot-only', 'RUNNING', ?, ?)`,
+      )
+      .run(task.id, NOW.getTime(), NOW.getTime());
+    const approval = store.createApproval({
+      requestId: "atomic-approval",
+      rawRpcId: 9,
+      accountId: "account-atomic",
+      connectionGeneration: 1,
+      threadId: "runtime-thread-secret",
+      taskId: task.id,
+      turnId: "runtime-turn-secret",
+      itemId: "atomic-command",
+      approvalType: "COMMAND",
+      payload: { command: "pnpm test" },
+      now: NOW,
+    });
+    database.sqlite.exec(`
+      CREATE TRIGGER fail_atomic_recovery
+      BEFORE UPDATE OF status ON approvals
+      WHEN NEW.status = 'RECOVERY_REQUIRED'
+      BEGIN
+        SELECT RAISE(ABORT, 'simulated crash');
+      END;
+    `);
+
+    expect(() =>
+      store.recoverAccountRuntimeState("account-atomic", new Date(NOW.getTime() + 1)),
+    ).toThrow("simulated crash");
+    expect(
+      database.sqlite
+        .prepare("SELECT status FROM codex_accounts WHERE id = 'account-atomic'")
+        .get(),
+    ).toEqual({ status: "AVAILABLE" });
+    expect(store.getTaskForUser(task.id, "user-1")).toMatchObject({ status: "RUNNING" });
+    expect(store.getTurn("platform-turn-atomic")).toMatchObject({ status: "RUNNING" });
+    expect(store.getTurn("platform-turn-slot-only")).toMatchObject({ status: "RUNNING" });
+    expect(database.sqlite.prepare("SELECT COUNT(*) AS count FROM user_turn_slots").get()).toEqual({
+      count: 2,
+    });
+    expect(
+      database.sqlite.prepare("SELECT status FROM approvals WHERE id = ?").get(approval.id),
+    ).toEqual({ status: "PENDING" });
+
+    database.sqlite.exec("DROP TRIGGER fail_atomic_recovery");
+    expect(store.recoverAccountRuntimeState("account-atomic", new Date(NOW.getTime() + 2))).toEqual(
+      [
+        expect.objectContaining({
+          taskId: task.id,
+          platformTurnId: "platform-turn-atomic",
+        }),
+      ],
+    );
+    expect(store.recoverAccountRuntimeState("account-atomic", new Date(NOW.getTime() + 3))).toEqual(
+      [],
+    );
+    expect(
+      database.sqlite
+        .prepare("SELECT status FROM codex_accounts WHERE id = 'account-atomic'")
+        .get(),
+    ).toEqual({ status: "QUARANTINED" });
+    expect(store.getTaskForUser(task.id, "user-1")).toMatchObject({ status: "NEEDS_RECOVERY" });
+    expect(store.getTurn("platform-turn-atomic")).toMatchObject({ status: "NEEDS_RECOVERY" });
+    expect(store.getTurn("platform-turn-slot-only")).toMatchObject({ status: "NEEDS_RECOVERY" });
+    expect(database.sqlite.prepare("SELECT COUNT(*) AS count FROM user_turn_slots").get()).toEqual({
+      count: 0,
+    });
+    expect(
+      database.sqlite.prepare("SELECT status FROM approvals WHERE id = ?").get(approval.id),
+    ).toEqual({ status: "RECOVERY_REQUIRED" });
+  });
+
   test("records tool provenance and hashes payloads instead of storing sensitive arguments", () => {
+    database.sqlite.prepare("UPDATE users SET name = ? WHERE id = ?").run("林可", "user-1");
     const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
     const task = store.createTask({
       ownerId: "user-1",
@@ -274,6 +627,7 @@ describe("SQLitePlatformStore", () => {
     expect(store.listAudit({ actorUserId: "user-1" })).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
+          actorName: "林可",
           action: "TOOL_INVOKED",
           accountAlias: "Codex A",
           toolCallId: expect.any(String),

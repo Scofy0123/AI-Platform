@@ -90,17 +90,21 @@ export async function createApplication(
     allowedTables: ["demo_orders", "demo_customers"],
   });
   const tools = new EnterpriseToolRuntime({
-    resolveActor: async (threadId, turnId) => {
-      const actor = actors.resolve(threadId, turnId);
+    resolveActor: async (binding) => {
+      const actor = actors.resolve(binding);
       if (!actor) return null;
-      let credentials = authStore.getCredentials(actor.userId);
+      let credentials = authStore.getCredentials(actor.actorContext.userId);
       if (!credentials) return null;
       if (credentials.accessExpiresAt.getTime() <= Date.now() + 60_000) {
-        await auth.refreshUserCredentials(actor.userId);
-        credentials = authStore.getCredentials(actor.userId);
+        await auth.refreshUserCredentials(actor.actorContext.userId);
+        credentials = authStore.getCredentials(actor.actorContext.userId);
       }
       return credentials
-        ? { taskId: actor.taskId, userId: actor.userId, accessToken: credentials.accessToken }
+        ? {
+            taskId: actor.taskId,
+            ...actor.actorContext,
+            accessToken: credentials.accessToken,
+          }
         : null;
     },
     createFeishuClient: (accessToken) => new FeishuContentClient(accessToken),

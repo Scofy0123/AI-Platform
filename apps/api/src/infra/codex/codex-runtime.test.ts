@@ -91,6 +91,7 @@ describe("CodexAppServerRuntime", () => {
   test("starts a thread with dynamic tools and starts, steers, then interrupts a turn", async () => {
     const rpc = new FakeRpc({
       "thread/start": { thread: { id: "thread-1" }, model: "gpt-5", cwd: "/workspace" },
+      "thread/memoryMode/set": {},
       "turn/start": { turn: { id: "turn-1" } },
       "turn/steer": { turnId: "turn-1" },
       "turn/interrupt": {},
@@ -108,6 +109,7 @@ describe("CodexAppServerRuntime", () => {
     await expect(
       runtime.startThread({ cwd: "/workspace", dynamicTools: tools }),
     ).resolves.toMatchObject({ thread: { id: "thread-1" } });
+    await expect(runtime.disableThreadMemory("thread-1")).resolves.toEqual({});
     await expect(runtime.startTurn("thread-1", "Summarize this repo")).resolves.toEqual({
       turn: { id: "turn-1" },
     });
@@ -126,6 +128,13 @@ describe("CodexAppServerRuntime", () => {
         },
       },
       {
+        method: "thread/memoryMode/set",
+        params: {
+          threadId: "thread-1",
+          mode: "disabled",
+        },
+      },
+      {
         method: "turn/start",
         params: {
           threadId: "thread-1",
@@ -141,6 +150,160 @@ describe("CodexAppServerRuntime", () => {
         },
       },
       { method: "turn/interrupt", params: { threadId: "thread-1", turnId: "turn-1" } },
+    ]);
+  });
+
+  test("propagates a native memory disable failure without issuing a Turn request", async () => {
+    const rpc = new FakeRpc({
+      "thread/memoryMode/set": new Error("memory mode unavailable"),
+      "turn/start": { turn: { id: "turn-must-not-start" } },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await expect(runtime.disableThreadMemory("thread-1")).rejects.toThrow(
+      "memory mode unavailable",
+    );
+    await expect(runtime.startTurn("thread-1", "Must not run")).rejects.toThrow(
+      "native memory must be disabled",
+    );
+    expect(rpc.requests).toEqual([
+      {
+        method: "thread/memoryMode/set",
+        params: { threadId: "thread-1", mode: "disabled" },
+      },
+    ]);
+  });
+
+  test("refuses turn/start when the caller skips the native memory gate", async () => {
+    const rpc = new FakeRpc({
+      "turn/start": { turn: { id: "turn-must-not-start" } },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await expect(runtime.startTurn("thread-1", "Must not run")).rejects.toThrow(
+      "native memory must be disabled",
+    );
+    expect(rpc.requests).toEqual([]);
+  });
+
+  test.each([null, [], { accepted: true }])(
+    "rejects a malformed native memory response: %j",
+    async (response) => {
+      const rpc = new FakeRpc({
+        "thread/memoryMode/set": response,
+        "turn/start": { turn: { id: "turn-must-not-start" } },
+      });
+      const runtime = new CodexAppServerRuntime(rpc);
+
+      await expect(runtime.disableThreadMemory("thread-1")).rejects.toThrow(
+        "Invalid thread/memoryMode/set response",
+      );
+      await expect(runtime.startTurn("thread-1", "Must not run")).rejects.toThrow(
+        "native memory must be disabled",
+      );
+      expect(rpc.requests).toEqual([
+        {
+          method: "thread/memoryMode/set",
+          params: { threadId: "thread-1", mode: "disabled" },
+        },
+      ]);
+    },
+  );
+
+  test("maps an effective platform snapshot to real thread/start and turn/start fields", async () => {
+    const rpc = new FakeRpc({
+      "thread/start": { thread: { id: "thread-1" } },
+      "thread/memoryMode/set": {},
+      "turn/start": { turn: { id: "turn-1" } },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+    const config = {
+      model: "gpt-5-codex",
+      reasoningEffort: "HIGH",
+      permissionMode: "READ_ONLY",
+      approvalMode: "ASK",
+      personality: "FRIENDLY",
+      instructions: "Use the employee's Feishu identity.",
+      sourceVersion: "org-policy-v1",
+    } as const;
+
+    await runtime.startThread({ cwd: "/workspace", dynamicTools: [], effectiveConfig: config });
+    await runtime.disableThreadMemory("thread-1");
+    await runtime.startTurn("thread-1", "Inspect", {
+      cwd: "/workspace",
+      effectiveConfig: config,
+    });
+
+    expect(rpc.requests).toEqual([
+      {
+        method: "thread/start",
+        params: {
+          cwd: "/workspace",
+          dynamicTools: [],
+          model: "gpt-5-codex",
+          approvalPolicy: "on-request",
+          approvalsReviewer: "user",
+          sandbox: "read-only",
+          developerInstructions: "Use the employee's Feishu identity.",
+          personality: "friendly",
+          ephemeral: false,
+        },
+      },
+      {
+        method: "thread/memoryMode/set",
+        params: { threadId: "thread-1", mode: "disabled" },
+      },
+      {
+        method: "turn/start",
+        params: {
+          threadId: "thread-1",
+          input: [{ type: "text", text: "Inspect", text_elements: [] }],
+          model: "gpt-5-codex",
+          effort: "high",
+          approvalPolicy: "on-request",
+          approvalsReviewer: "user",
+          sandboxPolicy: { type: "readOnly", networkAccess: false },
+          personality: "friendly",
+          summary: "auto",
+        },
+      },
+    ]);
+  });
+
+  test("reapplies the immutable snapshot when resuming and preserves explicit empty instructions", async () => {
+    const rpc = new FakeRpc({
+      "thread/resume": { thread: { id: "thread-1" } },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+    const config = {
+      model: null,
+      reasoningEffort: "ULTRA",
+      permissionMode: "WORKSPACE_WRITE",
+      approvalMode: "ASK",
+      personality: "NONE",
+      instructions: "",
+      sourceVersion: "org-policy-v1",
+    } as const;
+
+    await runtime.resumeThread("thread-1", {
+      cwd: "/workspace",
+      effectiveConfig: config,
+    });
+
+    expect(rpc.requests).toEqual([
+      {
+        method: "thread/resume",
+        params: {
+          threadId: "thread-1",
+          cwd: "/workspace",
+          model: null,
+          approvalPolicy: "on-request",
+          approvalsReviewer: "user",
+          sandbox: "workspace-write",
+          developerInstructions: "",
+          personality: "none",
+        },
+      },
     ]);
   });
 
@@ -174,7 +337,9 @@ class FakeRpc implements RpcPeer {
 
   async request<T>(method: string, params?: unknown): Promise<T> {
     this.requests.push({ method, params });
-    return this.responses[method] as T;
+    const response = this.responses[method];
+    if (response instanceof Error) throw response;
+    return response as T;
   }
 
   notify(method: string, params?: unknown): void {

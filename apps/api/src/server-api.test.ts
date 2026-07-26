@@ -1,5 +1,10 @@
 import { EventEmitter } from "node:events";
+import type { Bootstrap, Thread, UserSettingsView } from "@codexplatform/contracts";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import {
+  ActiveTurnResumeConflictError,
+  InvalidThreadResumeResponseError,
+} from "./domain/platform-service.js";
 import { buildApp, streamTaskEvents, subscribeWithReplay } from "./server.js";
 import type { AuthApi, PlatformApi } from "./web-api.js";
 
@@ -132,6 +137,49 @@ describe("CodexPlatform HTTP API", () => {
     }
   });
 
+  test("redacts a shared account alias from live SSE events", async () => {
+    const raw = Object.assign(new EventEmitter(), {
+      destroyed: false,
+      writableEnded: false,
+      writeHead: vi.fn(),
+      write: vi.fn(() => true),
+      end: vi.fn(),
+      destroy: vi.fn(),
+    });
+    let listener: ((event: never) => void) | undefined;
+    const unsubscribe = vi.fn();
+
+    await streamTaskEvents({ hijack: vi.fn(), raw } as never, {
+      afterSequence: 0,
+      loadReplay: async () => [],
+      subscribe: (next) => {
+        listener = next as (event: never) => void;
+        return unsubscribe;
+      },
+      sessionExpiresAt: new Date(Date.now() + 60_000),
+      isSessionValid: () => true,
+      hideAccountAlias: true,
+    });
+    listener?.({
+      taskId: "task-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "lease:turn-1",
+      sequence: 1,
+      timestamp: "2026-07-21T12:00:00.000Z",
+      type: "LEASE_ACQUIRED",
+      payload: { accountAlias: "Codex A" },
+    } as never);
+
+    expect(raw.write).toHaveBeenCalledWith(
+      expect.stringContaining('event: LEASE_ACQUIRED\ndata: {"taskId":"task-1"'),
+    );
+    expect(raw.write).toHaveBeenCalledWith(expect.stringContaining('"payload":{}'));
+    expect(raw.write).not.toHaveBeenCalledWith(expect.stringContaining("Codex A"));
+    raw.emit("close");
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
   test("requires a session and CSRF token for writes", async () => {
     const { auth, platform } = services();
     const app = buildApp({ auth, platform });
@@ -180,6 +228,43 @@ describe("CodexPlatform HTTP API", () => {
     expect(response.json()).toEqual([
       expect.objectContaining({ taskId: "task-1", sequence: 5, type: "TURN_COMPLETED" }),
     ]);
+  });
+
+  test("redacts the internal recovery source Turn from browser event replay", async () => {
+    const { auth, platform } = services();
+    platform.listTaskEvents.mockResolvedValueOnce([
+      {
+        taskId: "task-1",
+        threadId: "thread-visible",
+        turnId: "turn-visible",
+        sequence: 7,
+        timestamp: "2026-07-21T12:00:01.000Z",
+        type: "RECOVERY_REQUIRED",
+        payload: {
+          reason: "Explicit recovery is required.",
+          sourceRuntimeTurnId: "runtime-turn-internal",
+        },
+      },
+    ] as never);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/tasks/task-1/events",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { accept: "application/json" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({
+        type: "RECOVERY_REQUIRED",
+        payload: { reason: "Explicit recovery is required." },
+      }),
+    ]);
+    expect(response.body).not.toContain("sourceRuntimeTurnId");
+    expect(response.body).not.toContain("runtime-turn-internal");
   });
 
   test("projects internal scheduling and approval records before returning browser DTOs", async () => {
@@ -232,6 +317,7 @@ describe("CodexPlatform HTTP API", () => {
       {
         id: "audit-1",
         actorUserId: "user-1",
+        actorName: "林可",
         accountAlias: "Codex A",
         leaseId: "audit-lease-secret",
         taskId: "task-1",
@@ -287,7 +373,7 @@ describe("CodexPlatform HTTP API", () => {
       expect.objectContaining({
         threadId: "thread-visible",
         turnId: "turn-visible",
-        payload: { accountAlias: "Codex A" },
+        payload: {},
       }),
     ]);
     expect(approvals.json()).toEqual([
@@ -312,6 +398,7 @@ describe("CodexPlatform HTTP API", () => {
       {
         id: "audit-1",
         actorUserId: "user-1",
+        actorName: "林可",
         accountAlias: "Codex A",
         taskId: "task-1",
         action: "LEASE_ACQUIRED",
@@ -427,6 +514,329 @@ describe("CodexPlatform HTTP API", () => {
     expect(response.statusCode).toBe(409);
     expect(response.json()).toEqual({ error: "Task already has an active Turn" });
   });
+
+  test.each([
+    [
+      new ActiveTurnResumeConflictError("thread-internal", "turn-internal"),
+      "ACTIVE_TURN_RESUME_CONFLICT",
+      "Thread already has an active Turn; the new prompt was not accepted",
+    ],
+    [
+      new InvalidThreadResumeResponseError("thread-internal"),
+      "INVALID_THREAD_RESUME_RESPONSE",
+      "Thread resume response is unsafe; the new prompt was not accepted",
+    ],
+  ])("returns a safe structured 409 for %s", async (runtimeError, code, message) => {
+    const { auth, platform } = services();
+    platform.startTurn.mockRejectedValueOnce(runtimeError);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/tasks/task-1/turns",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "Resume safely" },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: code,
+      code,
+      message,
+      promptAccepted: false,
+      rejoined: false,
+    });
+    expect(response.body).not.toContain("thread-internal");
+    expect(response.body).not.toContain("turn-internal");
+  });
+
+  test("serves the 1.1 bootstrap and actor-aware Thread routes while preserving task routes", async () => {
+    const { auth, platform } = services();
+    const baseThread = await platform.getThread();
+    const projectedThread: Thread = {
+      ...baseThread,
+      currentTurn: {
+        id: "platform-turn-1",
+        threadId: "thread-1",
+        prompt: "Continue",
+        status: "RUNNING",
+        startedAt: "2026-07-21T12:00:00.000Z",
+        completedAt: null,
+        durationMs: null,
+        model: null,
+        effort: "MEDIUM",
+        permissionMode: "DEFAULT",
+        configSnapshot: {
+          model: null,
+          reasoningEffort: "MEDIUM",
+          permissionMode: "DEFAULT",
+          approvalMode: "ASK",
+          personality: "PRAGMATIC",
+          instructions: "",
+          sourceVersion: "test",
+        },
+      },
+      turns: [],
+    };
+    platform.getThread.mockResolvedValue(projectedThread as never);
+    platform.startThreadTurn.mockResolvedValueOnce({
+      status: "RUNNING",
+      accountAlias: "Codex A",
+      threadId: "runtime-thread-secret",
+      turnId: "runtime-turn-secret",
+    } as never);
+    platform.startTurn.mockResolvedValueOnce({
+      status: "RUNNING",
+      accountAlias: "Codex A",
+      threadId: "legacy-runtime-thread-secret",
+      turnId: "legacy-turn-secret",
+    } as never);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const bootstrap = await app.inject({ method: "GET", url: "/api/bootstrap" });
+    const threads = await app.inject({
+      method: "GET",
+      url: "/api/threads?projectId=project-1",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/threads",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { projectId: "project-1", title: "New thread" },
+    });
+    const detail = await app.inject({
+      method: "GET",
+      url: "/api/threads/thread-1",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const started = await app.inject({
+      method: "POST",
+      url: "/api/threads/thread-1/turns",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "Continue" },
+    });
+    const legacy = await app.inject({
+      method: "GET",
+      url: "/api/tasks/task-1",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const legacyStarted = await app.inject({
+      method: "POST",
+      url: "/api/tasks/task-1/turns",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "Continue through legacy route" },
+    });
+
+    expect(bootstrap.statusCode).toBe(200);
+    expect(bootstrap.json()).toMatchObject({ enabledModes: ["CODEX"] });
+    expect(threads.statusCode).toBe(200);
+    expect(created.statusCode).toBe(201);
+    expect(detail.statusCode).toBe(200);
+    expect(started.statusCode).toBe(202);
+    expect(started.json()).toEqual({ status: "RUNNING", turnId: "platform-turn-1" });
+    expect(started.body).not.toMatch(
+      /Codex A|accountAlias|runtime-thread-secret|runtime-turn-secret/,
+    );
+    expect(legacy.statusCode).toBe(200);
+    expect(legacy.json()).toMatchObject({ accountAlias: null });
+    expect(legacy.body).not.toContain("Codex A");
+    expect(legacyStarted.json()).toEqual({ status: "RUNNING" });
+    expect(legacyStarted.body).not.toMatch(
+      /Codex A|accountAlias|legacy-runtime-thread-secret|legacy-turn-secret/,
+    );
+    expect(platform.listThreads).toHaveBeenCalledWith("user-1", "project-1");
+    expect(platform.createThread).toHaveBeenCalledWith("user-1", {
+      projectId: "project-1",
+      title: "New thread",
+    });
+    expect(platform.startThreadTurn).toHaveBeenCalledWith("thread-1", "user-1", "Continue");
+    expect(platform.getTask).toHaveBeenCalledWith("task-1", "user-1");
+  });
+
+  test("keeps Thread, subagent and settings access fail-closed by actor and CSRF", async () => {
+    const { auth, platform } = services();
+    platform.getThread.mockResolvedValueOnce(null as never);
+    platform.getSubagent.mockResolvedValueOnce(null as never);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const missingThread = await app.inject({
+      method: "GET",
+      url: "/api/threads/other-thread",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const missingSubagent = await app.inject({
+      method: "GET",
+      url: "/api/subagents/other-agent",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const settingsWithoutCsrf = await app.inject({
+      method: "PATCH",
+      url: "/api/me/settings",
+      cookies: { codexplatform_session: "valid-session" },
+      payload: { general: { theme: "DARK" } },
+    });
+    const settings = await app.inject({
+      method: "PATCH",
+      url: "/api/me/settings",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { general: { theme: "DARK" } },
+    });
+
+    expect(missingThread.statusCode).toBe(404);
+    expect(missingSubagent.statusCode).toBe(404);
+    expect(settingsWithoutCsrf.statusCode).toBe(403);
+    expect(settings.statusCode).toBe(200);
+    expect(platform.patchMySettings).toHaveBeenCalledWith("user-1", {
+      general: { theme: "DARK" },
+    });
+  });
+
+  test("returns 400 when a default Settings project is unknown or not owned", async () => {
+    const { auth, platform } = services();
+    platform.patchMySettings.mockRejectedValueOnce(new Error("Invalid default project"));
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/me/settings",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { general: { defaultProjectId: "other-users-project" } },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ error: "Invalid default project" });
+  });
+
+  test("projects Thread events without raw reasoning or shared account aliases", async () => {
+    const { auth, platform } = services();
+    platform.listThreadEvents.mockResolvedValueOnce([
+      {
+        taskId: "thread-1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "reason-1",
+        sequence: 1,
+        timestamp: "2026-07-21T12:00:00.000Z",
+        type: "REASONING_SUMMARY_DELTA",
+        payload: {
+          itemId: "reason-1",
+          delta: "Inspect the repository.",
+          reasoningTextDelta: "raw secret",
+          content: "raw content",
+          encrypted_content: "ciphertext",
+        },
+      },
+      {
+        taskId: "thread-1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "lease:turn-1",
+        sequence: 2,
+        timestamp: "2026-07-21T12:00:01.000Z",
+        type: "LEASE_ACQUIRED",
+        payload: { accountAlias: "Codex A" },
+      },
+    ] as never);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/threads/thread-1/events",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { accept: "application/json" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({
+        payload: { itemId: "reason-1", delta: "Inspect the repository." },
+      }),
+      expect.objectContaining({ payload: {} }),
+    ]);
+    expect(response.body).not.toMatch(
+      /raw secret|raw content|ciphertext|reasoningTextDelta|encrypted_content|Codex A/,
+    );
+  });
+
+  test("serves personal projections and keeps every new admin endpoint admin-only", async () => {
+    const adminServices = services("ADMIN");
+    const admin = buildApp(adminServices);
+    apps.push(admin);
+    const memberServices = services("MEMBER");
+    const member = buildApp(memberServices);
+    apps.push(member);
+
+    for (const url of [
+      "/api/me/settings",
+      "/api/me/usage",
+      "/api/me/connections",
+      "/api/me/plugins",
+    ]) {
+      expect(
+        (
+          await admin.inject({
+            method: "GET",
+            url,
+            cookies: { codexplatform_session: "valid-session" },
+          })
+        ).statusCode,
+      ).toBe(200);
+    }
+    for (const url of [
+      "/api/admin/policies",
+      "/api/admin/connectors",
+      "/api/admin/usage",
+      "/api/admin/runtime-health",
+    ]) {
+      expect(
+        (
+          await member.inject({
+            method: "GET",
+            url,
+            cookies: { codexplatform_session: "valid-session" },
+          })
+        ).statusCode,
+      ).toBe(403);
+    }
+    expect(memberServices.platform.getAdminPolicies).not.toHaveBeenCalled();
+  });
+
+  test("serves a member-owned Thread through the administrator-only read projection", async () => {
+    const adminServices = services("ADMIN");
+    const admin = buildApp(adminServices);
+    apps.push(admin);
+    const memberServices = services("MEMBER");
+    const member = buildApp(memberServices);
+    apps.push(member);
+
+    const adminResponse = await admin.inject({
+      method: "GET",
+      url: "/api/admin/threads/member-thread",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const memberResponse = await member.inject({
+      method: "GET",
+      url: "/api/admin/threads/member-thread",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    expect(adminResponse.statusCode).toBe(200);
+    expect(adminServices.platform.getAdminThread).toHaveBeenCalledWith("member-thread", "user-1");
+    expect(memberResponse.statusCode).toBe(403);
+    expect(memberServices.platform.getAdminThread).not.toHaveBeenCalled();
+  });
 });
 
 function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
@@ -474,6 +884,19 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
     payload: { status: "completed" as const },
   };
   const platform = {
+    getBootstrap: vi.fn(
+      async (): Promise<Bootstrap> => ({
+        platformVersion: "0.1.0",
+        defaultMode: "CODEX",
+        enabledModes: ["CODEX"],
+        capabilities: {
+          threads: true as const,
+          settings: true as const,
+          subagents: true as const,
+          reasoningSummaries: true as const,
+        },
+      }),
+    ),
     createProject: vi.fn(async () => ({ id: "project-1" })),
     listProjects: vi.fn(async () => []),
     createTask: vi.fn(async () => ({ id: "task-1" })),
@@ -488,6 +911,123 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       accountAlias: "Codex A",
       queue: null,
     })),
+    createThread: vi.fn(async () => ({
+      id: "thread-new",
+      projectId: "project-1",
+      title: "New thread",
+      status: "READY" as const,
+      updatedAt: "2026-07-21T12:00:00.000Z",
+      currentTurn: null,
+      turns: [],
+      queue: null,
+      items: [],
+    })),
+    listThreads: vi.fn(async () => []),
+    getThread: vi.fn(async () => ({
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Build it",
+      status: "RUNNING" as const,
+      updatedAt: "2026-07-21T12:00:00.000Z",
+      currentTurn: null,
+      turns: [],
+      queue: null,
+      items: [],
+    })),
+    getAdminThread: vi.fn(async () => ({
+      id: "member-thread",
+      projectId: "project-1",
+      title: "Member Thread",
+      status: "COMPLETED" as const,
+      updatedAt: "2026-07-21T12:00:00.000Z",
+      currentTurn: null,
+      turns: [],
+      queue: null,
+      items: [],
+    })),
+    startThreadTurn: vi.fn(async () => ({ status: "RUNNING" })),
+    steerThread: vi.fn(async () => ({ status: "RUNNING" })),
+    interruptThread: vi.fn(async () => ({ status: "INTERRUPTING" })),
+    listThreadEvents: vi.fn(async () => [event]),
+    subscribeThreadEvents: vi.fn(() => () => undefined),
+    listSubagents: vi.fn(async () => []),
+    getSubagent: vi.fn(async () => ({
+      threadId: "agent-thread-1",
+      parentThreadId: "thread-1",
+      parentTurnId: "turn-1",
+      sessionId: null,
+      name: "Research",
+      role: "subagent",
+      model: null,
+      effort: null,
+      status: "DONE" as const,
+      startedAt: "2026-07-21T12:00:00.000Z",
+      completedAt: "2026-07-21T12:00:01.000Z",
+      elapsedMs: 1_000,
+      resultSummary: "Done",
+      tokenUsage: null,
+      items: [],
+    })),
+    getMySettings: vi.fn(
+      async (): Promise<UserSettingsView> => ({
+        general: {
+          language: "zh-CN",
+          theme: "SYSTEM" as const,
+          defaultProjectId: null,
+          notificationsEnabled: true,
+        },
+        execution: {
+          model: null,
+          reasoningEffort: "MEDIUM" as const,
+          permissionMode: "DEFAULT" as const,
+          approvalPreference: "ASK" as const,
+        },
+        personalization: { personality: "PRAGMATIC" as const, instructions: "" },
+        updatedAt: "2026-07-21T12:00:00.000Z",
+        policy: {
+          allowedModels: null,
+          allowedReasoningEfforts: ["LOW", "MEDIUM", "HIGH", "XHIGH"],
+          allowedPermissionModes: ["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"],
+          allowedApprovalPreferences: ["ASK"],
+          lockedFields: [],
+        },
+      }),
+    ),
+    patchMySettings: vi.fn(
+      async (): Promise<UserSettingsView> => ({
+        general: {
+          language: "zh-CN",
+          theme: "DARK" as const,
+          defaultProjectId: null,
+          notificationsEnabled: true,
+        },
+        execution: {
+          model: null,
+          reasoningEffort: "MEDIUM" as const,
+          permissionMode: "DEFAULT" as const,
+          approvalPreference: "ASK" as const,
+        },
+        personalization: { personality: "PRAGMATIC" as const, instructions: "" },
+        updatedAt: "2026-07-21T12:00:00.000Z",
+        policy: {
+          allowedModels: null,
+          allowedReasoningEfforts: ["LOW", "MEDIUM", "HIGH", "XHIGH"],
+          allowedPermissionModes: ["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"],
+          allowedApprovalPreferences: ["ASK"],
+          lockedFields: [],
+        },
+      }),
+    ),
+    getMyUsage: vi.fn(async () => ({
+      threads: 0,
+      turns: 0,
+      toolCalls: 0,
+      subagents: 0,
+      tokenUsage: null,
+      tokenUsageStatus: "UNKNOWN" as const,
+    })),
+    getMyConnections: vi.fn(async () => []),
+    getMyPlugins: vi.fn(async () => []),
     startTurn: vi.fn(async () => ({ status: "RUNNING" })),
     steerTask: vi.fn(async () => ({ status: "RUNNING" })),
     interruptTask: vi.fn(async () => ({ status: "INTERRUPTING" })),
@@ -500,6 +1040,10 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
     loginAccount: vi.fn(async () => ({ authUrl: "https://auth.example.test/codex" })),
     setAccountState: vi.fn(async () => ({ id: "account-1" })),
     listAudit: vi.fn(async () => []),
+    getAdminPolicies: vi.fn(async () => ({})),
+    getAdminConnectors: vi.fn(async () => []),
+    getAdminUsage: vi.fn(async () => ({})),
+    getAdminRuntimeHealth: vi.fn(async () => ({})),
   } satisfies PlatformApi;
   return { auth, platform };
 }

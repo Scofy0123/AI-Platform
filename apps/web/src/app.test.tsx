@@ -4,6 +4,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { App } from "./app.js";
+import type { TaskEvent, Thread } from "./types.js";
 
 const session = {
   authenticated: true as const,
@@ -27,6 +28,17 @@ const tasks = [
 function createApi() {
   return {
     getSession: vi.fn().mockResolvedValue(session),
+    getBootstrap: vi.fn().mockResolvedValue({
+      platformVersion: "0.1.0",
+      defaultMode: "CODEX",
+      enabledModes: ["CODEX"],
+      capabilities: {
+        threads: true,
+        settings: true,
+        subagents: true,
+        reasoningSummaries: true,
+      },
+    }),
     listProjects: vi.fn().mockResolvedValue(projects),
     createProject: vi.fn().mockResolvedValue({ id: "project-created" }),
     listTasks: vi.fn().mockResolvedValue(tasks),
@@ -39,6 +51,30 @@ function createApi() {
     createTask: vi.fn().mockResolvedValue({ id: "task-created" }),
     startTurn: vi.fn().mockResolvedValue({ status: "RUNNING" }),
     taskAction: vi.fn().mockResolvedValue({ ok: true }),
+    getMySettings: vi.fn().mockResolvedValue({
+      general: {
+        language: "zh-CN",
+        theme: "SYSTEM",
+        defaultProjectId: null,
+        notificationsEnabled: true,
+      },
+      execution: {
+        model: null,
+        reasoningEffort: "MEDIUM",
+        permissionMode: "DEFAULT",
+        approvalPreference: "ASK",
+      },
+      personalization: { personality: "PRAGMATIC", instructions: "" },
+      updatedAt: "2026-07-21T12:00:00.000Z",
+      policy: {
+        allowedModels: null,
+        allowedReasoningEfforts: ["LOW", "MEDIUM", "HIGH"],
+        allowedPermissionModes: ["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"],
+        allowedApprovalPreferences: ["ASK"],
+        lockedFields: [],
+      },
+    }),
+    patchMySettings: vi.fn(),
     decideApproval: vi.fn().mockResolvedValue({ ok: true }),
     addAccount: vi.fn().mockResolvedValue({ id: "account-created" }),
     listAccounts: vi.fn().mockResolvedValue([
@@ -83,18 +119,20 @@ describe("CodexPlatform workspace", () => {
     expect(screen.queryByLabelText(/密码|Token|Cookie/i)).not.toBeInTheDocument();
   });
 
-  test("shows projects, recent tasks and the workspace navigation", async () => {
+  test("shows projects, recent Threads and the CODEX workspace navigation", async () => {
     render(<App initialEntries={["/"]} api={createApi()} />);
 
-    expect(await screen.findByRole("heading", { name: "晚上好，林可" })).toBeInTheDocument();
-    expect(await screen.findByText("企业知识助手")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "What do you want to build?" }),
+    ).toBeInTheDocument();
+    expect((await screen.findAllByText("企业知识助手")).length).toBeGreaterThan(0);
     expect(await screen.findByText("梳理客户成功周报")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "新建任务" })).toBeInTheDocument();
-    expect(screen.getByRole("navigation", { name: "主导航" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "New chat" })).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Codex workspace" })).toBeInTheDocument();
   });
 
   test("renders the full Codex task timeline and task controls", async () => {
-    const events = [
+    const events: TaskEvent[] = [
       {
         taskId: "task-1",
         threadId: "thread-1",
@@ -143,7 +181,6 @@ describe("CodexPlatform workspace", () => {
         type: "APPROVAL_REQUESTED",
         payload: {
           approvalId: "approval-platform-1",
-          requestId: "7",
           itemId: "cmd-2",
           approvalType: "COMMAND",
           reason: "需要运行校验命令",
@@ -157,30 +194,72 @@ describe("CodexPlatform workspace", () => {
         sequence: 6,
         timestamp: "2026-07-21T12:00:06.000Z",
         type: "QUEUED",
-        payload: { ticket: 17, position: 2, etaMs: 240000, etaEstimated: true },
+        payload: { position: 2, etaMs: 240000, etaEstimated: true },
       },
     ];
-    const subscribe = vi.fn((_taskId, onEvent) => {
-      for (const event of events) onEvent(event);
-      return () => undefined;
-    });
+    const subscribe = vi.fn(() => () => undefined);
 
     const api = createApi();
-    render(<App initialEntries={["/tasks/task-1"]} api={api} subscribeToTaskEvents={subscribe} />);
+    const turn: Thread["turns"][number] = {
+      id: "turn-1",
+      threadId: "task-1",
+      prompt: "读取飞书知识库并形成摘要",
+      status: "RUNNING",
+      startedAt: "2026-07-21T12:00:00.000Z",
+      completedAt: null,
+      durationMs: null,
+      model: null,
+      effort: "MEDIUM",
+      permissionMode: "DEFAULT",
+      configSnapshot: {
+        model: null,
+        reasoningEffort: "MEDIUM",
+        permissionMode: "DEFAULT",
+        approvalMode: "ASK",
+        personality: "PRAGMATIC",
+        instructions: "",
+        sourceVersion: "test",
+      },
+    };
+    const runtimeApi = {
+      ...api,
+      getThread: vi.fn().mockResolvedValue({
+        id: "task-1",
+        projectId: "project-1",
+        title: "梳理客户成功周报",
+        status: "RUNNING",
+        updatedAt: "2026-07-21T12:02:00.000Z",
+        currentTurn: turn,
+        turns: [turn],
+        queue: null,
+        items: events.map((event) => ({
+          id: event.itemId ?? `event-${event.sequence}`,
+          threadId: "task-1",
+          turnId: event.turnId,
+          sequence: event.sequence,
+          type: event.type,
+          timestamp: event.timestamp,
+          payload: event.payload,
+        })),
+      } satisfies Thread),
+    };
+    render(
+      <App initialEntries={["/tasks/task-1"]} api={runtimeApi} subscribeToTaskEvents={subscribe} />,
+    );
 
     expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
-    expect(screen.getByText("执行计划")).toBeInTheDocument();
-    expect(screen.getByText("pnpm test")).toBeInTheDocument();
-    expect(screen.getByText("feishu_doc_read")).toBeInTheDocument();
-    expect(screen.getByText("文件变更")).toBeInTheDocument();
-    expect(screen.getByText("等待审批")).toBeInTheDocument();
+    expect(await screen.findByText("执行计划")).toBeInTheDocument();
+    expect(await screen.findByText("pnpm test")).toBeInTheDocument();
+    expect(await screen.findByText("feishu_doc_read")).toBeInTheDocument();
+    expect(await screen.findByText("文件变更")).toBeInTheDocument();
+    expect(await screen.findByText("等待审批")).toBeInTheDocument();
     expect(screen.getAllByText(/队列第 2 位/).length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "继续" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "发送调整" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "允许一次" }));
     await waitFor(() =>
-      expect(api.decideApproval).toHaveBeenCalledWith("approval-platform-1", "accept"),
+      expect(runtimeApi.decideApproval).toHaveBeenCalledWith("approval-platform-1", "accept"),
     );
   });
 
@@ -565,10 +644,13 @@ describe("CodexPlatform workspace", () => {
     const api = createApi();
     render(<App initialEntries={["/tasks/new"]} api={api} />);
 
-    expect(await screen.findByRole("heading", { name: "新建 AI 任务" })).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("任务名称"), { target: { value: "生成经营分析" } });
-    fireEvent.change(screen.getByLabelText("任务说明"), { target: { value: "分析本周核心指标" } });
-    fireEvent.click(screen.getByRole("button", { name: "开始执行" }));
+    expect(
+      await screen.findByRole("heading", { name: "What do you want to build?" }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Message Codex"), {
+      target: { value: "分析本周核心指标" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => expect(api.createTask).toHaveBeenCalled());
     expect(api.startTurn).toHaveBeenCalledWith("task-created", "分析本周核心指标");
@@ -585,17 +667,18 @@ describe("CodexPlatform workspace", () => {
       },
     ]);
     render(<App initialEntries={["/tasks/new"]} api={api} />);
-    await screen.findByRole("heading", { name: "新建 AI 任务" });
-    fireEvent.change(screen.getByLabelText("任务名称"), { target: { value: "首个任务" } });
-    fireEvent.change(screen.getByLabelText("任务说明"), { target: { value: "验证缓存更新" } });
-    fireEvent.click(screen.getByRole("button", { name: "开始执行" }));
+    await screen.findByRole("heading", { name: "What do you want to build?" });
+    fireEvent.change(screen.getByLabelText("Message Codex"), {
+      target: { value: "验证缓存更新" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(api.createProject).toHaveBeenCalledWith("默认项目"));
     await waitFor(() => expect(api.startTurn).toHaveBeenCalled());
     await waitFor(() => expect(api.listProjects).toHaveBeenCalledTimes(2));
 
-    fireEvent.click(screen.getByRole("link", { name: "项目" }));
+    fireEvent.click(screen.getByRole("link", { name: "All projects" }));
 
-    expect(await screen.findByText("默认项目")).toBeInTheDocument();
+    expect((await screen.findAllByText("默认项目")).length).toBeGreaterThan(0);
   });
 
   test("shows only safe account metadata and the audit trail", async () => {

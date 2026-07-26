@@ -1,10 +1,22 @@
 import type {
   AccountSummary,
+  AdminConnector,
+  AdminPolicies,
+  AdminUsage,
+  Bootstrap,
+  ConnectionSummary,
   PlatformApi,
+  PluginSummary,
   ProjectSummary,
+  RuntimeHealth,
   Session,
+  SubagentThread,
+  SubagentThreadDetail,
   TaskDetail,
   TaskSummary,
+  Thread,
+  UserSettingsView,
+  UserUsage,
 } from "./types.js";
 
 interface RawSession {
@@ -29,6 +41,7 @@ interface RawAccount {
 interface RawAudit {
   id: string;
   actorUserId: string;
+  actorName?: string;
   accountAlias?: string | null;
   taskId?: string | null;
   action: string;
@@ -41,6 +54,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly code?: string,
   ) {
     super(message);
     this.name = "ApiError";
@@ -68,12 +82,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (!response.ok) {
     const payload = (await response.json().catch(() => null)) as {
+      code?: string;
       error?: string;
       message?: string;
     } | null;
     throw new ApiError(
       payload?.message ?? payload?.error ?? `请求失败（${response.status}）`,
       response.status,
+      payload?.code ?? payload?.error,
     );
   }
 
@@ -96,6 +112,7 @@ export const httpApi: PlatformApi = {
     const session = await request<RawSession>("/api/auth/session");
     return { authenticated: true, user: session.user };
   },
+  getBootstrap: () => request<Bootstrap>("/api/bootstrap"),
   listProjects: async () => {
     const projects = await request<RawProject[]>("/api/projects");
     return projects.map((project) => ({ ...project, taskCount: project.taskCount ?? 0 }));
@@ -125,6 +142,45 @@ export const httpApi: PlatformApi = {
       method: "POST",
       body: JSON.stringify(action === "steer" && input ? { prompt: input } : {}),
     }),
+  listThreads: (projectId) =>
+    request<Thread[]>(
+      projectId ? `/api/threads?projectId=${encodeURIComponent(projectId)}` : "/api/threads",
+    ),
+  getThread: (threadId) => request<Thread>(`/api/threads/${encodeURIComponent(threadId)}`),
+  createThread: (input) =>
+    request<Thread>("/api/threads", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  startThreadTurn: (threadId, prompt, config) =>
+    request(`/api/threads/${encodeURIComponent(threadId)}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ prompt, ...(config ? { config } : {}) }),
+    }),
+  threadAction: (threadId, action, input) =>
+    request(`/api/threads/${encodeURIComponent(threadId)}/${action}`, {
+      method: "POST",
+      body: JSON.stringify(action === "steer" && input ? { prompt: input } : {}),
+    }),
+  listSubagents: (threadId) =>
+    request<SubagentThread[]>(`/api/threads/${encodeURIComponent(threadId)}/subagents`),
+  getSubagent: (threadId) =>
+    request<SubagentThreadDetail>(`/api/subagents/${encodeURIComponent(threadId)}`),
+  getMySettings: () => request<UserSettingsView>("/api/me/settings"),
+  patchMySettings: (patch) =>
+    request<UserSettingsView>("/api/me/settings", {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  getMyUsage: () => request<UserUsage>("/api/me/usage"),
+  listMyConnections: () => request<ConnectionSummary[]>("/api/me/connections"),
+  listMyPlugins: () => request<PluginSummary[]>("/api/me/plugins"),
+  getAdminPolicies: () => request<AdminPolicies>("/api/admin/policies"),
+  getAdminThread: (threadId) =>
+    request<Thread>(`/api/admin/threads/${encodeURIComponent(threadId)}`),
+  listAdminConnectors: () => request<AdminConnector[]>("/api/admin/connectors"),
+  getAdminUsage: () => request<AdminUsage>("/api/admin/usage"),
+  getAdminRuntimeHealth: () => request<RuntimeHealth>("/api/admin/runtime-health"),
   decideApproval: (approvalId, decision) =>
     request(`/api/approvals/${encodeURIComponent(approvalId)}/decision`, {
       method: "POST",
@@ -155,7 +211,7 @@ export const httpApi: PlatformApi = {
     return entries.map((entry) => ({
       id: entry.id,
       timestamp: entry.createdAt,
-      actorName: entry.actorUserId,
+      actorName: entry.actorName ?? entry.actorUserId,
       action: entry.action,
       resource: entry.summary,
       result: entry.outcome,

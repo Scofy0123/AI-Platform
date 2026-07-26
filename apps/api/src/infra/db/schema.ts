@@ -73,6 +73,7 @@ export const queueEntries = sqliteTable("queue_entries", {
   userId: text("user_id").notNull(),
   taskId: text("task_id").notNull(),
   turnId: text("turn_id").notNull(),
+  requiredAccountId: text("required_account_id"),
   reason: text("reason").notNull(),
   status: text("status").notNull(),
   enqueuedAt: integer("enqueued_at", { mode: "timestamp_ms" }).notNull(),
@@ -102,6 +103,14 @@ export const users = sqliteTable(
   },
   (table) => [uniqueIndex("users_tenant_open_id_unique").on(table.tenantKey, table.openId)],
 );
+
+export const userSettings = sqliteTable("user_settings", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  settingsJson: text("settings_json").notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});
 
 export const feishuCredentials = sqliteTable("feishu_credentials", {
   userId: text("user_id")
@@ -161,6 +170,7 @@ export const tasks = sqliteTable("tasks", {
   leaseId: text("lease_id"),
   threadId: text("thread_id"),
   currentTurnId: text("current_turn_id"),
+  threadConfigJson: text("thread_config_json"),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });
@@ -173,6 +183,7 @@ export const turns = sqliteTable("turns", {
   codexTurnId: text("codex_turn_id"),
   prompt: text("prompt").notNull(),
   status: text("status").notNull(),
+  configSnapshotJson: text("config_snapshot_json"),
   startedAt: integer("started_at", { mode: "timestamp_ms" }).notNull(),
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
   durationMs: integer("duration_ms"),
@@ -188,12 +199,78 @@ export const taskEvents = sqliteTable(
     sequence: integer("sequence").notNull(),
     threadId: text("thread_id"),
     turnId: text("turn_id"),
+    itemId: text("item_id"),
     type: text("type").notNull(),
     payloadJson: text("payload_json").notNull(),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   },
   (table) => [uniqueIndex("task_events_task_sequence_unique").on(table.taskId, table.sequence)],
 );
+
+export const subagentThreads = sqliteTable("subagent_threads", {
+  threadId: text("thread_id").primaryKey(),
+  parentTaskId: text("parent_task_id")
+    .notNull()
+    .references(() => tasks.id, { onDelete: "cascade" }),
+  parentThreadId: text("parent_thread_id"),
+  parentTurnId: text("parent_turn_id"),
+  ownerId: text("owner_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  sessionId: text("session_id"),
+  name: text("name").notNull(),
+  role: text("role").notNull(),
+  model: text("model"),
+  effort: text("effort"),
+  status: text("status").notNull(),
+  resultSummary: text("result_summary"),
+  startedAt: integer("started_at", { mode: "timestamp_ms" }).notNull(),
+  completedAt: integer("completed_at", { mode: "timestamp_ms" }),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const subagentEvents = sqliteTable(
+  "subagent_events",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    threadId: text("thread_id")
+      .notNull()
+      .references(() => subagentThreads.threadId, { onDelete: "cascade" }),
+    sequence: integer("sequence").notNull(),
+    turnId: text("turn_id"),
+    itemId: text("item_id").notNull(),
+    type: text("type").notNull(),
+    payloadJson: text("payload_json").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("subagent_events_thread_sequence_unique").on(table.threadId, table.sequence),
+  ],
+);
+
+export const threadTokenUsage = sqliteTable("thread_token_usage", {
+  runtimeThreadId: text("runtime_thread_id").primaryKey(),
+  parentTaskId: text("parent_task_id")
+    .notNull()
+    .references(() => tasks.id, { onDelete: "cascade" }),
+  ownerId: text("owner_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  parentRuntimeThreadId: text("parent_runtime_thread_id"),
+  turnId: text("turn_id"),
+  totalTokens: integer("total_tokens").notNull(),
+  inputTokens: integer("input_tokens").notNull(),
+  cachedInputTokens: integer("cached_input_tokens").notNull(),
+  outputTokens: integer("output_tokens").notNull(),
+  reasoningOutputTokens: integer("reasoning_output_tokens").notNull(),
+  lastTotalTokens: integer("last_total_tokens").notNull(),
+  lastInputTokens: integer("last_input_tokens").notNull(),
+  lastCachedInputTokens: integer("last_cached_input_tokens").notNull(),
+  lastOutputTokens: integer("last_output_tokens").notNull(),
+  lastReasoningOutputTokens: integer("last_reasoning_output_tokens").notNull(),
+  modelContextWindow: integer("model_context_window"),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});
 
 export const approvals = sqliteTable("approvals", {
   id: text("id").primaryKey(),
@@ -206,6 +283,7 @@ export const approvals = sqliteTable("approvals", {
     .notNull()
     .references(() => tasks.id, { onDelete: "cascade" }),
   turnId: text("turn_id").notNull(),
+  parentTurnId: text("parent_turn_id"),
   itemId: text("item_id").notNull(),
   approvalType: text("approval_type").notNull(),
   status: text("status").notNull(),
@@ -261,6 +339,7 @@ export const schema = {
   queueEntries,
   turnDurationSamples,
   users,
+  userSettings,
   feishuCredentials,
   oauthStates,
   sessions,
@@ -268,6 +347,8 @@ export const schema = {
   tasks,
   turns,
   taskEvents,
+  subagentThreads,
+  subagentEvents,
   approvals,
   toolCalls,
   auditEvents,

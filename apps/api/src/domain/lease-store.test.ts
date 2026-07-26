@@ -92,6 +92,84 @@ describe("SQLiteLeaseStore", () => {
     });
   });
 
+  test("selects the account required by an existing Thread instead of a higher-quota account", () => {
+    store.addAccount(account("thread-account", { weeklyRemaining: 10 }));
+    store.addAccount(account("higher-quota-account", { weeklyRemaining: 90 }));
+
+    expect(
+      store.acquireTurn({
+        ...request("user-1", "task-1", "turn-1"),
+        requiredAccountId: "thread-account",
+      }),
+    ).toMatchObject({
+      kind: "LEASED",
+      accountId: "thread-account",
+    });
+  });
+
+  test("persists required account affinity and promotes only onto that account", () => {
+    store.addAccount(account("thread-account", { weeklyRemaining: 10 }));
+    store.addAccount(account("other-account", { weeklyRemaining: 90 }));
+    expect(store.acquireTurn(request("user-1", "task-1", "turn-on-other"))).toMatchObject({
+      kind: "LEASED",
+      accountId: "other-account",
+    });
+
+    expect(
+      store.acquireTurn({
+        ...request("user-1", "task-2", "turn-pinned"),
+        requiredAccountId: "thread-account",
+      }),
+    ).toMatchObject({
+      kind: "QUEUED",
+    });
+    expect(store.getQueue()).toEqual([
+      expect.objectContaining({
+        taskId: "task-2",
+        turnId: "turn-pinned",
+        requiredAccountId: "thread-account",
+      }),
+    ]);
+
+    const promoted = store.releaseTurn("turn-on-other", new Date(NOW.getTime() + 1_000));
+    expect(promoted).toEqual([
+      expect.objectContaining({
+        kind: "LEASED",
+        accountId: "thread-account",
+        taskId: "task-2",
+        turnId: "turn-pinned",
+      }),
+    ]);
+    expect(store.getAccountOccupancy("other-account")).toEqual({
+      activeUsers: 0,
+      activeTurns: 0,
+    });
+  });
+
+  test("queues a required account when it is unavailable instead of falling back", () => {
+    store.addAccount(account("thread-account", { status: "QUARANTINED" }));
+    store.addAccount(account("fallback-account", { weeklyRemaining: 100 }));
+
+    expect(
+      store.acquireTurn({
+        ...request("user-1", "task-1", "turn-1"),
+        requiredAccountId: "thread-account",
+      }),
+    ).toMatchObject({
+      kind: "QUEUED",
+      reason: "NO_ELIGIBLE_ACCOUNT",
+    });
+    expect(store.getQueue()).toEqual([
+      expect.objectContaining({
+        requiredAccountId: "thread-account",
+      }),
+    ]);
+    expect(store.getAccountOccupancy("fallback-account")).toEqual({
+      activeUsers: 0,
+      activeTurns: 0,
+    });
+  });
+
   test.each(["DRAINING", "QUARANTINED", "REAUTH_REQUIRED", "EXHAUSTED"] as const)(
     "does not assign an account in %s state",
     (status) => {
@@ -179,6 +257,13 @@ describe("SQLiteLeaseStore", () => {
     });
 
     store.updateAccount("unknown", { allowUnknownQuota: true });
+    expect(store.promoteQueue(new Date(NOW.getTime() + 1))).toEqual([
+      expect.objectContaining({
+        kind: "LEASED",
+        accountId: "unknown",
+        taskId: "task-1",
+      }),
+    ]);
     expect(store.acquireTurn(request("user-2", "task-2", "turn-2"))).toMatchObject({
       kind: "LEASED",
       accountId: "unknown",
@@ -210,6 +295,103 @@ describe("SQLiteLeaseStore", () => {
     expect(store.getQueue()).toEqual([
       expect.objectContaining({ taskId: "task-6", position: 1, status: "WAITING" }),
     ]);
+  });
+
+  test("promotes the earliest runnable queue entry without starving another account", () => {
+    store.addAccount(account("blocked-account", { status: "QUARANTINED" }));
+    store.addAccount(
+      account("healthy-account", {
+        status: "QUARANTINED",
+        maxActiveUsers: 1,
+        weeklyRemaining: 90,
+      }),
+    );
+    store.acquireTurn({
+      ...request("user-1", "task-pinned", "turn-pinned"),
+      requiredAccountId: "blocked-account",
+    });
+    store.acquireTurn(request("user-2", "task-runnable", "turn-runnable", 1));
+    store.updateAccount("healthy-account", { status: "AVAILABLE" });
+
+    expect(store.promoteQueue(new Date(NOW.getTime() + 2))).toEqual([
+      expect.objectContaining({
+        taskId: "task-runnable",
+        turnId: "turn-runnable",
+        accountId: "healthy-account",
+      }),
+    ]);
+    expect(store.getQueue()).toEqual([
+      expect.objectContaining({
+        taskId: "task-pinned",
+        requiredAccountId: "blocked-account",
+        position: 1,
+      }),
+    ]);
+  });
+
+  test("does not let a new request take capacity from an earlier runnable queue entry", () => {
+    store.addAccount(account("blocked-account", { status: "QUARANTINED" }));
+    store.addAccount(
+      account("healthy-account", {
+        status: "QUARANTINED",
+        maxActiveUsers: 1,
+        weeklyRemaining: 90,
+      }),
+    );
+    store.acquireTurn({
+      ...request("user-1", "task-pinned", "turn-pinned"),
+      requiredAccountId: "blocked-account",
+    });
+    store.acquireTurn(request("user-2", "task-earlier", "turn-earlier", 1));
+    store.updateAccount("healthy-account", { status: "AVAILABLE" });
+
+    expect(store.acquireTurn(request("user-3", "task-new", "turn-new", 2))).toMatchObject({
+      kind: "QUEUED",
+    });
+    expect(store.promoteQueue(new Date(NOW.getTime() + 3))).toEqual([
+      expect.objectContaining({
+        taskId: "task-earlier",
+        turnId: "turn-earlier",
+        accountId: "healthy-account",
+      }),
+    ]);
+    expect(store.getQueue()).toEqual([
+      expect.objectContaining({ taskId: "task-pinned", position: 1 }),
+      expect.objectContaining({ taskId: "task-new", position: 2 }),
+    ]);
+  });
+
+  test("preserves FIFO for waiting Turns that target the same account resource", () => {
+    store.addAccount(account("account-a", { maxActiveUsers: 4 }));
+    store.acquireTurn(request("user-1", "task-running-1", "turn-running-1"));
+    store.acquireTurn(request("user-1", "task-running-2", "turn-running-2", 1));
+    expect(
+      store.acquireTurn({
+        ...request("user-1", "task-first", "turn-first", 2),
+        requiredAccountId: "account-a",
+      }),
+    ).toMatchObject({ kind: "QUEUED", position: 1 });
+    expect(
+      store.acquireTurn({
+        ...request("user-2", "task-second", "turn-second", 3),
+        requiredAccountId: "account-a",
+      }),
+    ).toMatchObject({ kind: "QUEUED", position: 2 });
+
+    expect(store.promoteQueue(new Date(NOW.getTime() + 4))).toEqual([]);
+    expect(store.releaseTurn("turn-running-1", new Date(NOW.getTime() + 5))).toEqual([
+      expect.objectContaining({
+        accountId: "account-a",
+        taskId: "task-first",
+        turnId: "turn-first",
+      }),
+      expect.objectContaining({
+        accountId: "account-a",
+        taskId: "task-second",
+        turnId: "turn-second",
+      }),
+    ]);
+    expect(store.getQueue()).toEqual([]);
   });
 
   test("cancels a queued Turn when recovery releases its scheduler allocation", () => {
