@@ -306,6 +306,17 @@ export class LocalPlatformService implements PlatformApi {
     return task ? this.projectThread(task, userId) : null;
   }
 
+  async getAdminThread(threadId: string, adminUserId: string): Promise<Thread | null> {
+    const admin = this.options.store.getUserIdentity(adminUserId);
+    if (admin.role !== "ADMIN") return null;
+    const ownerId = this.options.store.getTaskOwnerId(threadId);
+    if (!ownerId) return null;
+    const owner = this.options.store.getUserIdentity(ownerId);
+    if (owner.tenantKey !== admin.tenantKey) return null;
+    const task = this.options.store.getTaskForUser(threadId, ownerId);
+    return task ? this.projectThread(task, ownerId) : null;
+  }
+
   async startThreadTurn(
     threadId: string,
     userId: string,

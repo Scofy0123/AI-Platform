@@ -107,6 +107,12 @@ function createApi(session: Session = adminSession) {
     taskAction: vi.fn().mockResolvedValue({ ok: true }),
     listThreads: vi.fn().mockResolvedValue([thread]),
     getThread: vi.fn().mockResolvedValue(thread),
+    getAdminThread: vi.fn().mockResolvedValue({
+      ...thread,
+      title: "成员的审计 Thread",
+      status: "COMPLETED",
+      currentTurn: null,
+    }),
     createThread: vi.fn().mockResolvedValue({ ...thread, id: "thread-created" }),
     startThreadTurn: vi.fn().mockResolvedValue({ status: "RUNNING", turnId: "turn-created" }),
     threadAction: vi.fn().mockResolvedValue({ ok: true }),
@@ -794,6 +800,88 @@ describe("CodexPlatform 1.1 personal settings", () => {
       }),
     );
   });
+
+  test("does not present pending personal usage as factual zero metrics", async () => {
+    const api = createApi();
+    api.getMyUsage.mockImplementation(() => new Promise(() => undefined));
+    render(<App initialEntries={["/settings/usage"]} api={api} />);
+
+    const loading = await screen.findByText("Loading usage");
+    expect(loading.closest('[role="status"]')).toBeInTheDocument();
+    expect(screen.queryByText("Threads")).not.toBeInTheDocument();
+    expect(screen.queryByText("Turns")).not.toBeInTheDocument();
+  });
+
+  test("does not expose cached usage while a forced remount refresh is pending", async () => {
+    const api = createApi();
+    api.getMyUsage
+      .mockResolvedValueOnce({
+        threads: 7,
+        turns: 8,
+        toolCalls: 9,
+        subagents: 10,
+        tokenUsage: null,
+        tokenUsageStatus: "UNKNOWN",
+        quota: { scope: "SHARED_CODEX_ACCOUNT", attributableToUser: false },
+      })
+      .mockImplementationOnce(() => new Promise(() => undefined));
+    render(<App initialEntries={["/settings/usage"]} api={api} />);
+
+    const usageCard = (await screen.findByRole("heading", { name: "Personal activity" })).closest(
+      "section",
+    );
+    expect(usageCard).not.toBeNull();
+    expect(await within(usageCard as HTMLElement).findByText("7")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "General" }));
+    await screen.findByRole("heading", { name: "General preferences" });
+    fireEvent.click(screen.getByRole("link", { name: "Usage" }));
+
+    expect(await screen.findByText("Loading usage")).toBeInTheDocument();
+    expect(screen.queryByText("7")).not.toBeInTheDocument();
+  });
+
+  test("fails closed when personal usage and connection capabilities are missing", async () => {
+    const { getMyUsage: _getMyUsage, listMyConnections: _listMyConnections, ...api } = createApi();
+    const usageView = render(<App initialEntries={["/settings/usage"]} api={api} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取个人使用数据");
+    usageView.unmount();
+    render(<App initialEntries={["/settings/connections"]} api={api} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取组织连接状态");
+  });
+
+  test("shows a retryable personal usage error and recovers with fresh data", async () => {
+    const api = createApi();
+    api.getMyUsage.mockRejectedValueOnce(new Error("USAGE_READ_FAILED"));
+    render(<App initialEntries={["/settings/usage"]} api={api} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取个人使用数据");
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+
+    expect(await screen.findByText("Threads")).toBeInTheDocument();
+    expect(screen.getByText("Turns")).toBeInTheDocument();
+    expect(api.getMyUsage).toHaveBeenCalledTimes(2);
+  });
+
+  test("shows an explicit empty state for organization connections", async () => {
+    const api = createApi();
+    api.listMyConnections.mockResolvedValue([]);
+    render(<App initialEntries={["/settings/connections"]} api={api} />);
+
+    expect(await screen.findByText(/暂无可用的组织连接/)).toBeInTheDocument();
+  });
+
+  test("shows a retryable organization connection error", async () => {
+    const api = createApi();
+    api.listMyConnections.mockRejectedValueOnce(new Error("CONNECTIONS_READ_FAILED"));
+    render(<App initialEntries={["/settings/connections"]} api={api} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取组织连接状态");
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+
+    expect(await screen.findByText("Connected")).toBeInTheDocument();
+    expect(api.listMyConnections).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("CodexPlatform 1.1 account administration", () => {
@@ -828,5 +916,63 @@ describe("CodexPlatform 1.1 account administration", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "恢复" }));
     await waitFor(() => expect(api.accountAction).toHaveBeenCalledWith("account-1", "restore"));
+  });
+
+  test("shows a traceable audit actor and safe Platform Thread reference", async () => {
+    const api = createApi();
+    api.listAudit.mockResolvedValue([
+      {
+        id: "audit-1",
+        timestamp: "2026-07-25T12:00:00.000Z",
+        actorName: "林可",
+        action: "LEASE_ACQUIRED",
+        resource: "Codex account lease acquired",
+        result: "SUCCESS",
+        accountAlias: "Codex 01",
+        taskId: "thread-1",
+      },
+    ]);
+    render(<App initialEntries={["/admin/audit"]} api={api} />);
+
+    expect(await screen.findByText("林可")).toBeInTheDocument();
+    expect(screen.getByText("Thread thread-1")).toBeInTheDocument();
+    expect(screen.getByText("Codex 01")).toBeInTheDocument();
+  });
+
+  test("opens a member-owned audit Thread in a read-only administrator view", async () => {
+    const api = createApi();
+    api.listAudit.mockResolvedValue([
+      {
+        id: "audit-1",
+        timestamp: "2026-07-25T12:00:00.000Z",
+        actorName: "周宁",
+        action: "LEASE_ACQUIRED",
+        resource: "Codex account lease acquired",
+        result: "SUCCESS",
+        accountAlias: "Codex 01",
+        taskId: "member-thread",
+      },
+    ]);
+    render(<App initialEntries={["/admin/audit"]} api={api} />);
+
+    fireEvent.click(await screen.findByRole("link", { name: "Thread member-thread" }));
+
+    expect(await screen.findByRole("heading", { name: "成员的审计 Thread" })).toBeInTheDocument();
+    expect(api.getAdminThread).toHaveBeenCalledWith("member-thread");
+    expect(screen.getByText("只读审计视图")).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Message Codex")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "停止" })).not.toBeInTheDocument();
+  });
+
+  test("shows a retryable audit loading error instead of an empty list", async () => {
+    const api = createApi();
+    api.listAudit.mockRejectedValueOnce(new Error("AUDIT_READ_FAILED"));
+    render(<App initialEntries={["/admin/audit"]} api={api} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取审计记录");
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+
+    await waitFor(() => expect(api.listAudit).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/暂无审计记录/)).toBeInTheDocument();
   });
 });

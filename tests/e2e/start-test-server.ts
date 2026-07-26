@@ -282,6 +282,16 @@ function seedPrivateThreadTree(
         'TURN_COMPLETED', '{"status":"completed","durationMs":5}', ?)`,
     )
     .run(seededFixture.threadId, seededFixture.runtimeThreadId, now - 5);
+  sqlite
+    .prepare(
+      `INSERT INTO audit_events (
+        id, actor_user_id, account_id, account_alias, task_id, action, outcome, summary, created_at
+      ) VALUES (
+        'e2e-audit-thread', ?, 'primary-codex', ?, ?, 'LEASE_ACQUIRED', 'SUCCESS',
+        'E2E seeded account lease acquired', ?
+      )`,
+    )
+    .run(e2eIdentity.userId, e2eCanaries.accountAlias, seededFixture.threadId, now - 4);
   seedQueuedThread(sqlite, configSnapshot, now);
 
   seedSubagent(sqlite, {

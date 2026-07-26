@@ -38,6 +38,7 @@ export interface PlatformApi {
   ): Promise<Thread>;
   listThreads(userId: string, projectId?: string): Promise<Thread[]>;
   getThread(threadId: string, userId: string): Promise<Thread | null>;
+  getAdminThread(threadId: string, adminUserId: string): Promise<Thread | null>;
   startThreadTurn(
     threadId: string,
     userId: string,

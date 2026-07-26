@@ -199,6 +199,7 @@ function AdminWorkspace({ session }: { session: Session }) {
           <Route path="/" element={<Navigate to="/admin/accounts" replace />} />
           <Route path="/accounts" element={<AccountsPage />} />
           <Route path="/audit" element={<AuditPage />} />
+          <Route path="/threads/:threadId" element={<AdminThreadPage />} />
           <Route path="/policies" element={<AdminPoliciesPage />} />
           <Route path="/connectors" element={<AdminConnectorsPage />} />
           <Route path="/usage" element={<AdminUsagePage />} />
@@ -479,24 +480,7 @@ interface ThreadView {
 
 async function loadThread(api: PlatformApi, threadId: string): Promise<ThreadView> {
   if (api.getThread) {
-    const thread = await api.getThread(threadId);
-    return {
-      id: thread.id,
-      projectId: thread.projectId,
-      title: thread.title,
-      status: thread.status,
-      updatedAt: thread.updatedAt,
-      prompt: thread.currentTurn?.prompt ?? thread.turns.at(-1)?.prompt ?? null,
-      currentTurnId: thread.currentTurn?.id ?? null,
-      currentTurnStatus: thread.currentTurn?.status ?? null,
-      turns: thread.turns.map((turn) => ({
-        id: turn.id,
-        prompt: turn.prompt,
-        status: turn.status,
-      })),
-      queue: thread.queue,
-      events: thread.items.map((item) => threadItemToEvent(thread.id, item)),
-    };
+    return projectThreadView(await api.getThread(threadId));
   }
   const task = await api.getTask(threadId);
   return {
@@ -511,6 +495,26 @@ async function loadThread(api: PlatformApi, threadId: string): Promise<ThreadVie
     turns: [],
     queue: task.queue,
     events: task.events ?? [],
+  };
+}
+
+function projectThreadView(thread: Thread): ThreadView {
+  return {
+    id: thread.id,
+    projectId: thread.projectId,
+    title: thread.title,
+    status: thread.status,
+    updatedAt: thread.updatedAt,
+    prompt: thread.currentTurn?.prompt ?? thread.turns.at(-1)?.prompt ?? null,
+    currentTurnId: thread.currentTurn?.id ?? null,
+    currentTurnStatus: thread.currentTurn?.status ?? null,
+    turns: thread.turns.map((turn) => ({
+      id: turn.id,
+      prompt: turn.prompt,
+      status: turn.status,
+    })),
+    queue: thread.queue,
+    events: thread.items.map((item) => threadItemToEvent(thread.id, item)),
   };
 }
 
@@ -830,6 +834,7 @@ function Conversation({
   status,
   approvalDecisions,
   closedTurnIds,
+  readOnly = false,
 }: {
   prompt: string | null;
   turns: Array<{ id: string; prompt: string }>;
@@ -838,11 +843,13 @@ function Conversation({
   status: TaskStatus;
   approvalDecisions: Map<string, string>;
   closedTurnIds: Set<string>;
+  readOnly?: boolean;
 }) {
   const prompts =
     turns.length > 0 ? turns : prompt ? [{ id: events[0]?.turnId ?? "turn", prompt }] : [];
   const rendered = new Set<number>();
-  const approvalsLocked = ["COMPLETED", "FAILED", "INTERRUPTED", "NEEDS_RECOVERY"].includes(status);
+  const approvalsLocked =
+    readOnly || ["COMPLETED", "FAILED", "INTERRUPTED", "NEEDS_RECOVERY"].includes(status);
   return (
     <div className="v11-conversation-stream">
       {prompts.map((turn) => {
@@ -1807,16 +1814,33 @@ function ConnectionsSettings() {
   const api = useApi();
   const connections = useQuery({
     queryKey: ["my-connections"],
-    queryFn: () => (api.listMyConnections ? api.listMyConnections() : Promise.resolve([])),
+    queryFn: () => {
+      if (!api.listMyConnections) throw new Error("Connections endpoint unavailable");
+      return api.listMyConnections();
+    },
+    refetchOnMount: "always",
   });
+  const ready = connections.isSuccess && !connections.isFetching;
   return (
     <SettingsCard title="Organization connections">
-      {connections.data?.map((item) => (
-        <SettingRow label={item.name} key={item.id}>
-          <strong>{item.connected ? "Connected" : "Not connected"}</strong>
-          <span>{item.managed ? "Managed by organization" : "Personal"}</span>
-        </SettingRow>
-      ))}
+      {connections.isFetching ? <InlineQueryState label="Loading connections" /> : null}
+      {connections.isError ? (
+        <RetryableQueryError
+          copy="无法读取组织连接状态。"
+          onRetry={() => void connections.refetch()}
+        />
+      ) : null}
+      {ready && connections.data.length === 0 ? (
+        <p>暂无可用的组织连接，请联系管理员确认连接器配置。</p>
+      ) : null}
+      {ready
+        ? connections.data.map((item) => (
+            <SettingRow label={item.name} key={item.id}>
+              <strong>{item.connected ? "Connected" : "Not connected"}</strong>
+              <span>{item.managed ? "Managed by organization" : "Personal"}</span>
+            </SettingRow>
+          ))
+        : null}
     </SettingsCard>
   );
 }
@@ -1849,17 +1873,30 @@ function UsageSettings() {
   const api = useApi();
   const usage = useQuery({
     queryKey: ["my-usage"],
-    queryFn: () => (api.getMyUsage ? api.getMyUsage() : Promise.resolve(null)),
+    queryFn: () => {
+      if (!api.getMyUsage) throw new Error("Usage endpoint unavailable");
+      return api.getMyUsage();
+    },
+    refetchOnMount: "always",
   });
+  const ready = usage.isSuccess && !usage.isFetching;
   return (
     <SettingsCard title="Personal activity">
-      <div className="v11-usage-grid">
-        <Metric label="Threads" value={usage.data?.threads ?? 0} />
-        <Metric label="Turns" value={usage.data?.turns ?? 0} />
-        <Metric label="Tools" value={usage.data?.toolCalls ?? 0} />
-        <Metric label="Subagents" value={usage.data?.subagents ?? 0} />
-      </div>
-      <p>Shared runtime quota is not attributed to individual users.</p>
+      {usage.isFetching ? <InlineQueryState label="Loading usage" /> : null}
+      {usage.isError ? (
+        <RetryableQueryError copy="无法读取个人使用数据。" onRetry={() => void usage.refetch()} />
+      ) : null}
+      {ready ? (
+        <>
+          <div className="v11-usage-grid">
+            <Metric label="Threads" value={usage.data.threads} />
+            <Metric label="Turns" value={usage.data.turns} />
+            <Metric label="Tools" value={usage.data.toolCalls} />
+            <Metric label="Subagents" value={usage.data.subagents} />
+          </div>
+          <p>Shared runtime quota is not attributed to individual users.</p>
+        </>
+      ) : null}
     </SettingsCard>
   );
 }
@@ -2045,7 +2082,12 @@ function AccountCard({
 
 function AuditPage() {
   const api = useApi();
-  const audit = useQuery({ queryKey: ["audit"], queryFn: api.listAudit });
+  const audit = useQuery({
+    queryKey: ["audit"],
+    queryFn: api.listAudit,
+    refetchOnMount: "always",
+  });
+  const ready = audit.isSuccess && !audit.isFetching;
   return (
     <section className="v11-admin-page">
       <header>
@@ -2054,18 +2096,99 @@ function AuditPage() {
           <h1>审计记录</h1>
         </div>
       </header>
+      {audit.isFetching ? <InlineQueryState label="Loading audit" /> : null}
+      {audit.isError ? (
+        <RetryableQueryError copy="无法读取审计记录。" onRetry={() => void audit.refetch()} />
+      ) : null}
+      {ready && audit.data.length === 0 ? <p>暂无审计记录。</p> : null}
       <div className="v11-audit-list">
-        {audit.data?.map((entry) => (
-          <article key={entry.id}>
-            <time>{formatDateTime(entry.timestamp)}</time>
-            <strong>{entry.actorName}</strong>
-            <code>{entry.action}</code>
-            <span>{entry.resource}</span>
-            <span>{entry.accountAlias ?? "—"}</span>
-            <span>{entry.result}</span>
-          </article>
-        ))}
+        {ready
+          ? audit.data.map((entry) => (
+              <article key={entry.id}>
+                <time data-label="Time">{formatDateTime(entry.timestamp)}</time>
+                <strong data-label="Actor">{entry.actorName}</strong>
+                <code data-label="Action">{entry.action}</code>
+                <span data-label="Resource">{entry.resource}</span>
+                <span data-label="Account">{entry.accountAlias ?? "—"}</span>
+                {entry.taskId ? (
+                  <Link
+                    data-label="Thread"
+                    to={`/admin/threads/${encodeURIComponent(entry.taskId)}`}
+                  >
+                    Thread {entry.taskId}
+                  </Link>
+                ) : (
+                  <span data-label="Thread">Thread —</span>
+                )}
+                <span data-label="Result">{entry.result}</span>
+              </article>
+            ))
+          : null}
       </div>
+    </section>
+  );
+}
+
+function AdminThreadPage() {
+  const { threadId = "" } = useParams();
+  const api = useApi();
+  const thread = useQuery({
+    queryKey: ["admin-thread", threadId],
+    queryFn: async () => {
+      if (!api.getAdminThread) throw new Error("Administrator Thread endpoint unavailable");
+      return projectThreadView(await api.getAdminThread(threadId));
+    },
+    enabled: Boolean(threadId),
+  });
+  if (thread.isPending) return <FullPageState label="正在打开审计 Thread" />;
+  if (thread.isError) return <PageError title="无法打开审计 Thread" />;
+
+  const events = coalesceThreadEvents(thread.data.events).filter(isSafeConversationEvent);
+  const status = projectStatus(thread.data.status, events, thread.data.currentTurnId);
+  const approvalDecisions = new Map(
+    events.flatMap((event) =>
+      event.type === "APPROVAL_DECIDED"
+        ? [[event.payload.approvalId, event.payload.decision] as const]
+        : [],
+    ),
+  );
+  const closedTurnIds = new Set(
+    events.flatMap((event) =>
+      event.turnId &&
+      ["TURN_COMPLETED", "TURN_FAILED", "TURN_INTERRUPTED", "RECOVERY_REQUIRED"].includes(
+        event.type,
+      )
+        ? [event.turnId]
+        : [],
+    ),
+  );
+  return (
+    <section className="v11-thread-page v11-admin-thread-page">
+      <header className="v11-thread-header">
+        <div>
+          <Link className="v11-back-link" to="/admin/audit">
+            <Icon name="arrow" /> 返回审计记录
+          </Link>
+          <h1>{thread.data.title}</h1>
+          <StatusBadge status={status} />
+        </div>
+        <span className="v11-readonly-label">
+          <Icon name="shield" /> 只读审计视图
+        </span>
+      </header>
+      <section className="v11-conversation" aria-label="Read-only Thread conversation">
+        <Conversation
+          prompt={thread.data.prompt}
+          turns={thread.data.turns}
+          events={events}
+          api={api}
+          status={status}
+          approvalDecisions={approvalDecisions}
+          closedTurnIds={closedTurnIds}
+          readOnly
+        />
+        <Inspector events={events} />
+      </section>
     </section>
   );
 }
@@ -2259,6 +2382,26 @@ function InlineError({ copy }: { copy: string }) {
   );
 }
 
+function RetryableQueryError({ copy, onRetry }: { copy: string; onRetry: () => void }) {
+  return (
+    <div>
+      <InlineError copy={copy} />
+      <button type="button" onClick={onRetry}>
+        重试
+      </button>
+    </div>
+  );
+}
+
+function InlineQueryState({ label }: { label: string }) {
+  return (
+    <div className="v11-inline-query-state" role="status">
+      <span className="loader-ring" />
+      <p>{label}</p>
+    </div>
+  );
+}
+
 function MutationNotice({
   pending,
   error,
@@ -2389,7 +2532,7 @@ function EmptyRail({ copy }: { copy: string }) {
 
 function FullPageState({ label }: { label: string }) {
   return (
-    <div className="full-state">
+    <div className="full-state" role="status">
       <span className="loader-ring" />
       <p>{label}</p>
     </div>

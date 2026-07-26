@@ -317,6 +317,7 @@ describe("CodexPlatform HTTP API", () => {
       {
         id: "audit-1",
         actorUserId: "user-1",
+        actorName: "林可",
         accountAlias: "Codex A",
         leaseId: "audit-lease-secret",
         taskId: "task-1",
@@ -397,6 +398,7 @@ describe("CodexPlatform HTTP API", () => {
       {
         id: "audit-1",
         actorUserId: "user-1",
+        actorName: "林可",
         accountAlias: "Codex A",
         taskId: "task-1",
         action: "LEASE_ACQUIRED",
@@ -810,6 +812,31 @@ describe("CodexPlatform HTTP API", () => {
     }
     expect(memberServices.platform.getAdminPolicies).not.toHaveBeenCalled();
   });
+
+  test("serves a member-owned Thread through the administrator-only read projection", async () => {
+    const adminServices = services("ADMIN");
+    const admin = buildApp(adminServices);
+    apps.push(admin);
+    const memberServices = services("MEMBER");
+    const member = buildApp(memberServices);
+    apps.push(member);
+
+    const adminResponse = await admin.inject({
+      method: "GET",
+      url: "/api/admin/threads/member-thread",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const memberResponse = await member.inject({
+      method: "GET",
+      url: "/api/admin/threads/member-thread",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    expect(adminResponse.statusCode).toBe(200);
+    expect(adminServices.platform.getAdminThread).toHaveBeenCalledWith("member-thread", "user-1");
+    expect(memberResponse.statusCode).toBe(403);
+    expect(memberServices.platform.getAdminThread).not.toHaveBeenCalled();
+  });
 });
 
 function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
@@ -901,6 +928,17 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       projectId: "project-1",
       title: "Build it",
       status: "RUNNING" as const,
+      updatedAt: "2026-07-21T12:00:00.000Z",
+      currentTurn: null,
+      turns: [],
+      queue: null,
+      items: [],
+    })),
+    getAdminThread: vi.fn(async () => ({
+      id: "member-thread",
+      projectId: "project-1",
+      title: "Member Thread",
+      status: "COMPLETED" as const,
       updatedAt: "2026-07-21T12:00:00.000Z",
       currentTurn: null,
       turns: [],

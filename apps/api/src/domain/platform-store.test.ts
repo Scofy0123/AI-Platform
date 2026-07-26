@@ -586,6 +586,7 @@ describe("SQLitePlatformStore", () => {
   });
 
   test("records tool provenance and hashes payloads instead of storing sensitive arguments", () => {
+    database.sqlite.prepare("UPDATE users SET name = ? WHERE id = ?").run("林可", "user-1");
     const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
     const task = store.createTask({
       ownerId: "user-1",
@@ -626,6 +627,7 @@ describe("SQLitePlatformStore", () => {
     expect(store.listAudit({ actorUserId: "user-1" })).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
+          actorName: "林可",
           action: "TOOL_INVOKED",
           accountAlias: "Codex A",
           toolCallId: expect.any(String),

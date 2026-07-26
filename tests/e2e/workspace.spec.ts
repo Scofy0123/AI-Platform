@@ -178,6 +178,34 @@ test("administrator uses a separate management console", async ({ page }, testIn
   }
 });
 
+test("1280px administrator audit keeps every traceability field and opens a read-only Thread", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto("/admin/audit");
+
+  const auditEntry = page.locator(".v11-audit-list article", {
+    has: page.getByRole("link", { name: `Thread ${seededFixture.threadId}` }),
+  });
+  await expect(auditEntry.locator('[data-label="Actor"]')).toHaveText(e2eIdentity.name);
+  await expect(auditEntry.locator('[data-label="Account"]')).toHaveText(e2eCanaries.accountAlias);
+  await expect(auditEntry.locator('[data-label="Thread"]')).toBeVisible();
+  await expect(auditEntry.locator('[data-label="Result"]')).toHaveText("SUCCESS");
+
+  const adminThreadResponse = await page.request.get(
+    `/api/admin/threads/${seededFixture.threadId}`,
+  );
+  expect(adminThreadResponse.status()).toBe(200);
+  assertNoBrowserLeaks(await adminThreadResponse.text(), []);
+
+  await auditEntry.locator('[data-label="Thread"]').click();
+  await expect(page).toHaveURL(new RegExp(`/admin/threads/${seededFixture.threadId}$`));
+  await expect(page.getByRole("heading", { name: "E2E seeded private Thread" })).toBeVisible();
+  await expect(page.getByText("只读审计视图")).toBeVisible();
+  await expect(page.getByLabel("Read-only Thread conversation")).toBeVisible();
+  await expect(page.getByLabel("Message Codex")).toHaveCount(0);
+});
+
 test("seeded Subagents render Active and Done summaries with inspectable details", async ({
   page,
 }) => {
@@ -213,6 +241,8 @@ test("MEMBER has no admin affordance and cannot access admin or another user's T
 
   const adminApi = await page.request.get("/api/admin/accounts");
   expect(adminApi.status()).toBe(403);
+  const adminThreadApi = await page.request.get(`/api/admin/threads/${seededFixture.threadId}`);
+  expect(adminThreadApi.status()).toBe(403);
   await expectNotFound(page, `/api/threads/${seededFixture.threadId}`);
   await expectNotFound(page, `/api/threads/${seededFixture.threadId}/subagents`);
   await expectNotFound(page, `/api/subagents/${seededFixture.doneSubagentId}`);

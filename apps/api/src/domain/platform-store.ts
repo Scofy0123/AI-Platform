@@ -1523,14 +1523,26 @@ export class SQLitePlatformStore {
   listAudit(filter: { actorUserId?: string } = {}) {
     const rows = filter.actorUserId
       ? (this.sqlite
-          .prepare("SELECT * FROM audit_events WHERE actor_user_id = ? ORDER BY created_at DESC")
+          .prepare(
+            `SELECT ae.*, u.name AS actor_name
+             FROM audit_events ae
+             LEFT JOIN users u ON u.id = ae.actor_user_id
+             WHERE ae.actor_user_id = ?
+             ORDER BY ae.created_at DESC`,
+          )
           .all(filter.actorUserId) as Array<Record<string, unknown>>)
-      : (this.sqlite.prepare("SELECT * FROM audit_events ORDER BY created_at DESC").all() as Array<
-          Record<string, unknown>
-        >);
+      : (this.sqlite
+          .prepare(
+            `SELECT ae.*, u.name AS actor_name
+             FROM audit_events ae
+             LEFT JOIN users u ON u.id = ae.actor_user_id
+             ORDER BY ae.created_at DESC`,
+          )
+          .all() as Array<Record<string, unknown>>);
     return rows.map((row) => ({
       id: row.id,
       actorUserId: row.actor_user_id,
+      actorName: row.actor_name ?? row.actor_user_id,
       accountAlias: row.account_alias,
       leaseId: row.lease_id,
       taskId: row.task_id,

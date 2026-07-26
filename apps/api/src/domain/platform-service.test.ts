@@ -279,6 +279,21 @@ describe("LocalPlatformService", () => {
     expect(JSON.stringify(detail)).not.toMatch(/ownerId|leaseId|runtime-thread|Codex A/);
   });
 
+  test("lets a same-tenant administrator inspect a member Thread read-only", async () => {
+    const project = await service.createProject("user-2", { name: "Member project" });
+    const thread = await service.createThread("user-2", {
+      projectId: project.id,
+      title: "Member conversation",
+    });
+
+    expect(await service.getAdminThread(thread.id, "user-1")).toMatchObject({
+      id: thread.id,
+      title: "Member conversation",
+    });
+    expect(await service.getAdminThread(thread.id, "user-2")).toBeNull();
+    expect(await service.getThread(thread.id, "user-1")).toBeNull();
+  });
+
   test("reconstructs every completed Turn in creation order with its immutable config snapshot", async () => {
     const project = await service.createProject("user-1", { name: "History" });
     const thread = await service.createThread("user-1", {

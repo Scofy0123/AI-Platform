@@ -173,6 +173,7 @@ export interface PlatformApi {
   decideApproval(approvalId: string, decision: "accept" | "decline"): Promise<unknown>;
   listThreads?(projectId?: string): Promise<Thread[]>;
   getThread?(threadId: string): Promise<Thread>;
+  getAdminThread?(threadId: string): Promise<Thread>;
   createThread?(input: {
     projectId: string;
     title: string;

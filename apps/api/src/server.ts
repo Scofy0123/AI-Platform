@@ -471,6 +471,14 @@ function registerRoutes(
     return Array.isArray(entries) ? entries.map(projectAuditEntry) : [];
   });
 
+  app.get("/api/admin/threads/:id", async (request, reply) => {
+    const actor = requireAdmin(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    const thread = await platform.getAdminThread(id, actor.user.id);
+    return thread ? thread : reply.code(404).send({ error: "Thread not found" });
+  });
+
   app.get("/api/admin/policies", async (request, reply) => {
     const actor = requireAdmin(request, reply, auth);
     if (!actor) return;
@@ -778,6 +786,7 @@ function projectAuditEntry(value: unknown): Record<string, unknown> {
   return {
     ...(typeof source.id === "string" ? { id: source.id } : {}),
     ...(typeof source.actorUserId === "string" ? { actorUserId: source.actorUserId } : {}),
+    ...(typeof source.actorName === "string" ? { actorName: source.actorName } : {}),
     ...(typeof source.accountAlias === "string" ? { accountAlias: source.accountAlias } : {}),
     ...(typeof source.taskId === "string" ? { taskId: source.taskId } : {}),
     ...(typeof source.action === "string" ? { action: source.action } : {}),

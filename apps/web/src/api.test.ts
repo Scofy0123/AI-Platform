@@ -43,18 +43,21 @@ describe("HTTP API adapter", () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => jsonResponse({}));
     vi.stubGlobal("fetch", fetcher);
     const adminApi = httpApi as typeof httpApi & {
+      getAdminThread(threadId: string): Promise<unknown>;
       getAdminPolicies(): Promise<unknown>;
       listAdminConnectors(): Promise<unknown>;
       getAdminUsage(): Promise<unknown>;
       getAdminRuntimeHealth(): Promise<unknown>;
     };
 
+    await adminApi.getAdminThread("member-thread");
     await adminApi.getAdminPolicies();
     await adminApi.listAdminConnectors();
     await adminApi.getAdminUsage();
     await adminApi.getAdminRuntimeHealth();
 
     expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/admin/threads/member-thread",
       "/api/admin/policies",
       "/api/admin/connectors",
       "/api/admin/usage",
@@ -134,7 +137,9 @@ describe("HTTP API adapter", () => {
           {
             id: "audit-1",
             actorUserId: "user-1",
+            actorName: "林可",
             accountAlias: "Codex 01",
+            taskId: "thread-1",
             action: "LEASE_ACQUIRED",
             outcome: "SUCCESS",
             summary: "Codex account lease acquired",
@@ -150,9 +155,10 @@ describe("HTTP API adapter", () => {
     ]);
     await expect(httpApi.listAudit()).resolves.toEqual([
       expect.objectContaining({
-        actorName: "user-1",
+        actorName: "林可",
         resource: "Codex account lease acquired",
         result: "SUCCESS",
+        taskId: "thread-1",
       }),
     ]);
     await httpApi.taskAction("task-1", "steer", "优先处理权限");

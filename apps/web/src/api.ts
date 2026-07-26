@@ -41,6 +41,7 @@ interface RawAccount {
 interface RawAudit {
   id: string;
   actorUserId: string;
+  actorName?: string;
   accountAlias?: string | null;
   taskId?: string | null;
   action: string;
@@ -175,6 +176,8 @@ export const httpApi: PlatformApi = {
   listMyConnections: () => request<ConnectionSummary[]>("/api/me/connections"),
   listMyPlugins: () => request<PluginSummary[]>("/api/me/plugins"),
   getAdminPolicies: () => request<AdminPolicies>("/api/admin/policies"),
+  getAdminThread: (threadId) =>
+    request<Thread>(`/api/admin/threads/${encodeURIComponent(threadId)}`),
   listAdminConnectors: () => request<AdminConnector[]>("/api/admin/connectors"),
   getAdminUsage: () => request<AdminUsage>("/api/admin/usage"),
   getAdminRuntimeHealth: () => request<RuntimeHealth>("/api/admin/runtime-health"),
@@ -208,7 +211,7 @@ export const httpApi: PlatformApi = {
     return entries.map((entry) => ({
       id: entry.id,
       timestamp: entry.createdAt,
-      actorName: entry.actorUserId,
+      actorName: entry.actorName ?? entry.actorUserId,
       action: entry.action,
       resource: entry.summary,
       result: entry.outcome,
