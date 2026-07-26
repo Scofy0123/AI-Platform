@@ -15,6 +15,8 @@ describe("EnterpriseToolRuntime", () => {
     const onInvocation = vi.fn();
     const runtime = createRuntime({ search }, onInvocation);
     const call = {
+      accountId: "account-1",
+      connectionGeneration: 1,
       threadId: "thread-1",
       turnId: "turn-1",
       callId: "call-1",
@@ -55,6 +57,8 @@ describe("EnterpriseToolRuntime", () => {
 
     await expect(
       runtime.invoke({
+        accountId: "account-1",
+        connectionGeneration: 1,
         threadId: "thread-1",
         turnId: "turn-other",
         callId: "call-1",
@@ -68,6 +72,26 @@ describe("EnterpriseToolRuntime", () => {
     });
   });
 
+  test("fails closed when the immutable ActorContext does not grant the requested Tool Scope", async () => {
+    const runtime = createRuntime({}, undefined, ["feishu_doc_read"]);
+
+    await expect(
+      runtime.invoke({
+        accountId: "account-1",
+        connectionGeneration: 1,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "scope-denied",
+        namespace: null,
+        tool: "demo_db_query",
+        arguments: { sql: "SELECT id FROM demo_orders" },
+      }),
+    ).resolves.toEqual({
+      success: false,
+      contentItems: [{ type: "inputText", text: "Enterprise tool is not allowed for this actor" }],
+    });
+  });
+
   test("exposes only the four MVP tools and runs safe demo queries", async () => {
     const runtime = createRuntime();
     expect(runtime.definitions().map((tool) => tool.name)).toEqual([
@@ -78,6 +102,8 @@ describe("EnterpriseToolRuntime", () => {
     ]);
 
     const result = await runtime.invoke({
+      accountId: "account-1",
+      connectionGeneration: 1,
       threadId: "thread-1",
       turnId: "turn-1",
       callId: "call-db",
@@ -92,6 +118,7 @@ describe("EnterpriseToolRuntime", () => {
   function createRuntime(
     feishuOverrides: Record<string, unknown> = {},
     onInvocation?: ConstructorParameters<typeof EnterpriseToolRuntime>[0]["onInvocation"],
+    toolScopes = ["feishu_wiki_search", "feishu_doc_read", "demo_db_query", "demo_business_get"],
   ) {
     const sqlite = new Database(":memory:");
     databases.push(sqlite);
@@ -105,9 +132,20 @@ describe("EnterpriseToolRuntime", () => {
       ...feishuOverrides,
     };
     return new EnterpriseToolRuntime({
-      resolveActor: (threadId, turnId) =>
-        threadId === "thread-1" && turnId === "turn-1"
-          ? { taskId: "task-1", userId: "user-1", accessToken: "user-token" }
+      resolveActor: (identity) =>
+        identity.accountId === "account-1" &&
+        identity.connectionGeneration === 1 &&
+        identity.threadId === "thread-1" &&
+        identity.turnId === "turn-1"
+          ? {
+              taskId: "task-1",
+              tenantKey: "tenant-1",
+              userId: "user-1",
+              role: "MEMBER" as const,
+              toolScopes,
+              approvalPolicy: "ASK",
+              accessToken: "user-token",
+            }
           : null,
       createFeishuClient: () => feishu,
       demoDatabase: new SafeDemoDatabase(sqlite, { allowedTables: ["demo_orders"] }),

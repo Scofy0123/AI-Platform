@@ -1,11 +1,19 @@
 import { EventEmitter } from "node:events";
-import { TaskDetailSchema, TaskSummarySchema } from "@codexplatform/contracts";
+import {
+  BootstrapSchema,
+  TaskDetailSchema,
+  TaskSummarySchema,
+  ThreadSchema,
+  UserSettingsViewSchema,
+} from "@codexplatform/contracts";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { createDatabase, type PlatformDatabase } from "../infra/db/database.js";
 import { migrateDatabase } from "../infra/db/migrate.js";
+import { encodeSse } from "../server.js";
 import { AccountAdminStore } from "./account-admin-store.js";
 import { SQLiteLeaseStore } from "./lease-store.js";
 import {
+  ActiveTurnResumeConflictError,
   type ApprovalDraft,
   ApprovalTransportUnavailableError,
   LocalPlatformService,
@@ -73,14 +81,19 @@ describe("LocalPlatformService", () => {
     const streamed: unknown[] = [];
     const unsubscribe = service.subscribeTaskEvents(task.id, (event) => streamed.push(event));
 
-    await expect(
-      service.startTurn(task.id, "user-1", "Implement the scheduler"),
-    ).resolves.toMatchObject({
+    const started = await service.startTurn(task.id, "user-1", "Implement the scheduler");
+    const platformTurnId = (
+      database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+        id: string;
+      }
+    ).id;
+    expect(started).toMatchObject({
       status: "RUNNING",
       accountAlias: "Codex A",
       threadId: `thread-${task.id}`,
-      turnId: `codex-turn-${task.id}`,
+      turnId: platformTurnId,
     });
+    expect(JSON.stringify(started)).not.toContain(`codex-turn-${task.id}`);
     expect(execution.startTask).toHaveBeenCalledWith(
       expect.objectContaining({
         accountId: "account-1",
@@ -105,6 +118,62 @@ describe("LocalPlatformService", () => {
     );
     expect(streamed).toHaveLength(2);
     unsubscribe();
+  });
+
+  test("persists a Steer only after the runtime accepts it and replays it as a platform Turn item", async () => {
+    const project = await service.createProject("user-1", { name: "Steer persistence" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Initial");
+    const platformTurnId = (
+      database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+        id: string;
+      }
+    ).id;
+    const streamed: unknown[] = [];
+    service.subscribeThreadEvents(task.id, (event) => streamed.push(event));
+
+    await service.steerThread(task.id, "user-1", "优先核对权限边界");
+
+    expect(execution.steerTask).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      `codex-turn-${task.id}`,
+      "优先核对权限边界",
+    );
+    expect(streamed).toEqual([
+      expect.objectContaining({
+        turnId: platformTurnId,
+        type: "USER_MESSAGE",
+        payload: expect.objectContaining({
+          kind: "STEER",
+          text: "优先核对权限边界",
+        }),
+      }),
+    ]);
+    expect(await service.getThread(task.id, "user-1")).toMatchObject({
+      items: [
+        expect.anything(),
+        expect.objectContaining({
+          turnId: platformTurnId,
+          type: "USER_MESSAGE",
+          payload: expect.objectContaining({ text: "优先核对权限边界" }),
+        }),
+      ],
+    });
+
+    execution.steerTask.mockRejectedValueOnce(new Error("runtime rejected steer"));
+    await expect(service.steerThread(task.id, "user-1", "不得落库")).rejects.toThrow(
+      "runtime rejected steer",
+    );
+    expect(JSON.stringify(await service.getThread(task.id, "user-1"))).not.toContain("不得落库");
+  });
+
+  test("allows Steer only for RUNNING or WAITING_APPROVAL tasks", async () => {
+    const project = await service.createProject("user-1", { name: "Steer state" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await expect(service.steerThread(task.id, "user-1", "too early")).rejects.toThrow(
+      "does not accept Steer",
+    );
+    expect(execution.steerTask).not.toHaveBeenCalled();
   });
 
   test("returns strict public task DTOs with the latest prompt and live queue state", async () => {
@@ -134,6 +203,479 @@ describe("LocalPlatformService", () => {
     expect(JSON.stringify(detail)).not.toMatch(
       /ownerId|leaseId|currentTurnId|threadId|queueTicket/,
     );
+  });
+
+  test("boots 1.1 with only the real Codex product mode enabled", async () => {
+    expect(BootstrapSchema.parse(await service.getBootstrap())).toEqual({
+      platformVersion: "0.1.0",
+      defaultMode: "CODEX",
+      enabledModes: ["CODEX"],
+      capabilities: {
+        threads: true,
+        settings: true,
+        subagents: true,
+        reasoningSummaries: true,
+      },
+    });
+  });
+
+  test("projects legacy tasks as owned continuous Threads with stable Items", async () => {
+    const project = await service.createProject("user-1", { name: "Threads" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Continuous conversation",
+    });
+    await service.startThreadTurn(thread.id, "user-1", "Inspect the repository");
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: `thread-${thread.id}`,
+      turnId: `codex-turn-${thread.id}`,
+      type: "AGENT_MESSAGE_DELTA",
+      payload: { itemId: "message-1", delta: "Working" },
+    });
+    const schedulerTurn = database.sqlite
+      .prepare("SELECT id FROM turns WHERE task_id = ?")
+      .get(thread.id) as { id: string };
+
+    const detail = ThreadSchema.parse(await service.getThread(thread.id, "user-1"));
+    expect(detail).toMatchObject({
+      id: thread.id,
+      projectId: project.id,
+      title: "Continuous conversation",
+      currentTurn: {
+        id: schedulerTurn.id,
+        threadId: thread.id,
+        prompt: "Inspect the repository",
+      },
+      turns: [
+        expect.objectContaining({
+          id: schedulerTurn.id,
+          prompt: "Inspect the repository",
+          configSnapshot: expect.objectContaining({
+            reasoningEffort: "MEDIUM",
+            approvalMode: "ASK",
+          }),
+        }),
+      ],
+      items: [
+        expect.objectContaining({
+          id: expect.any(String),
+          threadId: thread.id,
+          turnId: schedulerTurn.id,
+          type: "LEASE_ACQUIRED",
+        }),
+        expect.objectContaining({
+          id: "message-1",
+          threadId: thread.id,
+          turnId: schedulerTurn.id,
+          type: "AGENT_MESSAGE_DELTA",
+        }),
+      ],
+    });
+    expect(await service.listThreads("user-1")).toEqual([
+      expect.objectContaining({ id: thread.id }),
+    ]);
+    expect(await service.getThread(thread.id, "user-2")).toBeNull();
+    expect(JSON.stringify(detail)).not.toMatch(/ownerId|leaseId|runtime-thread|Codex A/);
+  });
+
+  test("reconstructs every completed Turn in creation order with its immutable config snapshot", async () => {
+    const project = await service.createProject("user-1", { name: "History" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Two turns",
+    });
+
+    await service.startThreadTurn(thread.id, "user-1", "First prompt");
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: `thread-${thread.id}`,
+      turnId: `codex-turn-${thread.id}`,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed", durationMs: 10 },
+    });
+    execution.startTask.mockResolvedValueOnce({
+      threadId: `thread-${thread.id}`,
+      turnId: `codex-turn-${thread.id}-2`,
+    });
+    await service.startThreadTurn(thread.id, "user-1", "Second prompt");
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: `thread-${thread.id}`,
+      turnId: `codex-turn-${thread.id}-2`,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed", durationMs: 20 },
+    });
+
+    const detail = ThreadSchema.parse(await service.getThread(thread.id, "user-1"));
+    expect(detail.currentTurn).toBeNull();
+    expect(detail.turns.map((turn) => [turn.prompt, turn.status])).toEqual([
+      ["First prompt", "COMPLETED"],
+      ["Second prompt", "COMPLETED"],
+    ]);
+    expect(detail.turns[0]?.configSnapshot).toEqual(detail.turns[1]?.configSnapshot);
+    expect(JSON.stringify(detail)).not.toContain("Codex A");
+  });
+
+  test("isolates Settings and exposes organization policy metadata", async () => {
+    const updated = UserSettingsViewSchema.parse(
+      await service.patchMySettings("user-1", {
+        general: { theme: "DARK" },
+        personalization: { instructions: "Use concise Chinese." },
+      }),
+    );
+
+    expect(updated).toMatchObject({
+      general: { theme: "DARK" },
+      personalization: { instructions: "Use concise Chinese." },
+      policy: {
+        allowedModels: null,
+        allowedReasoningEfforts: ["LOW", "MEDIUM", "HIGH", "XHIGH", "ULTRA"],
+        allowedPermissionModes: ["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"],
+        allowedApprovalPreferences: ["ASK"],
+        lockedFields: [],
+      },
+    });
+    expect(await service.getMySettings("user-2")).toMatchObject({
+      general: { theme: "SYSTEM" },
+      personalization: { instructions: "" },
+    });
+    await expect(
+      service.patchMySettings("user-1", {
+        execution: { permissionMode: "FULL_ACCESS" },
+      } as never),
+    ).rejects.toThrow(/not allowed/i);
+    await expect(
+      service.patchMySettings("user-1", {
+        execution: { approvalPreference: "NEVER" },
+      } as never),
+    ).rejects.toThrow(/not allowed/i);
+  });
+
+  test("accepts only an owned project as the user's default project", async () => {
+    const owned = await service.createProject("user-1", { name: "Owned" });
+    const other = await service.createProject("user-2", { name: "Other user" });
+
+    await expect(
+      service.patchMySettings("user-1", {
+        general: { defaultProjectId: owned.id },
+      }),
+    ).resolves.toMatchObject({ general: { defaultProjectId: owned.id } });
+    await expect(
+      service.patchMySettings("user-1", {
+        general: { defaultProjectId: other.id },
+      }),
+    ).rejects.toThrow("Invalid default project");
+    await expect(
+      service.patchMySettings("user-1", {
+        general: { defaultProjectId: "unknown-project" },
+      }),
+    ).rejects.toThrow("Invalid default project");
+  });
+
+  test("passes each Feishu user's immutable effective Settings and ActorContext to Runtime", async () => {
+    await service.patchMySettings("user-1", {
+      execution: {
+        reasoningEffort: "HIGH",
+        permissionMode: "READ_ONLY",
+      },
+      personalization: {
+        personality: "FRIENDLY",
+        instructions: "Answer user one concisely.",
+      },
+    });
+    await service.patchMySettings("user-2", {
+      execution: {
+        reasoningEffort: "LOW",
+        permissionMode: "WORKSPACE_WRITE",
+      },
+      personalization: {
+        personality: "NONE",
+        instructions: "Answer user two with evidence.",
+      },
+    });
+    const projectOne = await service.createProject("user-1", { name: "One" });
+    const projectTwo = await service.createProject("user-2", { name: "Two" });
+    const threadOne = await service.createThread("user-1", {
+      projectId: projectOne.id,
+      title: "One",
+    });
+    const threadTwo = await service.createThread("user-2", {
+      projectId: projectTwo.id,
+      title: "Two",
+    });
+
+    await service.startThreadTurn(threadOne.id, "user-1", "First");
+    await service.startThreadTurn(threadTwo.id, "user-2", "Second");
+
+    expect(execution.startTask).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        effectiveConfig: expect.objectContaining({
+          reasoningEffort: "HIGH",
+          permissionMode: "READ_ONLY",
+          approvalMode: "ASK",
+          personality: "FRIENDLY",
+          instructions: expect.stringContaining("Answer user one concisely."),
+        }),
+        actorContext: {
+          tenantKey: "tenant-1",
+          userId: "user-1",
+          role: "ADMIN",
+          toolScopes: [
+            "feishu_wiki_search",
+            "feishu_doc_read",
+            "demo_db_query",
+            "demo_business_get",
+          ],
+          approvalPolicy: "ASK",
+        },
+      }),
+    );
+    expect(execution.startTask).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        effectiveConfig: expect.objectContaining({
+          reasoningEffort: "LOW",
+          permissionMode: "WORKSPACE_WRITE",
+          approvalMode: "ASK",
+          personality: "NONE",
+          instructions: expect.stringContaining("Answer user two with evidence."),
+        }),
+        actorContext: expect.objectContaining({
+          tenantKey: "tenant-1",
+          userId: "user-2",
+          role: "MEMBER",
+        }),
+      }),
+    );
+  });
+
+  test("merges organization, user, Thread and Turn config into one persisted immutable snapshot", async () => {
+    await service.patchMySettings("user-1", {
+      execution: { reasoningEffort: "LOW", permissionMode: "READ_ONLY" },
+      personalization: {
+        personality: "FRIENDLY",
+        instructions: "User instructions",
+      },
+    });
+    const project = await service.createProject("user-1", { name: "Config merge" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Config",
+      config: {
+        reasoningEffort: "HIGH",
+        permissionMode: "WORKSPACE_WRITE",
+        instructions: "Thread instructions",
+      },
+    });
+
+    await service.startThreadTurn(thread.id, "user-1", "Run", {
+      reasoningEffort: "ULTRA",
+      personality: "NONE",
+      instructions: "",
+    });
+
+    const detail = await service.getThread(thread.id, "user-1");
+    expect(detail?.currentTurn?.configSnapshot).toEqual({
+      model: null,
+      reasoningEffort: "ULTRA",
+      permissionMode: "WORKSPACE_WRITE",
+      approvalMode: "ASK",
+      personality: "NONE",
+      instructions:
+        "Apply organization policy and use the authenticated employee identity for enterprise tools.",
+      sourceVersion: "org-policy-1.1a-v1",
+    });
+    expect(execution.startTask).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        effectiveConfig: detail?.currentTurn?.configSnapshot,
+      }),
+    );
+  });
+
+  test("persists observable subagent summaries and keeps details private to the parent owner", async () => {
+    const project = await service.createProject("user-1", { name: "Subagents" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Delegate",
+    });
+    await service.startThreadTurn(thread.id, "user-1", "Run parallel research");
+
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: `thread-${thread.id}`,
+      turnId: `codex-turn-${thread.id}`,
+      type: "SUBAGENT_ACTIVITY",
+      payload: {
+        itemId: "collab-1:agent-thread-1",
+        agentThreadId: "agent-thread-1",
+        kind: "started",
+        name: "Repository audit",
+        role: "subagent",
+        model: "gpt-5",
+        effort: "HIGH",
+        status: "ACTIVE",
+        resultSummary: null,
+      },
+    });
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: "agent-thread-1",
+      turnId: "agent-turn-1",
+      subagentThreadId: "agent-thread-1",
+      type: "TURN_STARTED",
+      payload: { status: "inProgress" },
+    });
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: "agent-thread-1",
+      turnId: "agent-turn-1",
+      subagentThreadId: "agent-thread-1",
+      type: "AGENT_MESSAGE_DELTA",
+      payload: { itemId: "child-message-1", delta: "Inspecting files" },
+    });
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: "agent-thread-1",
+      turnId: "agent-turn-1",
+      subagentThreadId: "agent-thread-1",
+      type: "TURN_COMPLETED",
+      payload: { status: "completed", durationMs: 10 },
+    });
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: `thread-${thread.id}`,
+      turnId: `codex-turn-${thread.id}`,
+      type: "SUBAGENT_ACTIVITY",
+      payload: {
+        itemId: "collab-2:agent-thread-1",
+        agentThreadId: "agent-thread-1",
+        kind: "completed",
+        name: "Repository audit",
+        role: "subagent",
+        model: "gpt-5",
+        effort: "HIGH",
+        status: "DONE",
+        resultSummary: "No critical findings",
+      },
+    });
+
+    expect(await service.listSubagents(thread.id, "user-1")).toEqual([
+      expect.objectContaining({
+        threadId: "agent-thread-1",
+        parentThreadId: thread.id,
+        parentTurnId: expect.any(String),
+        status: "DONE",
+        resultSummary: "No critical findings",
+      }),
+    ]);
+    expect(await service.getSubagent("agent-thread-1", "user-1")).toMatchObject({
+      name: "Repository audit",
+      items: [
+        expect.objectContaining({ type: "TURN_STARTED", threadId: "agent-thread-1" }),
+        expect.objectContaining({
+          type: "AGENT_MESSAGE_DELTA",
+          id: "child-message-1",
+          threadId: "agent-thread-1",
+          turnId: null,
+        }),
+        expect.objectContaining({ type: "TURN_COMPLETED", threadId: "agent-thread-1" }),
+      ],
+    });
+    expect(await service.getSubagent("agent-thread-1", "user-2")).toBeNull();
+    expect(await service.getTask(thread.id, "user-1")).toMatchObject({ status: "RUNNING" });
+    expect((await service.getThread(thread.id, "user-1"))?.items).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "child-message-1" }),
+        expect.objectContaining({ turnId: "agent-turn-1", type: "TURN_COMPLETED" }),
+      ]),
+    );
+  });
+
+  test("reports only factual usage and connection data", async () => {
+    const project = await service.createProject("user-1", { name: "Usage" });
+    await service.createThread("user-1", { projectId: project.id, title: "One thread" });
+
+    expect(await service.getMyUsage("user-1")).toMatchObject({
+      threads: 1,
+      tokenUsage: null,
+      tokenUsageStatus: "UNKNOWN",
+    });
+    expect(await service.getMyConnections("user-1")).toEqual([
+      expect.objectContaining({
+        id: "feishu",
+        managed: true,
+        connected: false,
+      }),
+    ]);
+    expect(await service.getMyPlugins("user-1")).toEqual([]);
+  });
+
+  test("persists parent and child Thread token snapshots and aggregates the owned Thread tree", async () => {
+    const project = await service.createProject("user-1", { name: "Token usage" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Usage tree",
+    });
+    await service.startThreadTurn(thread.id, "user-1", "Delegate");
+    const parentThreadId = `thread-${thread.id}`;
+    const parentTurnId = `codex-turn-${thread.id}`;
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: parentThreadId,
+      turnId: parentTurnId,
+      type: "SUBAGENT_ACTIVITY",
+      payload: {
+        itemId: "collab-token",
+        agentThreadId: "agent-token",
+        kind: "started",
+        name: "Token child",
+        role: "subagent",
+        model: null,
+        effort: null,
+        status: "ACTIVE",
+        resultSummary: null,
+      },
+    });
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: parentThreadId,
+      turnId: parentTurnId,
+      type: "TOKEN_USAGE_UPDATED",
+      payload: tokenUsagePayload(100, 60, 10, 40, 8),
+    } as TaskEventDraft);
+    execution.emitTaskEvent({
+      taskId: thread.id,
+      threadId: "agent-token",
+      turnId: "agent-turn-token",
+      subagentThreadId: "agent-token",
+      type: "TOKEN_USAGE_UPDATED",
+      payload: tokenUsagePayload(50, 30, 5, 20, 4),
+    } as TaskEventDraft);
+
+    expect(await service.getMyUsage("user-1")).toMatchObject({
+      tokenUsageStatus: "KNOWN",
+      tokenUsage: {
+        scope: "OWNED_THREAD_TREES",
+        totalTokens: 150,
+        inputTokens: 90,
+        cachedInputTokens: 15,
+        outputTokens: 60,
+        reasoningOutputTokens: 12,
+      },
+      quota: {
+        scope: "SHARED_CODEX_ACCOUNT",
+        attributableToUser: false,
+      },
+    });
+    expect(await service.getSubagent("agent-token", "user-1")).toMatchObject({
+      tokenUsage: {
+        totalTokens: 50,
+        inputTokens: 30,
+        outputTokens: 20,
+      },
+    });
   });
 
   test("rejects a second active Turn for the same task before taking another slot", async () => {
@@ -254,6 +796,133 @@ describe("LocalPlatformService", () => {
     ]);
   });
 
+  test("attributes a subagent approval to its parent Turn without losing child transport identity", async () => {
+    const project = await service.createProject("user-1", { name: "Subagent approval" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Approval" });
+    await service.startTurn(task.id, "user-1", "Delegate a protected change");
+    const parentTurnId = `codex-turn-${task.id}`;
+    const platformParentTurnId = (
+      database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+        id: string;
+      }
+    ).id;
+
+    execution.emitApproval({
+      requestId: "child-approval-1",
+      rawRpcId: "child-approval-1",
+      accountId: "account-1",
+      connectionGeneration: 3,
+      taskId: task.id,
+      threadId: "agent-thread-1",
+      turnId: "agent-turn-1",
+      parentTurnId,
+      itemId: "child-command-1",
+      approvalType: "COMMAND",
+      payload: { reason: "run tests", command: "pnpm test", cwd: "/repo" },
+    });
+    execution.emitApproval({
+      requestId: "child-approval-2",
+      rawRpcId: "child-approval-2",
+      accountId: "account-1",
+      connectionGeneration: 3,
+      taskId: task.id,
+      threadId: "agent-thread-2",
+      turnId: "agent-turn-2",
+      parentTurnId,
+      itemId: "child-command-2",
+      approvalType: "COMMAND",
+      payload: { reason: "run checks", command: "pnpm typecheck", cwd: "/repo" },
+    });
+
+    expect(await service.getTask(task.id, "user-1")).toMatchObject({
+      status: "WAITING_APPROVAL",
+    });
+    const approvals = (await service.listApprovals(task.id, "user-1")) as Array<{
+      id: string;
+      turnId: string | null;
+      parentTurnId: string | null;
+      sourceThreadId: string;
+    }>;
+    expect(approvals).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          turnId: null,
+          parentTurnId: platformParentTurnId,
+          sourceThreadId: "agent-thread-1",
+        }),
+        expect.objectContaining({
+          turnId: null,
+          parentTurnId: platformParentTurnId,
+          sourceThreadId: "agent-thread-2",
+        }),
+      ]),
+    );
+    expect(await service.listTaskEvents(task.id, "user-1", 0)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "APPROVAL_REQUESTED",
+          turnId: platformParentTurnId,
+          payload: expect.objectContaining({
+            sourceThreadId: "agent-thread-1",
+            sourceSubagent: true,
+          }),
+        }),
+      ]),
+    );
+
+    const firstApproval = approvals.find(
+      (approval) => approval.sourceThreadId === "agent-thread-1",
+    );
+    const secondApproval = approvals.find(
+      (approval) => approval.sourceThreadId === "agent-thread-2",
+    );
+    await service.decideApproval(firstApproval?.id ?? "missing", "user-1", "accept");
+    expect(await service.getTask(task.id, "user-1")).toMatchObject({
+      status: "WAITING_APPROVAL",
+    });
+    await service.decideApproval(secondApproval?.id ?? "missing", "user-1", "accept");
+    expect(await service.getTask(task.id, "user-1")).toMatchObject({ status: "RUNNING" });
+    expect(await service.listTaskEvents(task.id, "user-1", 0)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "APPROVAL_DECIDED",
+          turnId: platformParentTurnId,
+        }),
+      ]),
+    );
+    expect(execution.respondApproval).toHaveBeenCalledWith(
+      "child-approval-1",
+      "accept",
+      expect.objectContaining({
+        transport: expect.objectContaining({
+          threadId: "agent-thread-1",
+          turnId: "agent-turn-1",
+        }),
+      }),
+    );
+    const firstDetail = await service.getSubagent("agent-thread-1", "user-1");
+    expect(firstDetail?.items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          turnId: null,
+          type: "APPROVAL_REQUESTED",
+          payload: expect.objectContaining({
+            sourceSubagent: true,
+            sourceSubagentName: "agent-thread-1",
+          }),
+        }),
+        expect.objectContaining({
+          turnId: null,
+          type: "APPROVAL_DECIDED",
+          payload: expect.objectContaining({ decision: "accept" }),
+        }),
+      ]),
+    );
+    expect(JSON.stringify({ approvals, firstDetail })).not.toMatch(
+      new RegExp(`codex-turn-${task.id}|agent-turn-[12]`),
+    );
+  });
+
   test("does not mark an approval delivered before the response write is acknowledged", async () => {
     const project = await service.createProject("user-1", { name: "Delayed approval" });
     const task = await service.createTask("user-1", { projectId: project.id, title: "Approval" });
@@ -320,10 +989,12 @@ describe("LocalPlatformService", () => {
       status: "DELIVERED",
       decision: "accept",
     });
-    await expect(service.decideApproval(approvalId, "user-1", "accept")).resolves.toMatchObject({
+    const idempotentDecision = await service.decideApproval(approvalId, "user-1", "accept");
+    expect(idempotentDecision).toMatchObject({
       status: "DELIVERED",
       decision: "accept",
     });
+    expect(JSON.stringify(idempotentDecision)).not.toContain(`codex-turn-${task.id}`);
     await expect(service.decideApproval(approvalId, "user-1", "decline")).rejects.toThrow(
       "different decision",
     );
@@ -512,6 +1183,135 @@ describe("LocalPlatformService", () => {
     await service.startTurn(task.id, "user-1", "Continue from the safe Turn boundary");
     expect(execution.startTask).toHaveBeenCalledTimes(2);
     expect(accounts.list()[0]).toMatchObject({ activeUsers: 1, activeTurns: 1 });
+  });
+
+  test("queues an existing Thread when its bound account is unavailable instead of migrating it", async () => {
+    const project = await service.createProject("user-1", { name: "Runtime affinity" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Pinned Task",
+    });
+    await service.startTurn(task.id, "user-1", "First Turn");
+    execution.emitTaskEvent({
+      taskId: task.id,
+      threadId: `thread-${task.id}`,
+      turnId: `codex-turn-${task.id}`,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed", durationMs: 10 },
+    });
+    leases.addAccount({
+      id: "account-2",
+      alias: "Codex B",
+      codexHome: "/tmp/codexplatform-test/account-2",
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+      maxActiveUsers: 4,
+      weeklyRemaining: 100,
+      quotaUpdatedAt: NOW,
+      allowUnknownQuota: false,
+      healthScore: 100,
+    });
+    leases.updateAccount("account-1", { status: "QUARANTINED" });
+
+    await expect(service.startTurn(task.id, "user-1", "Second Turn")).resolves.toMatchObject({
+      status: "QUEUED",
+      reason: "NO_ELIGIBLE_ACCOUNT",
+    });
+    expect(execution.startTask).toHaveBeenCalledTimes(1);
+    expect(
+      database.sqlite
+        .prepare(
+          `SELECT required_account_id, status
+           FROM queue_entries
+           WHERE task_id = ? ORDER BY ticket DESC LIMIT 1`,
+        )
+        .get(task.id),
+    ).toEqual({ required_account_id: "account-1", status: "WAITING" });
+    expect(accounts.list().find((account) => account.id === "account-2")).toMatchObject({
+      activeUsers: 0,
+      activeTurns: 0,
+    });
+  });
+
+  test("fails closed when an existing Thread has lost its runtime account binding", async () => {
+    const project = await service.createProject("user-1", { name: "Missing affinity" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Pinned Task",
+    });
+    await service.startTurn(task.id, "user-1", "First Turn");
+    execution.emitTaskEvent({
+      taskId: task.id,
+      threadId: `thread-${task.id}`,
+      turnId: `codex-turn-${task.id}`,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed", durationMs: 10 },
+    });
+    database.sqlite.prepare("UPDATE tasks SET account_id = NULL WHERE id = ?").run(task.id);
+
+    await expect(service.startTurn(task.id, "user-1", "Second Turn")).rejects.toThrow(
+      "Thread runtime account binding is missing",
+    );
+    expect(execution.startTask).toHaveBeenCalledTimes(1);
+  });
+
+  test("quarantines a typed active-resume conflict and releases its scheduler allocation", async () => {
+    const project = await service.createProject("user-1", { name: "Active resume conflict" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Pinned Task",
+    });
+    await service.startTurn(task.id, "user-1", "First Turn");
+    execution.emitTaskEvent({
+      taskId: task.id,
+      threadId: `thread-${task.id}`,
+      turnId: `codex-turn-${task.id}`,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed", durationMs: 10 },
+    });
+    execution.startTask.mockImplementationOnce(async () => {
+      execution.emit("accountCrashed", {
+        accountId: "account-1",
+        reason: "Thread already has an active Turn; the new prompt was not accepted",
+        sourceTaskId: task.id,
+        sourceRuntimeTurnId: `codex-turn-${task.id}`,
+      });
+      throw new ActiveTurnResumeConflictError(`thread-${task.id}`, `codex-turn-${task.id}`);
+    });
+
+    await expect(service.startTurn(task.id, "user-1", "Second Turn")).rejects.toMatchObject({
+      code: "ACTIVE_TURN_RESUME_CONFLICT",
+      promptAccepted: false,
+      rejoined: false,
+    });
+    expect(await service.getTask(task.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+    });
+    expect(accounts.list()[0]).toMatchObject({
+      status: "QUARANTINED",
+      activeTurns: 0,
+    });
+    const recoveryPayload = database.sqlite
+      .prepare(
+        `SELECT payload_json
+         FROM task_events
+         WHERE task_id = ? AND type = 'RECOVERY_REQUIRED'
+         ORDER BY sequence DESC LIMIT 1`,
+      )
+      .get(task.id) as { payload_json: string };
+    expect(JSON.parse(recoveryPayload.payload_json)).toEqual({
+      reason: "Thread already has an active Turn; the new prompt was not accepted",
+    });
+
+    const anotherTask = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Must not run on quarantined account",
+    });
+    await expect(service.startTurn(anotherTask.id, "user-1", "Third Turn")).resolves.toMatchObject({
+      status: "QUEUED",
+      reason: "NO_ELIGIBLE_ACCOUNT",
+    });
+    expect(execution.startTask).toHaveBeenCalledTimes(2);
   });
 
   test.each([
@@ -940,13 +1740,9 @@ describe("LocalPlatformService", () => {
     const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
     await service.startTurn(task.id, "user-1", "Run once");
 
-    execution.emit("accountCrashed", { accountId: "account-1" });
-    execution.emitTaskEvent({
-      taskId: task.id,
-      threadId: `thread-${task.id}`,
-      turnId: `codex-turn-${task.id}`,
-      type: "RECOVERY_REQUIRED",
-      payload: { reason: "Codex App Server exited; recovery is required." },
+    execution.emit("accountCrashed", {
+      accountId: "account-1",
+      reason: "Codex App Server exited; recovery is required.",
     });
 
     expect(await service.getTask(task.id, "user-1")).toMatchObject({
@@ -958,6 +1754,190 @@ describe("LocalPlatformService", () => {
         (event) => event.type === "RECOVERY_REQUIRED",
       ),
     ).toHaveLength(1);
+  });
+
+  test("persists recovery events with only the public platform Turn id across every event view", async () => {
+    const project = await service.createProject("user-1", { name: "Recovery projection" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Run once");
+    const schedulerTurn = database.sqlite
+      .prepare("SELECT id FROM turns WHERE task_id = ?")
+      .get(task.id) as { id: string };
+    const runtimeTurnId = `codex-turn-${task.id}`;
+
+    execution.emit("accountCrashed", {
+      accountId: "account-1",
+      reason: "Codex App Server exited; recovery is required.",
+      sourceTaskId: task.id,
+      sourceRuntimeTurnId: runtimeTurnId,
+    });
+
+    const persisted = database.sqlite
+      .prepare(
+        `SELECT turn_id, payload_json
+         FROM task_events
+         WHERE task_id = ? AND type = 'RECOVERY_REQUIRED'`,
+      )
+      .get(task.id) as { turn_id: string | null; payload_json: string };
+    expect(persisted).toEqual({
+      turn_id: schedulerTurn.id,
+      payload_json: JSON.stringify({
+        reason: "Codex App Server exited; recovery is required.",
+      }),
+    });
+    database.sqlite
+      .prepare(
+        `UPDATE task_events
+         SET turn_id = ?, item_id = ?, payload_json = ?
+         WHERE task_id = ? AND type = 'RECOVERY_REQUIRED'`,
+      )
+      .run(
+        runtimeTurnId,
+        `recovery_required:${runtimeTurnId}`,
+        JSON.stringify({
+          reason: "Codex App Server exited; recovery is required.",
+          sourceRuntimeTurnId: runtimeTurnId,
+        }),
+        task.id,
+      );
+
+    const legacyEvents = (await service.listTaskEvents(task.id, "user-1", 0)) ?? [];
+    const threadEvents = (await service.listThreadEvents(task.id, "user-1", 0)) ?? [];
+    const thread = await service.getThread(task.id, "user-1");
+    const serialized = JSON.stringify({
+      legacyEvents,
+      threadEvents,
+      items: thread?.items,
+      sse: legacyEvents.map((event) => encodeSse(event)).join(""),
+    });
+    expect(serialized).not.toContain("sourceRuntimeTurnId");
+    expect(serialized).not.toContain(runtimeTurnId);
+    for (const event of [...legacyEvents, ...threadEvents].filter(
+      (candidate) => candidate.type === "RECOVERY_REQUIRED",
+    )) {
+      expect(event.turnId).toBe(schedulerTurn.id);
+      expect(event.payload).toEqual({
+        reason: "Codex App Server exited; recovery is required.",
+      });
+    }
+    expect(thread?.items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          turnId: schedulerTurn.id,
+          type: "RECOVERY_REQUIRED",
+          payload: { reason: "Codex App Server exited; recovery is required." },
+        }),
+      ]),
+    );
+  });
+
+  test("immediately recovers every active Turn on the intentionally stopped account", async () => {
+    const project1 = await service.createProject("user-1", { name: "Crash user 1" });
+    const project2 = await service.createProject("user-2", { name: "Crash user 2" });
+    const task1 = await service.createTask("user-1", {
+      projectId: project1.id,
+      title: "Task 1",
+    });
+    const task2 = await service.createTask("user-2", {
+      projectId: project2.id,
+      title: "Task 2",
+    });
+    await service.startTurn(task1.id, "user-1", "Run one");
+    await service.startTurn(task2.id, "user-2", "Run two");
+    expect(accounts.list()[0]).toMatchObject({ activeTurns: 2 });
+
+    execution.emit("accountCrashed", {
+      accountId: "account-1",
+      reason: "Unsafe resume forced an intentional account stop.",
+    });
+
+    expect(await service.getTask(task1.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+    });
+    expect(await service.getTask(task2.id, "user-2")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+    });
+    expect(accounts.list()[0]).toMatchObject({
+      status: "QUARANTINED",
+      activeTurns: 0,
+    });
+    for (const [task, userId] of [
+      [task1, "user-1"],
+      [task2, "user-2"],
+    ] as const) {
+      expect(
+        (await service.listTaskEvents(task.id, userId, 0))?.filter(
+          (event) => event.type === "RECOVERY_REQUIRED",
+        ),
+      ).toHaveLength(1);
+    }
+  });
+
+  test("releases an account Turn slot even when its scheduler record is missing", () => {
+    expect(
+      leases.acquireTurn({
+        userId: "user-1",
+        taskId: "damaged-task",
+        turnId: "missing-scheduler-turn",
+        now: NOW,
+      }),
+    ).toMatchObject({ kind: "LEASED", accountId: "account-1" });
+
+    execution.emit("accountCrashed", {
+      accountId: "account-1",
+      reason: "Unsafe runtime state.",
+    });
+
+    expect(leases.getAccountOccupancy("account-1")).toMatchObject({ activeTurns: 0 });
+    expect(leases.markAccountTurnsForRecovery("account-1")).toEqual([]);
+  });
+
+  test("recovers account tasks and approvals when the scheduler Turn record is missing", async () => {
+    const project = await service.createProject("user-1", { name: "Damaged crash recovery" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Run once");
+    execution.emitApproval({
+      requestId: "damaged-approval",
+      rawRpcId: 301,
+      accountId: "account-1",
+      connectionGeneration: 1,
+      taskId: task.id,
+      threadId: `thread-${task.id}`,
+      turnId: `codex-turn-${task.id}`,
+      itemId: "damaged-command",
+      approvalType: "COMMAND",
+      payload: { command: "pnpm publish" },
+    });
+    const schedulerTurn = database.sqlite
+      .prepare("SELECT id FROM turns WHERE task_id = ?")
+      .get(task.id) as { id: string };
+    database.sqlite.prepare("DELETE FROM turns WHERE id = ?").run(schedulerTurn.id);
+
+    execution.emit("accountCrashed", {
+      accountId: "account-1",
+      reason: "Unsafe runtime state.",
+    });
+
+    expect(await service.getTask(task.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+    });
+    expect(await service.listApprovals(task.id, "user-1")).toEqual([
+      expect.objectContaining({
+        requestId: "damaged-approval",
+        status: "RECOVERY_REQUIRED",
+      }),
+    ]);
+    expect(leases.getAccountOccupancy("account-1")).toMatchObject({ activeTurns: 0 });
+    expect(
+      (await service.listTaskEvents(task.id, "user-1", 0))?.filter(
+        (event) => event.type === "RECOVERY_REQUIRED",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        turnId: null,
+        payload: { reason: "Unsafe runtime state." },
+      }),
+    ]);
   });
 
   test("quarantines a crashed Codex account before another task can be assigned", async () => {
@@ -1018,4 +1998,30 @@ function deferred<T>(): {
 
 async function nextTick(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function tokenUsagePayload(
+  totalTokens: number,
+  inputTokens: number,
+  cachedInputTokens: number,
+  outputTokens: number,
+  reasoningOutputTokens: number,
+) {
+  return {
+    total: {
+      totalTokens,
+      inputTokens,
+      cachedInputTokens,
+      outputTokens,
+      reasoningOutputTokens,
+    },
+    last: {
+      totalTokens,
+      inputTokens,
+      cachedInputTokens,
+      outputTokens,
+      reasoningOutputTokens,
+    },
+    modelContextWindow: 200_000,
+  };
 }

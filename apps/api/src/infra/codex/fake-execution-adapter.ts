@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import type { ActorContext, EffectiveThreadConfigSnapshot } from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
 import type { TaskEventDraft, TaskExecutionAdapter } from "../../domain/platform-service.js";
 import type { WeeklyQuota } from "./codex-runtime.js";
@@ -15,6 +16,8 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
     cwd: string;
     prompt: string;
     existingThreadId: string | null;
+    effectiveConfig: EffectiveThreadConfigSnapshot;
+    actorContext: ActorContext;
   }): Promise<{ threadId: string; turnId: string }> {
     const threadId = input.existingThreadId ?? `fake-thread-${randomUUID()}`;
     const turnId = `fake-turn-${randomUUID()}`;

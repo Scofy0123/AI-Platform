@@ -16,6 +16,22 @@ describe("FakeExecutionAdapter", () => {
         cwd: "/tmp/workspace",
         prompt: "Build it",
         existingThreadId: null,
+        effectiveConfig: {
+          model: null,
+          reasoningEffort: "MEDIUM",
+          permissionMode: "WORKSPACE_WRITE",
+          approvalMode: "ASK",
+          personality: "PRAGMATIC",
+          instructions: "",
+          sourceVersion: "test-v1",
+        },
+        actorContext: {
+          tenantKey: "tenant-1",
+          userId: "user-1",
+          role: "MEMBER",
+          toolScopes: [],
+          approvalPolicy: "ASK",
+        },
       }),
     ).resolves.toEqual({
       threadId: expect.stringMatching(/^fake-thread-/),

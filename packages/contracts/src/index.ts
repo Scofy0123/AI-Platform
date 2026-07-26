@@ -42,11 +42,32 @@ export type TaskStatus = z.infer<typeof TaskStatusSchema>;
 export type TaskSummary = z.infer<typeof TaskSummarySchema>;
 export type TaskDetail = z.infer<typeof TaskDetailSchema>;
 
+export const ProductModeSchema = z.enum(["CODEX", "CHAT", "WORK"]);
+export type ProductMode = z.infer<typeof ProductModeSchema>;
+
+export const BootstrapSchema = z
+  .object({
+    platformVersion: z.string().min(1),
+    defaultMode: z.literal("CODEX"),
+    enabledModes: z.tuple([z.literal("CODEX")]),
+    capabilities: z
+      .object({
+        threads: z.literal(true),
+        settings: z.literal(true),
+        subagents: z.literal(true),
+        reasoningSummaries: z.literal(true),
+      })
+      .strict(),
+  })
+  .strict();
+export type Bootstrap = z.infer<typeof BootstrapSchema>;
+
 export const TASK_EVENT_TYPES = [
   "TURN_STARTED",
   "TURN_COMPLETED",
   "TURN_FAILED",
   "TURN_INTERRUPTED",
+  "USER_MESSAGE",
   "AGENT_MESSAGE_DELTA",
   "REASONING_SUMMARY_DELTA",
   "PLAN_UPDATED",
@@ -62,15 +83,233 @@ export const TASK_EVENT_TYPES = [
   "QUEUED",
   "LEASE_ACQUIRED",
   "RECOVERY_REQUIRED",
+  "SUBAGENT_ACTIVITY",
+  "TOKEN_USAGE_UPDATED",
 ] as const;
 
 export type TaskEventType = (typeof TASK_EVENT_TYPES)[number];
+
+export const ReasoningPresentationSchema = z
+  .object({
+    provider: z.string().min(1),
+    kind: z.enum(["SUMMARY", "PROVIDER_REASONING_TEXT"]),
+    summary: z.string(),
+    displayable: z.boolean(),
+    auditEligible: z.literal(false),
+  })
+  .strict();
+export type ReasoningPresentation = z.infer<typeof ReasoningPresentationSchema>;
+
+export const EffectiveThreadConfigSnapshotSchema = z
+  .object({
+    model: z.string().trim().min(1).nullable(),
+    reasoningEffort: z.string().min(1),
+    permissionMode: z.enum(["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"]),
+    approvalMode: z.literal("ASK"),
+    personality: z.enum(["NONE", "FRIENDLY", "PRAGMATIC"]),
+    instructions: z.string(),
+    sourceVersion: z.string().min(1),
+  })
+  .strict();
+export type EffectiveThreadConfigSnapshot = z.infer<typeof EffectiveThreadConfigSnapshotSchema>;
+
+export const EffectiveConfigOverrideSchema = EffectiveThreadConfigSnapshotSchema.pick({
+  model: true,
+  reasoningEffort: true,
+  permissionMode: true,
+  approvalMode: true,
+  personality: true,
+  instructions: true,
+}).partial();
+export type EffectiveConfigOverride = z.infer<typeof EffectiveConfigOverrideSchema>;
+
+export const TokenUsageBreakdownSchema = z
+  .object({
+    totalTokens: z.number().int().nonnegative(),
+    inputTokens: z.number().int().nonnegative(),
+    cachedInputTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    reasoningOutputTokens: z.number().int().nonnegative(),
+  })
+  .strict();
+export type TokenUsageBreakdown = z.infer<typeof TokenUsageBreakdownSchema>;
+
+export const TurnStatusSchema = z.enum([
+  "ALLOCATING",
+  "QUEUED",
+  "RUNNING",
+  "WAITING_APPROVAL",
+  "COMPLETED",
+  "FAILED",
+  "INTERRUPTED",
+  "NEEDS_RECOVERY",
+  "ABANDONED_FOR_RESUME",
+]);
+
+export const TurnSchema = z
+  .object({
+    id: z.string().min(1),
+    threadId: z.string().min(1),
+    prompt: z.string(),
+    status: TurnStatusSchema,
+    startedAt: z.iso.datetime(),
+    completedAt: z.iso.datetime().nullable(),
+    durationMs: z.number().int().nonnegative().nullable(),
+    model: z.string().nullable(),
+    effort: z.string().nullable(),
+    permissionMode: z.string().nullable(),
+    configSnapshot: EffectiveThreadConfigSnapshotSchema,
+  })
+  .strict();
+export type Turn = z.infer<typeof TurnSchema>;
+
+export const ThreadItemSchema = z
+  .object({
+    id: z.string().min(1),
+    threadId: z.string().min(1),
+    turnId: z.string().nullable(),
+    sequence: z.number().int().positive(),
+    type: z.enum(TASK_EVENT_TYPES),
+    timestamp: z.iso.datetime(),
+    payload: z.record(z.string(), z.unknown()),
+  })
+  .strict();
+export type ThreadItem = z.infer<typeof ThreadItemSchema>;
+
+export const ThreadSchema = z
+  .object({
+    id: z.string().min(1),
+    projectId: z.string().min(1),
+    title: z.string().min(1),
+    status: TaskStatusSchema,
+    updatedAt: z.iso.datetime(),
+    currentTurn: TurnSchema.nullable(),
+    turns: z.array(TurnSchema),
+    queue: QueueStateSchema.nullable(),
+    items: z.array(ThreadItemSchema),
+  })
+  .strict();
+export type Thread = z.infer<typeof ThreadSchema>;
+
+export const SubagentStatusSchema = z.enum(["ACTIVE", "DONE", "FAILED", "INTERRUPTED", "UNKNOWN"]);
+export type SubagentStatus = z.infer<typeof SubagentStatusSchema>;
+
+export const SubagentThreadSchema = z
+  .object({
+    threadId: z.string().min(1),
+    parentThreadId: z.string().min(1),
+    parentTurnId: z.string().nullable(),
+    sessionId: z.string().nullable(),
+    name: z.string().min(1),
+    role: z.string().min(1),
+    model: z.string().nullable(),
+    effort: z.string().nullable(),
+    status: SubagentStatusSchema,
+    startedAt: z.iso.datetime(),
+    completedAt: z.iso.datetime().nullable(),
+    elapsedMs: z.number().int().nonnegative(),
+    resultSummary: z.string().nullable(),
+    tokenUsage: TokenUsageBreakdownSchema.nullable(),
+  })
+  .strict();
+export type SubagentThread = z.infer<typeof SubagentThreadSchema>;
+
+export const SubagentThreadDetailSchema = SubagentThreadSchema.extend({
+  items: z.array(ThreadItemSchema),
+}).strict();
+export type SubagentThreadDetail = z.infer<typeof SubagentThreadDetailSchema>;
+
+export const ActorContextSchema = z
+  .object({
+    tenantKey: z.string().min(1),
+    userId: z.string().min(1),
+    role: z.enum(["ADMIN", "MEMBER"]),
+    toolScopes: z.array(z.string()),
+    approvalPolicy: z.string().min(1),
+  })
+  .strict();
+export type ActorContext = z.infer<typeof ActorContextSchema>;
+
+export const UserGeneralSettingsSchema = z
+  .object({
+    language: z.string().min(1).max(32),
+    theme: z.enum(["SYSTEM", "LIGHT", "DARK"]),
+    defaultProjectId: z.string().min(1).nullable(),
+    notificationsEnabled: z.boolean(),
+  })
+  .strict();
+
+export const UserExecutionSettingsSchema = z
+  .object({
+    model: z.string().min(1).nullable(),
+    reasoningEffort: z.string().trim().min(1).max(64),
+    permissionMode: z.enum(["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"]),
+    approvalPreference: z.literal("ASK"),
+  })
+  .strict();
+
+export const UserPersonalizationSettingsSchema = z
+  .object({
+    personality: z.enum(["NONE", "FRIENDLY", "PRAGMATIC"]),
+    instructions: z.string().max(20_000),
+  })
+  .strict();
+
+export const UserSettingsSchema = z
+  .object({
+    general: UserGeneralSettingsSchema,
+    execution: UserExecutionSettingsSchema,
+    personalization: UserPersonalizationSettingsSchema,
+    updatedAt: z.iso.datetime(),
+  })
+  .strict();
+export type UserSettings = z.infer<typeof UserSettingsSchema>;
+
+export const UserSettingsPolicySchema = z
+  .object({
+    /** null means the runtime-provided model catalog is not yet available. */
+    allowedModels: z.array(z.string().min(1)).nullable(),
+    allowedReasoningEfforts: z.array(UserExecutionSettingsSchema.shape.reasoningEffort),
+    allowedPermissionModes: z.array(UserExecutionSettingsSchema.shape.permissionMode),
+    allowedApprovalPreferences: z.array(UserExecutionSettingsSchema.shape.approvalPreference),
+    lockedFields: z.array(
+      z.enum([
+        "execution.model",
+        "execution.reasoningEffort",
+        "execution.permissionMode",
+        "execution.approvalPreference",
+      ]),
+    ),
+  })
+  .strict();
+
+export const UserSettingsViewSchema = UserSettingsSchema.extend({
+  policy: UserSettingsPolicySchema,
+}).strict();
+export type UserSettingsView = z.infer<typeof UserSettingsViewSchema>;
+
+export const UserSettingsPatchSchema = z
+  .object({
+    general: UserGeneralSettingsSchema.partial().optional(),
+    execution: UserExecutionSettingsSchema.partial().optional(),
+    personalization: UserPersonalizationSettingsSchema.partial().optional(),
+  })
+  .strict()
+  .refine(
+    (value) =>
+      value.general !== undefined ||
+      value.execution !== undefined ||
+      value.personalization !== undefined,
+    { message: "At least one settings field is required" },
+  );
+export type UserSettingsPatch = z.infer<typeof UserSettingsPatchSchema>;
 
 export interface TaskEventPayloadMap {
   TURN_STARTED: { status: "inProgress" };
   TURN_COMPLETED: { status: "completed"; durationMs?: number | null };
   TURN_FAILED: { status: "failed"; error: string };
   TURN_INTERRUPTED: { status: "interrupted" };
+  USER_MESSAGE: { itemId: string; kind: "STEER"; text: string };
   AGENT_MESSAGE_DELTA: { itemId: string; delta: string };
   REASONING_SUMMARY_DELTA: { itemId: string; delta: string };
   PLAN_UPDATED: { explanation: string | null; plan: unknown[] };
@@ -94,17 +333,43 @@ export interface TaskEventPayloadMap {
     reason: string | null;
     command?: string | null;
     cwd?: string | null;
+    sourceThreadId?: string | null;
+    sourceSubagent?: boolean;
+    sourceSubagentName?: string | null;
   };
   APPROVAL_DECIDED: { approvalId: string; decision: string };
   QUEUED: { position: number; etaMs: number; etaEstimated: boolean };
   LEASE_ACQUIRED: { accountAlias: string };
   RECOVERY_REQUIRED: { reason: string };
+  SUBAGENT_ACTIVITY: {
+    itemId: string;
+    agentThreadId: string;
+    kind: "started" | "interacted" | "interrupted" | "completed" | "failed" | "unknown";
+    name: string | null;
+    role: string | null;
+    model: string | null;
+    effort: string | null;
+    status: "ACTIVE" | "DONE" | "FAILED" | "INTERRUPTED" | "UNKNOWN";
+    resultSummary: string | null;
+  };
+  TOKEN_USAGE_UPDATED: {
+    total: TokenUsageBreakdown;
+    last: TokenUsageBreakdown;
+    modelContextWindow: number | null;
+  };
 }
 
 export interface TaskEventEnvelope {
   taskId: string;
   threadId: string | null;
   turnId: string | null;
+  /**
+   * Stable projection boundary for clients. It is optional in the type so
+   * legacy in-process producers remain source-compatible; persisted and HTTP
+   * events always populate it with either the protocol item id or a stable
+   * derived id.
+   */
+  itemId?: string | null;
   sequence: number;
   timestamp: string;
 }
@@ -120,6 +385,7 @@ export const TaskEventSchema = z.object({
   taskId: z.string().min(1),
   threadId: z.string().nullable(),
   turnId: z.string().nullable(),
+  itemId: z.string().nullable().optional(),
   sequence: z.number().int().positive(),
   timestamp: z.iso.datetime(),
   type: z.enum(TASK_EVENT_TYPES),

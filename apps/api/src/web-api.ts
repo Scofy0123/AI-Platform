@@ -1,4 +1,15 @@
-import type { TaskDetail, TaskEvent, TaskSummary } from "@codexplatform/contracts";
+import type {
+  Bootstrap,
+  EffectiveConfigOverride,
+  SubagentThread,
+  SubagentThreadDetail,
+  TaskDetail,
+  TaskEvent,
+  TaskSummary,
+  Thread,
+  UserSettingsPatch,
+  UserSettingsView,
+} from "@codexplatform/contracts";
 import type { PlatformUser } from "./auth/auth-store.js";
 
 export interface AuthApi {
@@ -15,11 +26,39 @@ export interface AuthApi {
 }
 
 export interface PlatformApi {
+  getBootstrap(): Promise<Bootstrap>;
   createProject(userId: string, input: { name: string }): Promise<unknown>;
   listProjects(userId: string): Promise<unknown>;
   createTask(userId: string, input: { projectId: string; title: string }): Promise<unknown>;
   listTasks(userId: string, projectId?: string): Promise<TaskSummary[]>;
   getTask(taskId: string, userId: string): Promise<TaskDetail | null>;
+  createThread(
+    userId: string,
+    input: { projectId: string; title: string; config?: EffectiveConfigOverride },
+  ): Promise<Thread>;
+  listThreads(userId: string, projectId?: string): Promise<Thread[]>;
+  getThread(threadId: string, userId: string): Promise<Thread | null>;
+  startThreadTurn(
+    threadId: string,
+    userId: string,
+    prompt: string,
+    config?: EffectiveConfigOverride,
+  ): Promise<unknown>;
+  steerThread(threadId: string, userId: string, prompt: string): Promise<unknown>;
+  interruptThread(threadId: string, userId: string): Promise<unknown>;
+  listThreadEvents(
+    threadId: string,
+    userId: string,
+    afterSequence: number,
+  ): Promise<TaskEvent[] | null>;
+  subscribeThreadEvents(threadId: string, listener: (event: TaskEvent) => void): () => void;
+  listSubagents(threadId: string, userId: string): Promise<SubagentThread[] | null>;
+  getSubagent(threadId: string, userId: string): Promise<SubagentThreadDetail | null>;
+  getMySettings(userId: string): Promise<UserSettingsView>;
+  patchMySettings(userId: string, patch: UserSettingsPatch): Promise<UserSettingsView>;
+  getMyUsage(userId: string): Promise<unknown>;
+  getMyConnections(userId: string): Promise<unknown>;
+  getMyPlugins(userId: string): Promise<unknown>;
   startTurn(taskId: string, userId: string, prompt: string): Promise<unknown>;
   steerTask(taskId: string, userId: string, prompt: string): Promise<unknown>;
   interruptTask(taskId: string, userId: string): Promise<unknown>;
@@ -40,4 +79,8 @@ export interface PlatformApi {
     adminUserId: string,
   ): Promise<unknown>;
   listAudit(): Promise<unknown>;
+  getAdminPolicies(): Promise<unknown>;
+  getAdminConnectors(): Promise<unknown>;
+  getAdminUsage(): Promise<unknown>;
+  getAdminRuntimeHealth(adminUserId: string): Promise<unknown>;
 }

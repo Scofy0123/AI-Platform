@@ -1,4 +1,9 @@
-import type { TaskEvent, TaskEventPayloadMap, TaskEventType } from "@codexplatform/contracts";
+import {
+  type TaskEvent,
+  type TaskEventPayloadMap,
+  type TaskEventType,
+  TokenUsageBreakdownSchema,
+} from "@codexplatform/contracts";
 
 interface NormalizerContext {
   taskId: string;
@@ -60,6 +65,7 @@ export class CodexEventNormalizer {
         ];
       }
       case "item/agentMessage/delta":
+        if (!stableItemId(params.itemId)) return [];
         return [
           this.event("AGENT_MESSAGE_DELTA", threadId, turnId, {
             itemId: stringOrEmpty(params.itemId),
@@ -67,6 +73,7 @@ export class CodexEventNormalizer {
           }),
         ];
       case "item/reasoning/summaryTextDelta":
+        if (!stableItemId(params.itemId)) return [];
         return [
           this.event("REASONING_SUMMARY_DELTA", threadId, turnId, {
             itemId: stringOrEmpty(params.itemId),
@@ -81,6 +88,7 @@ export class CodexEventNormalizer {
           }),
         ];
       case "item/commandExecution/outputDelta":
+        if (!stableItemId(params.itemId)) return [];
         return [
           this.event("COMMAND_OUTPUT", threadId, turnId, {
             itemId: stringOrEmpty(params.itemId),
@@ -89,6 +97,27 @@ export class CodexEventNormalizer {
         ];
       case "turn/diff/updated":
         return [this.event("DIFF_UPDATED", threadId, turnId, { diff: stringOrEmpty(params.diff) })];
+      case "thread/tokenUsage/updated": {
+        const tokenUsage = asRecord(params.tokenUsage);
+        const total = parseTokenUsage(tokenUsage.total);
+        const last = parseTokenUsage(tokenUsage.last);
+        const modelContextWindow = nullableNonnegativeInteger(tokenUsage.modelContextWindow);
+        if (
+          !threadId ||
+          !total ||
+          !last ||
+          (tokenUsage.modelContextWindow !== null && modelContextWindow === null)
+        ) {
+          return [];
+        }
+        return [
+          this.event("TOKEN_USAGE_UPDATED", threadId, turnId, {
+            total,
+            last,
+            modelContextWindow,
+          }),
+        ];
+      }
       case "item/started":
         return this.normalizeItemStarted(item, threadId, turnId);
       case "item/completed":
@@ -106,7 +135,8 @@ export class CodexEventNormalizer {
       "item/permissions/requestApproval": "PERMISSIONS",
     } as const;
     const approvalType = approvalTypeByMethod[message.method as keyof typeof approvalTypeByMethod];
-    if (!approvalType || message.id === undefined) return null;
+    const itemId = stableItemId(params.itemId);
+    if (!approvalType || message.id === undefined || !itemId) return null;
 
     this.sequence += 1;
     return {
@@ -117,7 +147,7 @@ export class CodexEventNormalizer {
       timestamp: this.now().toISOString(),
       type: "APPROVAL_REQUESTED",
       payload: {
-        itemId: stringOrEmpty(params.itemId),
+        itemId,
         approvalType,
         reason: stringOrNull(params.reason),
         ...(approvalType === "COMMAND"
@@ -132,6 +162,7 @@ export class CodexEventNormalizer {
     threadId: string | null,
     turnId: string | null,
   ): TaskEvent[] {
+    if (!stableItemId(item.id)) return [];
     if (item.type === "commandExecution") {
       return [
         this.event("COMMAND_STARTED", threadId, turnId, {
@@ -150,6 +181,9 @@ export class CodexEventNormalizer {
         }),
       ];
     }
+    if (item.type === "subAgentActivity" || item.type === "collabAgentToolCall") {
+      return this.normalizeSubagentItem(item, threadId, turnId);
+    }
     return [];
   }
 
@@ -158,6 +192,7 @@ export class CodexEventNormalizer {
     threadId: string | null,
     turnId: string | null,
   ): TaskEvent[] {
+    if (!stableItemId(item.id)) return [];
     if (item.type === "commandExecution") {
       return [
         this.event("COMMAND_COMPLETED", threadId, turnId, {
@@ -184,7 +219,73 @@ export class CodexEventNormalizer {
             }),
       ];
     }
+    if (item.type === "subAgentActivity" || item.type === "collabAgentToolCall") {
+      return this.normalizeSubagentItem(item, threadId, turnId);
+    }
     return [];
+  }
+
+  private normalizeSubagentItem(
+    item: Record<string, unknown>,
+    threadId: string | null,
+    turnId: string | null,
+  ): TaskEvent[] {
+    if (item.type === "subAgentActivity") {
+      const agentThreadId = stringOrNull(item.agentThreadId);
+      const itemId = stringOrNull(item.id);
+      if (!agentThreadId || !itemId) return [];
+      const kind = stringOrNull(item.kind);
+      const status = kind === "interrupted" ? "INTERRUPTED" : "ACTIVE";
+      const agentPath = stringOrNull(item.agentPath);
+      return [
+        this.event("SUBAGENT_ACTIVITY", threadId, turnId, {
+          itemId,
+          agentThreadId,
+          kind:
+            kind === "started" || kind === "interacted" || kind === "interrupted"
+              ? kind
+              : "unknown",
+          name: agentPath ? lastPathSegment(agentPath) : null,
+          role: "subagent",
+          model: null,
+          effort: null,
+          status,
+          resultSummary: null,
+        }),
+      ];
+    }
+
+    const itemId = stringOrNull(item.id);
+    const receiverThreadIds = Array.isArray(item.receiverThreadIds)
+      ? item.receiverThreadIds.filter((value): value is string => typeof value === "string")
+      : [];
+    if (!itemId || receiverThreadIds.length === 0) return [];
+    const agentStates = asRecord(item.agentsStates);
+    const prompt = stringOrNull(item.prompt);
+    return receiverThreadIds.map((agentThreadId) => {
+      const state = asRecord(agentStates[agentThreadId]);
+      const status = normalizeSubagentStatus(state.status, item.status);
+      return this.event("SUBAGENT_ACTIVITY", threadId, turnId, {
+        itemId: `${itemId}:${agentThreadId}`,
+        agentThreadId,
+        kind:
+          status === "DONE"
+            ? "completed"
+            : status === "FAILED"
+              ? "failed"
+              : status === "INTERRUPTED"
+                ? "interrupted"
+                : status === "ACTIVE"
+                  ? "interacted"
+                  : "unknown",
+        name: prompt ? prompt.slice(0, 120) : null,
+        role: "subagent",
+        model: stringOrNull(item.model),
+        effort: stringOrNull(item.reasoningEffort),
+        status,
+        resultSummary: stringOrNull(state.message),
+      });
+    });
   }
 
   private event<Type extends TaskEventType>(
@@ -194,10 +295,18 @@ export class CodexEventNormalizer {
     payload: TaskEventPayloadMap[Type],
   ): Extract<TaskEvent, { type: Type }> {
     this.sequence += 1;
+    const record = payload as Record<string, unknown>;
+    const itemId =
+      typeof record.itemId === "string" && record.itemId.length > 0
+        ? record.itemId
+        : type === "TOKEN_USAGE_UPDATED" && threadId
+          ? `token-usage:${threadId}`
+          : `${type.toLowerCase()}:${turnId ?? threadId ?? this.context.taskId}`;
     return {
       taskId: this.context.taskId,
       threadId,
       turnId,
+      itemId,
       sequence: this.sequence,
       timestamp: this.now().toISOString(),
       type,
@@ -222,8 +331,43 @@ function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function stableItemId(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function nullableNonnegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function parseTokenUsage(
+  value: unknown,
+): TaskEventPayloadMap["TOKEN_USAGE_UPDATED"]["total"] | null {
+  const parsed = TokenUsageBreakdownSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
 function extractError(value: unknown): string | null {
   if (typeof value === "string") return value;
   const error = asRecord(value);
   return stringOrNull(error.message);
+}
+
+function lastPathSegment(value: string): string {
+  const segments = value.split(/[\\/]/).filter(Boolean);
+  return segments.at(-1) ?? value;
+}
+
+function normalizeSubagentStatus(
+  stateStatus: unknown,
+  toolStatus: unknown,
+): "ACTIVE" | "DONE" | "FAILED" | "INTERRUPTED" | "UNKNOWN" {
+  if (stateStatus === "pendingInit" || stateStatus === "running") return "ACTIVE";
+  if (stateStatus === "completed" || stateStatus === "shutdown") return "DONE";
+  if (stateStatus === "errored") return "FAILED";
+  if (stateStatus === "interrupted") return "INTERRUPTED";
+  if (stateStatus === "notFound") return "UNKNOWN";
+  if (toolStatus === "inProgress") return "ACTIVE";
+  if (toolStatus === "completed") return "DONE";
+  if (toolStatus === "failed") return "FAILED";
+  return "UNKNOWN";
 }

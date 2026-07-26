@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS queue_entries (
   user_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
   turn_id TEXT NOT NULL,
+  required_account_id TEXT,
   reason TEXT NOT NULL,
   status TEXT NOT NULL,
   enqueued_at INTEGER NOT NULL,
@@ -91,6 +92,12 @@ CREATE TABLE IF NOT EXISTS users (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE(tenant_key, open_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  settings_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS feishu_credentials (
@@ -144,6 +151,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   lease_id TEXT,
   thread_id TEXT,
   current_turn_id TEXT,
+  thread_config_json TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -156,6 +164,7 @@ CREATE TABLE IF NOT EXISTS turns (
   codex_turn_id TEXT,
   prompt TEXT NOT NULL,
   status TEXT NOT NULL,
+  config_snapshot_json TEXT,
   started_at INTEGER NOT NULL,
   completed_at INTEGER,
   duration_ms INTEGER
@@ -167,6 +176,7 @@ CREATE TABLE IF NOT EXISTS task_events (
   sequence INTEGER NOT NULL,
   thread_id TEXT,
   turn_id TEXT,
+  item_id TEXT,
   type TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   created_at INTEGER NOT NULL,
@@ -174,6 +184,68 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 
 CREATE INDEX IF NOT EXISTS task_events_replay_idx ON task_events(task_id, sequence);
+
+CREATE TABLE IF NOT EXISTS subagent_threads (
+  thread_id TEXT PRIMARY KEY,
+  parent_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  parent_thread_id TEXT,
+  parent_turn_id TEXT,
+  owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_id TEXT,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL,
+  model TEXT,
+  effort TEXT,
+  status TEXT NOT NULL,
+  result_summary TEXT,
+  started_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS subagent_threads_parent_status_idx
+  ON subagent_threads(parent_task_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS subagent_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL REFERENCES subagent_threads(thread_id) ON DELETE CASCADE,
+  sequence INTEGER NOT NULL,
+  turn_id TEXT,
+  item_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(thread_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS subagent_events_replay_idx
+  ON subagent_events(thread_id, sequence);
+
+CREATE TABLE IF NOT EXISTS thread_token_usage (
+  runtime_thread_id TEXT PRIMARY KEY,
+  parent_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  parent_runtime_thread_id TEXT,
+  turn_id TEXT,
+  total_tokens INTEGER NOT NULL CHECK(total_tokens >= 0),
+  input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+  cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens >= 0),
+  output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+  reasoning_output_tokens INTEGER NOT NULL CHECK(reasoning_output_tokens >= 0),
+  last_total_tokens INTEGER NOT NULL CHECK(last_total_tokens >= 0),
+  last_input_tokens INTEGER NOT NULL CHECK(last_input_tokens >= 0),
+  last_cached_input_tokens INTEGER NOT NULL CHECK(last_cached_input_tokens >= 0),
+  last_output_tokens INTEGER NOT NULL CHECK(last_output_tokens >= 0),
+  last_reasoning_output_tokens INTEGER NOT NULL CHECK(last_reasoning_output_tokens >= 0),
+  model_context_window INTEGER,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS thread_token_usage_task_idx
+  ON thread_token_usage(parent_task_id, runtime_thread_id);
+
+CREATE INDEX IF NOT EXISTS thread_token_usage_owner_idx
+  ON thread_token_usage(owner_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS approvals (
   id TEXT PRIMARY KEY,
@@ -184,6 +256,7 @@ CREATE TABLE IF NOT EXISTS approvals (
   thread_id TEXT,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   turn_id TEXT NOT NULL,
+  parent_turn_id TEXT,
   item_id TEXT NOT NULL,
   approval_type TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -238,7 +311,37 @@ export function migrateDatabase(sqlite: Database.Database): void {
   sqlite.exec(INITIAL_SCHEMA);
   ensureColumn(sqlite, "codex_accounts", "codex_home", "TEXT");
   ensureColumn(sqlite, "codex_accounts", "quota_resets_at", "INTEGER");
+  ensureColumn(sqlite, "task_events", "item_id", "TEXT");
+  ensureColumn(sqlite, "tasks", "thread_config_json", "TEXT");
+  ensureColumn(sqlite, "turns", "config_snapshot_json", "TEXT");
+  ensureColumn(sqlite, "queue_entries", "required_account_id", "TEXT");
+  backfillQueuedThreadAccountAffinity(sqlite);
+  backfillTaskEventItemIds(sqlite);
   migrateApprovalsTable(sqlite);
+}
+
+function backfillQueuedThreadAccountAffinity(sqlite: Database.Database): void {
+  sqlite
+    .prepare(
+      `UPDATE queue_entries
+       SET required_account_id = (
+         SELECT tasks.account_id
+         FROM tasks
+         WHERE tasks.id = queue_entries.task_id
+           AND tasks.thread_id IS NOT NULL
+           AND tasks.account_id IS NOT NULL
+       )
+       WHERE status = 'WAITING'
+         AND required_account_id IS NULL
+         AND EXISTS (
+           SELECT 1
+           FROM tasks
+           WHERE tasks.id = queue_entries.task_id
+             AND tasks.thread_id IS NOT NULL
+             AND tasks.account_id IS NOT NULL
+         )`,
+    )
+    .run();
 }
 
 function migrateApprovalsTable(sqlite: Database.Database): void {
@@ -264,6 +367,7 @@ function migrateApprovalsTable(sqlite: Database.Database): void {
     "transport_account_id",
     "connection_generation",
     "thread_id",
+    "parent_turn_id",
   ];
   if (
     requiredColumns.every((column) => columnNames.has(column)) &&
@@ -297,6 +401,7 @@ function migrateApprovalsTable(sqlite: Database.Database): void {
         thread_id TEXT,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         turn_id TEXT NOT NULL,
+        parent_turn_id TEXT,
         item_id TEXT NOT NULL,
         approval_type TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -308,7 +413,7 @@ function migrateApprovalsTable(sqlite: Database.Database): void {
       );
       INSERT INTO approvals_migrated (
         id, request_id, raw_request_id_json, transport_account_id,
-        connection_generation, thread_id, task_id, turn_id, item_id, approval_type,
+        connection_generation, thread_id, task_id, turn_id, parent_turn_id, item_id, approval_type,
         status, payload_json, decision, requested_at, decided_at, decided_by
       )
       SELECT
@@ -317,7 +422,9 @@ function migrateApprovalsTable(sqlite: Database.Database): void {
         ${source("transport_account_id", "NULL")},
         ${source("connection_generation", "NULL")},
         ${source("thread_id", "NULL")},
-        task_id, turn_id, item_id, approval_type, status, payload_json, decision,
+        task_id, turn_id,
+        ${source("parent_turn_id", "turn_id")},
+        item_id, approval_type, status, payload_json, decision,
         requested_at, decided_at, decided_by
       FROM approvals;
       DROP TABLE approvals;
@@ -333,11 +440,63 @@ function migrateApprovalsTable(sqlite: Database.Database): void {
 
 function ensureColumn(
   sqlite: Database.Database,
-  table: "codex_accounts",
-  column: "codex_home" | "quota_resets_at",
+  table: "codex_accounts" | "queue_entries" | "task_events" | "tasks" | "turns",
+  column:
+    | "codex_home"
+    | "quota_resets_at"
+    | "required_account_id"
+    | "item_id"
+    | "thread_config_json"
+    | "config_snapshot_json",
   definition: "TEXT" | "INTEGER",
 ): void {
   const columns = sqlite.pragma(`table_info(${table})`) as Array<{ name: string }>;
   if (columns.some((entry) => entry.name === column)) return;
   sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function backfillTaskEventItemIds(sqlite: Database.Database): void {
+  const rows = sqlite
+    .prepare(
+      `SELECT id, task_id, turn_id, type, payload_json
+       FROM task_events WHERE item_id IS NULL`,
+    )
+    .all() as Array<{
+    id: number;
+    task_id: string;
+    turn_id: string | null;
+    type: string;
+    payload_json: string;
+  }>;
+  const update = sqlite.prepare("UPDATE task_events SET item_id = ? WHERE id = ?");
+  for (const row of rows) {
+    let payload: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(row.payload_json) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        payload = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Legacy malformed payloads retain an event-scoped boundary and are not
+      // interpreted further.
+    }
+    update.run(deriveEventItemId(row.task_id, row.turn_id, row.type, payload), row.id);
+  }
+}
+
+function deriveEventItemId(
+  taskId: string,
+  turnId: string | null,
+  type: string,
+  payload: Record<string, unknown>,
+): string {
+  if (typeof payload.itemId === "string" && payload.itemId.length > 0) return payload.itemId;
+  if (type === "PLAN_UPDATED") return `plan:${turnId ?? taskId}`;
+  if (type === "DIFF_UPDATED") return `diff:${turnId ?? taskId}`;
+  if (type === "QUEUED") return `queue:${taskId}`;
+  if (type === "APPROVAL_DECIDED" && typeof payload.approvalId === "string") {
+    return `approval:${payload.approvalId}`;
+  }
+  if (type.startsWith("TURN_")) return `turn:${turnId ?? taskId}`;
+  return `${type.toLowerCase()}:${turnId ?? taskId}`;
 }

@@ -1,6 +1,27 @@
-import type { TaskDetail as TaskDetailDto, TaskEvent, TaskSummary } from "@codexplatform/contracts";
+import type {
+  Bootstrap,
+  EffectiveConfigOverride,
+  SubagentThread,
+  SubagentThreadDetail,
+  TaskDetail as TaskDetailDto,
+  TaskEvent,
+  TaskSummary,
+  Thread,
+  UserSettingsPatch,
+  UserSettingsView,
+} from "@codexplatform/contracts";
 
-export type { TaskStatus, TaskSummary } from "@codexplatform/contracts";
+export type {
+  Bootstrap,
+  SubagentThread,
+  SubagentThreadDetail,
+  TaskEvent,
+  TaskStatus,
+  TaskSummary,
+  Thread,
+  UserSettingsPatch,
+  UserSettingsView,
+} from "@codexplatform/contracts";
 
 export type UserRole = "ADMIN" | "MEMBER";
 
@@ -54,8 +75,94 @@ export interface AuditEntry {
   taskId?: string | null;
 }
 
+export interface UserUsage {
+  threads: number;
+  turns: number;
+  toolCalls: number;
+  subagents: number;
+  tokenUsage: {
+    scope: "OWNED_THREAD_TREES";
+    totalTokens: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    outputTokens: number;
+    reasoningOutputTokens: number;
+  } | null;
+  tokenUsageStatus: "KNOWN" | "UNKNOWN";
+  quota: {
+    scope: "SHARED_CODEX_ACCOUNT";
+    attributableToUser: false;
+  };
+}
+
+export interface ConnectionSummary {
+  id: string;
+  name: string;
+  managed: boolean;
+  connected: boolean;
+  status: string;
+  scopes: string[];
+}
+
+export interface PluginSummary {
+  id: string;
+  name: string;
+  status: string;
+  description?: string | null;
+}
+
+export interface AdminPolicies {
+  productModes: {
+    enabled: readonly string[];
+    disabled: readonly string[];
+  };
+  settings: {
+    allowedModels: string[] | null;
+    allowedReasoningEfforts: readonly string[];
+    allowedPermissionModes: readonly string[];
+    allowedApprovalPreferences: readonly string[];
+    lockedFields: readonly string[];
+  };
+  memory: { nativeSharedAccountMemory: boolean };
+  deploymentStage: string;
+  productionMultiUserEnabled: boolean;
+}
+
+export interface AdminConnector {
+  id: string;
+  name: string;
+  managed: boolean;
+  mode: string;
+  status: string;
+}
+
+export interface AdminUsage {
+  users: number;
+  threads: number;
+  turns: number;
+  toolCalls: number;
+  subagents: number;
+  tokenUsage: UserUsage["tokenUsage"];
+  tokenUsageStatus: "KNOWN" | "UNKNOWN";
+  quota: UserUsage["quota"];
+}
+
+export interface RuntimeHealth {
+  deploymentStage: string;
+  multiUserReady: boolean;
+  workerIsolation: string;
+  safetyMode: string;
+  safetyAllowedForActor: boolean;
+  accounts: {
+    total: number;
+    available: number;
+    unhealthy: number;
+  };
+}
+
 export interface PlatformApi {
   getSession(): Promise<Session>;
+  getBootstrap?(): Promise<Bootstrap>;
   listProjects(): Promise<ProjectSummary[]>;
   createProject(name: string): Promise<{ id: string }>;
   listTasks(): Promise<TaskSummary[]>;
@@ -64,6 +171,30 @@ export interface PlatformApi {
   startTurn(taskId: string, prompt: string): Promise<unknown>;
   taskAction(taskId: string, action: "interrupt" | "steer", input?: string): Promise<unknown>;
   decideApproval(approvalId: string, decision: "accept" | "decline"): Promise<unknown>;
+  listThreads?(projectId?: string): Promise<Thread[]>;
+  getThread?(threadId: string): Promise<Thread>;
+  createThread?(input: {
+    projectId: string;
+    title: string;
+    config?: EffectiveConfigOverride;
+  }): Promise<Thread>;
+  startThreadTurn?(
+    threadId: string,
+    prompt: string,
+    config?: EffectiveConfigOverride,
+  ): Promise<unknown>;
+  threadAction?(threadId: string, action: "interrupt" | "steer", input?: string): Promise<unknown>;
+  listSubagents?(threadId: string): Promise<SubagentThread[]>;
+  getSubagent?(threadId: string): Promise<SubagentThreadDetail>;
+  getMySettings?(): Promise<UserSettingsView>;
+  patchMySettings?(patch: UserSettingsPatch): Promise<UserSettingsView>;
+  getMyUsage?(): Promise<UserUsage>;
+  listMyConnections?(): Promise<ConnectionSummary[]>;
+  listMyPlugins?(): Promise<PluginSummary[]>;
+  getAdminPolicies?(): Promise<AdminPolicies>;
+  listAdminConnectors?(): Promise<AdminConnector[]>;
+  getAdminUsage?(): Promise<AdminUsage>;
+  getAdminRuntimeHealth?(): Promise<RuntimeHealth>;
   listAccounts(): Promise<AccountSummary[]>;
   addAccount(alias: string): Promise<{ id: string }>;
   accountAction(

@@ -34,6 +34,7 @@ export interface AcquireTurnInput {
   taskId: string;
   turnId: string;
   now: Date;
+  requiredAccountId?: string | null;
 }
 
 export interface LeasedTurn {
@@ -54,6 +55,7 @@ export interface QueuedTurn {
   userId: string;
   taskId: string;
   turnId: string;
+  requiredAccountId: string | null;
   position: number;
   reason: QueueReason;
   etaMs: number;
@@ -80,6 +82,7 @@ interface QueueRow {
   user_id: string;
   task_id: string;
   turn_id: string;
+  required_account_id: string | null;
   reason: QueueReason;
   status: "WAITING" | "ASSIGNED" | "CANCELLED";
   enqueued_at: number;
@@ -90,6 +93,7 @@ export interface QueueEntry {
   userId: string;
   taskId: string;
   turnId: string;
+  requiredAccountId: string | null;
   reason: QueueReason;
   status: "WAITING" | "ASSIGNED" | "CANCELLED";
   enqueuedAt: Date;
@@ -189,10 +193,17 @@ export class SQLiteLeaseStore {
 
   acquireTurn(input: AcquireTurnInput): AcquireTurnResult {
     return this.immediateTransaction(() => {
+      const waiting = this.sqlite
+        .prepare("SELECT 1 FROM queue_entries WHERE status = 'WAITING' LIMIT 1")
+        .get();
+      if (waiting) {
+        const reason = this.getQueueReason(input);
+        return this.enqueue(input, reason);
+      }
       const leased = this.tryAcquireTurn(input);
       if (leased) return leased;
 
-      const reason = this.getQueueReason(input.userId, input.now);
+      const reason = this.getQueueReason(input);
       return this.enqueue(input, reason);
     });
   }
@@ -296,6 +307,28 @@ export class SQLiteLeaseStore {
     });
   }
 
+  markAccountTurnsForRecovery(accountId: string): string[] {
+    return this.immediateTransaction(() => {
+      const rows = this.sqlite
+        .prepare(
+          `SELECT turn_id FROM user_turn_slots
+           WHERE account_id = ? AND status IN ('RUNNING', 'NEEDS_RECOVERY')
+           ORDER BY acquired_at, turn_id`,
+        )
+        .all(accountId) as Array<{ turn_id: string }>;
+      if (rows.length > 0) {
+        this.sqlite
+          .prepare(
+            `UPDATE user_turn_slots
+             SET status = 'NEEDS_RECOVERY'
+             WHERE account_id = ? AND status = 'RUNNING'`,
+          )
+          .run(accountId);
+      }
+      return rows.map((row) => row.turn_id);
+    });
+  }
+
   releaseIdleLeases(now: Date, idleAfterMs = DEFAULT_IDLE_LEASE_MS): LeasedTurn[] {
     this.immediateTransaction(() => {
       const idle = this.sqlite
@@ -339,27 +372,41 @@ export class SQLiteLeaseStore {
     const promoted: LeasedTurn[] = [];
     while (true) {
       const result = this.immediateTransaction(() => {
-        const entry = this.sqlite
-          .prepare("SELECT * FROM queue_entries WHERE status = 'WAITING' ORDER BY ticket LIMIT 1")
-          .get() as QueueRow | undefined;
-        if (!entry) return null;
+        const entries = this.sqlite
+          .prepare("SELECT * FROM queue_entries WHERE status = 'WAITING' ORDER BY ticket")
+          .all() as QueueRow[];
+        const blockedAccountIds = new Set<string>();
+        for (const entry of entries) {
+          const resourceAccountId =
+            entry.required_account_id ??
+            this.findExistingUserAccount(entry.user_id, entry.required_account_id);
+          if (resourceAccountId && blockedAccountIds.has(resourceAccountId)) continue;
 
-        const leased = this.tryAcquireTurn({
-          userId: entry.user_id,
-          taskId: entry.task_id,
-          turnId: entry.turn_id,
-          now,
-        });
-        if (!leased) return null;
+          const leased = this.tryAcquireTurn(
+            {
+              userId: entry.user_id,
+              taskId: entry.task_id,
+              turnId: entry.turn_id,
+              now,
+              requiredAccountId: entry.required_account_id,
+            },
+            blockedAccountIds,
+          );
+          if (!leased) {
+            if (resourceAccountId) blockedAccountIds.add(resourceAccountId);
+            continue;
+          }
 
-        this.sqlite
-          .prepare(
-            `UPDATE queue_entries
-             SET status = 'ASSIGNED', assigned_at = ?, account_id = ?, lease_id = ?
-             WHERE ticket = ? AND status = 'WAITING'`,
-          )
-          .run(now.getTime(), leased.accountId, leased.leaseId, entry.ticket);
-        return leased;
+          this.sqlite
+            .prepare(
+              `UPDATE queue_entries
+               SET status = 'ASSIGNED', assigned_at = ?, account_id = ?, lease_id = ?
+               WHERE ticket = ? AND status = 'WAITING'`,
+            )
+            .run(now.getTime(), leased.accountId, leased.leaseId, entry.ticket);
+          return leased;
+        }
+        return null;
       });
       if (!result) break;
       promoted.push(result);
@@ -376,6 +423,7 @@ export class SQLiteLeaseStore {
       userId: row.user_id,
       taskId: row.task_id,
       turnId: row.turn_id,
+      requiredAccountId: row.required_account_id,
       reason: row.reason,
       status: row.status,
       enqueuedAt: new Date(row.enqueued_at),
@@ -423,13 +471,20 @@ export class SQLiteLeaseStore {
       .run(Math.round(durationMs), completedAt.getTime());
   }
 
-  private tryAcquireTurn(input: AcquireTurnInput): LeasedTurn | null {
-    const existingSlot = this.sqlite
+  private tryAcquireTurn(
+    input: AcquireTurnInput,
+    excludedAccountIds: ReadonlySet<string> = new Set(),
+  ): LeasedTurn | null {
+    const requiredAccountId = input.requiredAccountId ?? null;
+    const existingSlots = this.sqlite
       .prepare(
         `SELECT account_id, slot_index, user_id, lease_id
-         FROM account_slots WHERE user_id = ? ORDER BY claimed_at LIMIT 1`,
+         FROM account_slots
+         WHERE user_id = ? AND (? IS NULL OR account_id = ?)
+         ORDER BY claimed_at`,
       )
-      .get(input.userId) as AccountSlotRow | undefined;
+      .all(input.userId, requiredAccountId, requiredAccountId) as AccountSlotRow[];
+    const existingSlot = existingSlots.find((slot) => !excludedAccountIds.has(slot.account_id));
 
     if (existingSlot) {
       if (this.isAccountEligibleForExistingUser(existingSlot.account_id, input.now)) {
@@ -454,10 +509,26 @@ export class SQLiteLeaseStore {
           reusedUserSlot: true,
         };
       }
-      if (!this.releaseIneligibleIdleUserSlot(existingSlot, input.now)) return null;
+      if (!this.releaseIdleUserSlot(existingSlot, input.now, "ACCOUNT_INELIGIBLE")) return null;
     }
 
-    const account = this.selectEligibleAccount(input.now);
+    if (requiredAccountId) {
+      const otherSlots = this.sqlite
+        .prepare(
+          `SELECT account_id, slot_index, user_id, lease_id
+           FROM account_slots
+           WHERE user_id = ? AND account_id <> ?
+           ORDER BY claimed_at`,
+        )
+        .all(input.userId, requiredAccountId) as AccountSlotRow[];
+      for (const otherSlot of otherSlots) {
+        if (!this.releaseIdleUserSlot(otherSlot, input.now, "THREAD_ACCOUNT_AFFINITY")) {
+          return null;
+        }
+      }
+    }
+
+    const account = this.selectEligibleAccount(input.now, requiredAccountId, excludedAccountIds);
     if (!account) return null;
 
     const freeSlot = this.sqlite
@@ -521,17 +592,21 @@ export class SQLiteLeaseStore {
     };
   }
 
-  private selectEligibleAccount(now: Date): EligibleAccountRow | null {
-    return (
-      (this.sqlite
-        .prepare(
-          `SELECT a.id, a.max_active_users,
+  private selectEligibleAccount(
+    now: Date,
+    requiredAccountId: string | null,
+    excludedAccountIds: ReadonlySet<string>,
+  ): EligibleAccountRow | null {
+    const accounts = this.sqlite
+      .prepare(
+        `SELECT a.id, a.max_active_users,
                   COUNT(s.user_id) AS active_users
            FROM codex_accounts a
            LEFT JOIN account_slots s ON s.account_id = a.id
            WHERE a.status = 'AVAILABLE'
              AND a.auth_status = 'AUTHENTICATED'
              AND a.health_score > 0
+             AND (? IS NULL OR a.id = ?)
              AND (
                (a.weekly_remaining IS NOT NULL
                  AND a.weekly_remaining > 0
@@ -548,20 +623,53 @@ export class SQLiteLeaseStore {
              (a.last_assigned_at IS NULL) DESC,
              a.last_assigned_at ASC,
              a.id ASC
-           LIMIT 1`,
-        )
-        .get(now.getTime() - QUOTA_FRESHNESS_MS) as EligibleAccountRow | undefined) ?? null
-    );
+           `,
+      )
+      .all(
+        requiredAccountId,
+        requiredAccountId,
+        now.getTime() - QUOTA_FRESHNESS_MS,
+      ) as EligibleAccountRow[];
+    return accounts.find((account) => !excludedAccountIds.has(account.id)) ?? null;
   }
 
-  private getQueueReason(userId: string, now: Date): QueueReason {
+  private findExistingUserAccount(userId: string, requiredAccountId: string | null): string | null {
+    const row = this.sqlite
+      .prepare(
+        `SELECT account_id
+         FROM account_slots
+         WHERE user_id = ? AND (? IS NULL OR account_id = ?)
+         ORDER BY claimed_at LIMIT 1`,
+      )
+      .get(userId, requiredAccountId, requiredAccountId) as { account_id: string } | undefined;
+    return row?.account_id ?? requiredAccountId;
+  }
+
+  private getQueueReason(input: AcquireTurnInput): QueueReason {
+    const requiredAccountId = input.requiredAccountId ?? null;
     const existing = this.sqlite
-      .prepare("SELECT account_id FROM account_slots WHERE user_id = ? LIMIT 1")
-      .get(userId) as { account_id: string } | undefined;
+      .prepare(
+        `SELECT account_id FROM account_slots
+         WHERE user_id = ? AND (? IS NULL OR account_id = ?)
+         LIMIT 1`,
+      )
+      .get(input.userId, requiredAccountId, requiredAccountId) as
+      | { account_id: string }
+      | undefined;
     if (existing) {
-      return this.isAccountEligibleForExistingUser(existing.account_id, now)
+      return this.isAccountEligibleForExistingUser(existing.account_id, input.now)
         ? "USER_TURN_LIMIT"
         : "NO_ELIGIBLE_ACCOUNT";
+    }
+
+    if (requiredAccountId) {
+      const activeOnOtherAccount = this.sqlite
+        .prepare(
+          `SELECT 1 FROM user_turn_slots
+           WHERE user_id = ? AND account_id <> ? LIMIT 1`,
+        )
+        .get(input.userId, requiredAccountId);
+      if (activeOnOtherAccount) return "USER_TURN_LIMIT";
     }
 
     const otherwiseEligible = this.sqlite
@@ -570,12 +678,13 @@ export class SQLiteLeaseStore {
          WHERE status IN ('AVAILABLE', 'FULL')
            AND auth_status = 'AUTHENTICATED'
            AND health_score > 0
+           AND (? IS NULL OR id = ?)
            AND (
              (weekly_remaining IS NOT NULL AND weekly_remaining > 0 AND quota_updated_at >= ?)
              OR (weekly_remaining IS NULL AND allow_unknown_quota = 1)
            ) LIMIT 1`,
       )
-      .get(now.getTime() - QUOTA_FRESHNESS_MS);
+      .get(requiredAccountId, requiredAccountId, input.now.getTime() - QUOTA_FRESHNESS_MS);
     return otherwiseEligible ? "ACCOUNT_USER_LIMIT" : "NO_ELIGIBLE_ACCOUNT";
   }
 
@@ -599,7 +708,11 @@ export class SQLiteLeaseStore {
     );
   }
 
-  private releaseIneligibleIdleUserSlot(slot: AccountSlotRow, now: Date): boolean {
+  private releaseIdleUserSlot(
+    slot: AccountSlotRow,
+    now: Date,
+    reason: "ACCOUNT_INELIGIBLE" | "THREAD_ACCOUNT_AFFINITY",
+  ): boolean {
     const activeTurn = this.sqlite
       .prepare(
         `SELECT 1 FROM user_turn_slots
@@ -610,10 +723,10 @@ export class SQLiteLeaseStore {
     this.sqlite
       .prepare(
         `UPDATE account_leases
-         SET status = 'RELEASED', released_at = ?, release_reason = 'ACCOUNT_INELIGIBLE'
+         SET status = 'RELEASED', released_at = ?, release_reason = ?
          WHERE id = ? AND status = 'ACTIVE'`,
       )
-      .run(now.getTime(), slot.lease_id);
+      .run(now.getTime(), reason, slot.lease_id);
     this.sqlite
       .prepare(
         `UPDATE account_slots
@@ -631,10 +744,17 @@ export class SQLiteLeaseStore {
     this.sqlite
       .prepare(
         `INSERT OR IGNORE INTO queue_entries (
-          user_id, task_id, turn_id, reason, status, enqueued_at
-        ) VALUES (?, ?, ?, ?, 'WAITING', ?)`,
+          user_id, task_id, turn_id, required_account_id, reason, status, enqueued_at
+        ) VALUES (?, ?, ?, ?, ?, 'WAITING', ?)`,
       )
-      .run(input.userId, input.taskId, input.turnId, reason, input.now.getTime());
+      .run(
+        input.userId,
+        input.taskId,
+        input.turnId,
+        input.requiredAccountId ?? null,
+        reason,
+        input.now.getTime(),
+      );
     const row = this.sqlite
       .prepare("SELECT * FROM queue_entries WHERE turn_id = ? AND status = 'WAITING'")
       .get(input.turnId) as QueueRow;
@@ -650,6 +770,7 @@ export class SQLiteLeaseStore {
       userId: row.user_id,
       taskId: row.task_id,
       turnId: row.turn_id,
+      requiredAccountId: row.required_account_id,
       position: positionRow.position,
       reason: row.reason,
       etaMs: eta.durationMs * positionRow.position,

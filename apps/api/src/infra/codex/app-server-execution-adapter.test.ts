@@ -1,13 +1,553 @@
 import { EventEmitter } from "node:events";
+import type { ActorContext, EffectiveThreadConfigSnapshot } from "@codexplatform/contracts";
 import { describe, expect, test, vi } from "vitest";
+import {
+  ActiveTurnResumeConflictError,
+  type ApprovalDraft,
+  InvalidThreadResumeResponseError,
+} from "../../domain/platform-service.js";
 import { ActorRegistry } from "../../tools/actor-registry.js";
 import {
   AppServerExecutionAdapter,
   type ManagedRuntimePort,
   type RuntimeSupervisorPort,
 } from "./app-server-execution-adapter.js";
+import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse.js";
+
+const TEST_EXECUTION_CONTEXT: {
+  effectiveConfig: EffectiveThreadConfigSnapshot;
+  actorContext: ActorContext;
+} = {
+  effectiveConfig: {
+    model: null,
+    reasoningEffort: "MEDIUM",
+    permissionMode: "WORKSPACE_WRITE",
+    approvalMode: "ASK",
+    personality: "PRAGMATIC",
+    instructions: "",
+    sourceVersion: "test-v1",
+  },
+  actorContext: {
+    tenantKey: "tenant-1",
+    userId: "user-1",
+    role: "MEMBER",
+    toolScopes: ["demo"],
+    approvalPolicy: "ASK",
+  },
+};
 
 describe("AppServerExecutionAdapter", () => {
+  test("fails closed when resume rejoins an active Turn and never starts another Turn", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.resumeThread).mockResolvedValue(
+      resumeResponse("thread-1", { type: "active", activeFlags: [] }, [
+        { id: "turn-active", status: "inProgress" },
+      ]),
+    );
+    const registry = new ActorRegistry();
+    const stopAccount = vi.fn(async () => undefined);
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAccount,
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: registry,
+    });
+    const events: unknown[] = [];
+    const crashes: unknown[] = [];
+    adapter.on("taskEvent", (event) => events.push(event));
+    adapter.on("accountCrashed", (event) => crashes.push(event));
+
+    const error = await adapter
+      .startTask({
+        accountId: "account-1",
+        codexHome: "/tmp/account-1",
+        taskId: "task-1",
+        userId: "user-1",
+        cwd: "/workspace",
+        prompt: "This prompt must not attach to the active Turn",
+        existingThreadId: "thread-1",
+        ...TEST_EXECUTION_CONTEXT,
+      })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(ActiveTurnResumeConflictError);
+    expect(error).toMatchObject({
+      code: "ACTIVE_TURN_RESUME_CONFLICT",
+      promptAccepted: false,
+      rejoined: false,
+      threadId: "thread-1",
+      turnId: "turn-active",
+    });
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+    expect(stopAccount).toHaveBeenCalledWith("account-1");
+    expect(crashes).toEqual([
+      {
+        accountId: "account-1",
+        reason: "Thread already has an active Turn; the new prompt was not accepted",
+        sourceTaskId: "task-1",
+        sourceRuntimeTurnId: "turn-active",
+      },
+    ]);
+    expect(
+      registry.resolve({
+        accountId: "account-1",
+        connectionGeneration: 1,
+        threadId: "thread-1",
+        turnId: "turn-active",
+      }),
+    ).toBeNull();
+
+    rpc.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-active",
+        itemId: "message-active",
+        delta: "Still running",
+      },
+    });
+    expect(events).toEqual([]);
+  });
+
+  test("starts a new Turn after resuming an idle Thread", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.resumeThread).mockResolvedValue(
+      resumeResponse("thread-1", { type: "idle" }, [{ id: "turn-completed", status: "completed" }]),
+    );
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await expect(
+      adapter.startTask({
+        accountId: "account-1",
+        codexHome: "/tmp/account-1",
+        taskId: "task-1",
+        userId: "user-1",
+        cwd: "/workspace",
+        prompt: "Start the next Turn",
+        existingThreadId: "thread-1",
+        ...TEST_EXECUTION_CONTEXT,
+      }),
+    ).resolves.toEqual({ threadId: "thread-1", turnId: "turn-1" });
+    expect(runtime.resumeThread).toHaveBeenCalledOnce();
+    expect(runtime.disableThreadMemory).toHaveBeenCalledWith("thread-1");
+    expect(runtime.startTurn).toHaveBeenCalledOnce();
+    expect(vi.mocked(runtime.resumeThread).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.disableThreadMemory).mock.invocationCallOrder[0] as number,
+    );
+    expect(vi.mocked(runtime.disableThreadMemory).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.startTurn).mock.invocationCallOrder[0] as number,
+    );
+  });
+
+  test("disables native memory after creating a Thread and before starting its Turn", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Start safely",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    expect(runtime.disableThreadMemory).toHaveBeenCalledWith("thread-1");
+    expect(vi.mocked(runtime.startThread).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.disableThreadMemory).mock.invocationCallOrder[0] as number,
+    );
+    expect(vi.mocked(runtime.disableThreadMemory).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.startTurn).mock.invocationCallOrder[0] as number,
+    );
+  });
+
+  test.each([
+    ["new", null],
+    ["resumed", "thread-1"],
+  ] as const)(
+    "fails closed when native memory cannot be disabled on a %s Thread",
+    async (_kind, existingThreadId) => {
+      const rpc = new FakeRpc();
+      const runtime = runtimePort();
+      vi.mocked(runtime.disableThreadMemory).mockRejectedValueOnce(
+        new Error("memory mode unavailable"),
+      );
+      const stopAccount = vi.fn(async () => undefined);
+      const adapter = new AppServerExecutionAdapter({
+        supervisor: {
+          startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+          stopAccount,
+          stopAll: async () => undefined,
+        },
+        tools: {
+          definitions: () => [],
+          invoke: async () => ({ success: true, contentItems: [] }),
+        },
+        actors: new ActorRegistry(),
+      });
+      const crashes: unknown[] = [];
+      adapter.on("accountCrashed", (event) => crashes.push(event));
+
+      await expect(
+        adapter.startTask({
+          accountId: "account-1",
+          codexHome: "/tmp/account-1",
+          taskId: "task-1",
+          userId: "user-1",
+          cwd: "/workspace",
+          prompt: "Must not run",
+          existingThreadId,
+          ...TEST_EXECUTION_CONTEXT,
+        }),
+      ).rejects.toMatchObject({
+        code: "INVALID_THREAD_RESUME_RESPONSE",
+        promptAccepted: false,
+        rejoined: false,
+      });
+      expect(runtime.startTurn).not.toHaveBeenCalled();
+      expect(stopAccount).toHaveBeenCalledWith("account-1");
+      expect(crashes).toEqual([
+        expect.objectContaining({
+          accountId: "account-1",
+          reason: expect.stringContaining("unsafe"),
+        }),
+      ]);
+    },
+  );
+
+  test.each([null, [], { accepted: true }])(
+    "fails closed on a malformed native memory response: %j",
+    async (memoryResponse) => {
+      const rpc = new FakeRpc();
+      const runtime = runtimePort();
+      vi.mocked(runtime.disableThreadMemory).mockResolvedValueOnce(memoryResponse);
+      const stopAccount = vi.fn(async () => undefined);
+      const adapter = new AppServerExecutionAdapter({
+        supervisor: {
+          startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+          stopAccount,
+          stopAll: async () => undefined,
+        },
+        tools: {
+          definitions: () => [],
+          invoke: async () => ({ success: true, contentItems: [] }),
+        },
+        actors: new ActorRegistry(),
+      });
+      const crashes: unknown[] = [];
+      adapter.on("accountCrashed", (event) => crashes.push(event));
+
+      await expect(
+        adapter.startTask({
+          accountId: "account-1",
+          codexHome: "/tmp/account-1",
+          taskId: "task-1",
+          userId: "user-1",
+          cwd: "/workspace",
+          prompt: "Must not run",
+          existingThreadId: null,
+          ...TEST_EXECUTION_CONTEXT,
+        }),
+      ).rejects.toMatchObject({ code: "INVALID_THREAD_RESUME_RESPONSE" });
+      expect(runtime.startTurn).not.toHaveBeenCalled();
+      expect(stopAccount).toHaveBeenCalledWith("account-1");
+      expect(crashes).toEqual([
+        expect.objectContaining({
+          accountId: "account-1",
+          reason: expect.stringContaining("unsafe"),
+        }),
+      ]);
+    },
+  );
+
+  test("detaches every same-account Turn and pending approval before intentionally stopping", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.startThread)
+      .mockResolvedValueOnce({ thread: { id: "thread-a" } })
+      .mockResolvedValueOnce({ thread: { id: "thread-b" } });
+    vi.mocked(runtime.startTurn)
+      .mockResolvedValueOnce({ turn: { id: "turn-a" } })
+      .mockResolvedValueOnce({ turn: { id: "turn-b" } });
+    const stopAccount = vi.fn(async () => undefined);
+    const registry = new ActorRegistry();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAccount,
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: registry,
+    });
+    const approvals: ApprovalDraft[] = [];
+    const events: unknown[] = [];
+    const crashes: unknown[] = [];
+    adapter.on("approval", (approval) => approvals.push(approval));
+    adapter.on("taskEvent", (event) => events.push(event));
+    adapter.on("accountCrashed", (event) => crashes.push(event));
+
+    for (const suffix of ["a", "b"]) {
+      await adapter.startTask({
+        accountId: "account-1",
+        codexHome: "/tmp/account-1",
+        taskId: `task-${suffix}`,
+        userId: `user-${suffix}`,
+        cwd: `/workspace/${suffix}`,
+        prompt: `Build ${suffix}`,
+        existingThreadId: null,
+        ...TEST_EXECUTION_CONTEXT,
+      });
+    }
+    rpc.emit("serverRequest", {
+      id: "approval-b",
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thread-b",
+        turnId: "turn-b",
+        itemId: "command-b",
+        command: "pnpm test",
+      },
+    });
+    await nextTick();
+    expect(approvals).toHaveLength(1);
+
+    vi.mocked(runtime.resumeThread).mockResolvedValueOnce(
+      resumeResponse("thread-a", { type: "active", activeFlags: [] }, [
+        { id: "turn-a", status: "inProgress" },
+      ]),
+    );
+    await expect(
+      adapter.startTask({
+        accountId: "account-1",
+        codexHome: "/tmp/account-1",
+        taskId: "task-resume",
+        userId: "user-a",
+        cwd: "/workspace/a",
+        prompt: "Resume",
+        existingThreadId: "thread-a",
+        ...TEST_EXECUTION_CONTEXT,
+      }),
+    ).rejects.toBeInstanceOf(ActiveTurnResumeConflictError);
+
+    expect(stopAccount).toHaveBeenCalledWith("account-1");
+    expect(crashes).toEqual([
+      expect.objectContaining({
+        accountId: "account-1",
+        reason: "Thread already has an active Turn; the new prompt was not accepted",
+        sourceTaskId: "task-resume",
+        sourceRuntimeTurnId: "turn-a",
+      }),
+    ]);
+    for (const suffix of ["a", "b"]) {
+      expect(
+        registry.resolve({
+          accountId: "account-1",
+          connectionGeneration: 1,
+          threadId: `thread-${suffix}`,
+          turnId: `turn-${suffix}`,
+        }),
+      ).toBeNull();
+      await expect(
+        adapter.steerTask(`thread-${suffix}`, `turn-${suffix}`, "continue"),
+      ).rejects.toThrow("not attached");
+    }
+    const approval = approvals[0] as ApprovalDraft;
+    await expect(
+      adapter.respondApproval(approval.requestId, "accept", {
+        approvalType: approval.approvalType,
+        transport: {
+          accountId: approval.accountId,
+          connectionGeneration: approval.connectionGeneration,
+          threadId: approval.threadId,
+          turnId: approval.turnId,
+          requestId: approval.requestId,
+          rawRpcId: approval.rawRpcId,
+        },
+      }),
+    ).rejects.toThrow("no longer attached");
+
+    rpc.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "thread-b",
+        turnId: "turn-b",
+        itemId: "late-message",
+        delta: "must be ignored",
+      },
+    });
+    expect(events).toEqual([]);
+  });
+
+  test("fails closed when an idle resume response still contains an in-progress Turn", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.resumeThread).mockResolvedValue(
+      resumeResponse("thread-1", { type: "idle" }, [
+        { id: "turn-inconsistent", status: "inProgress" },
+      ]),
+    );
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await expect(
+      adapter.startTask({
+        accountId: "account-1",
+        codexHome: "/tmp/account-1",
+        taskId: "task-1",
+        userId: "user-1",
+        cwd: "/workspace",
+        prompt: "Do not attach this prompt",
+        existingThreadId: "thread-1",
+        ...TEST_EXECUTION_CONTEXT,
+      }),
+    ).rejects.toThrow("inconsistent with an in-progress Turn");
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    [
+      "unknown thread status",
+      {
+        thread: {
+          id: "thread-1",
+          status: { type: "futureStatus" },
+          turns: [],
+        },
+      },
+    ],
+    [
+      "missing turns",
+      {
+        thread: {
+          id: "thread-1",
+          status: { type: "idle" },
+        },
+      },
+    ],
+    [
+      "unknown turn status",
+      {
+        thread: {
+          id: "thread-1",
+          status: { type: "idle" },
+          turns: [{ id: "turn-1", status: "futureTurnStatus" }],
+        },
+      },
+    ],
+    [
+      "idle status with active flags",
+      {
+        thread: {
+          id: "thread-1",
+          status: { type: "idle", activeFlags: [] },
+          turns: [{ id: "turn-1", status: "completed" }],
+        },
+      },
+    ],
+    [
+      "malformed active flags",
+      {
+        thread: {
+          id: "thread-1",
+          status: { type: "active", activeFlags: "waitingOnApproval" },
+          turns: [{ id: "turn-1", status: "inProgress" }],
+        },
+      },
+    ],
+    [
+      "unknown active flag",
+      {
+        thread: {
+          id: "thread-1",
+          status: { type: "active", activeFlags: ["futureFlag"] },
+          turns: [{ id: "turn-1", status: "inProgress" }],
+        },
+      },
+    ],
+    [
+      "missing thread id",
+      {
+        thread: {
+          status: { type: "idle" },
+          turns: [],
+        },
+      },
+    ],
+  ])("stops and quarantines malformed resume payloads: %s", async (_name, payload) => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.resumeThread).mockResolvedValue(payload as unknown as ThreadResumeResponse);
+    const stopAccount = vi.fn(async () => undefined);
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAccount,
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const crashes: unknown[] = [];
+    adapter.on("accountCrashed", (event) => crashes.push(event));
+
+    const error = await adapter
+      .startTask({
+        accountId: "account-1",
+        codexHome: "/tmp/account-1",
+        taskId: "task-1",
+        userId: "user-1",
+        cwd: "/workspace",
+        prompt: "Do not start",
+        existingThreadId: "thread-1",
+        ...TEST_EXECUTION_CONTEXT,
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(InvalidThreadResumeResponseError);
+    expect(error).toMatchObject({
+      code: "INVALID_THREAD_RESUME_RESPONSE",
+      promptAccepted: false,
+      rejoined: false,
+      threadId: "thread-1",
+    });
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+    expect(stopAccount).toHaveBeenCalledWith("account-1");
+    expect(crashes).toEqual([
+      expect.objectContaining({
+        accountId: "account-1",
+        reason: expect.stringContaining("unsafe"),
+      }),
+    ]);
+  });
+
   test("starts one thread/turn, normalizes notifications and binds dynamic tools to its actor", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();
@@ -38,15 +578,24 @@ describe("AppServerExecutionAdapter", () => {
         cwd: "/workspace",
         prompt: "Build it",
         existingThreadId: null,
+        ...TEST_EXECUTION_CONTEXT,
       }),
     ).resolves.toEqual({ threadId: "thread-1", turnId: "turn-1" });
     expect(runtime.startThread).toHaveBeenCalledWith({
       cwd: "/workspace",
       dynamicTools: tools.definitions(),
+      effectiveConfig: TEST_EXECUTION_CONTEXT.effectiveConfig,
     });
-    expect(registry.resolve("thread-1", "turn-1")).toMatchObject({
+    expect(
+      registry.resolve({
+        accountId: "account-1",
+        connectionGeneration: 1,
+        threadId: "thread-1",
+        turnId: "turn-1",
+      }),
+    ).toMatchObject({
       taskId: "task-1",
-      userId: "user-1",
+      actorContext: { userId: "user-1" },
     });
 
     rpc.emit("notification", {
@@ -77,6 +626,141 @@ describe("AppServerExecutionAdapter", () => {
     });
   });
 
+  test("inherits the parent actor for observable subagent threads and clears it with the parent", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    const registry = new ActorRegistry();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: registry,
+    });
+    const events: Array<{
+      type: string;
+      threadId: string | null;
+      subagentThreadId?: string;
+      payload: unknown;
+    }> = [];
+    const approvals: unknown[] = [];
+    adapter.on("taskEvent", (event) => events.push(event));
+    adapter.on("approval", (approval) => approvals.push(approval));
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Delegate",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    rpc.emit("notification", {
+      method: "item/started",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "subAgentActivity",
+          id: "subagent-activity-1",
+          kind: "started",
+          agentThreadId: "agent-thread-1",
+          agentPath: "research",
+        },
+      },
+    });
+    rpc.emit("notification", {
+      method: "turn/started",
+      params: { threadId: "agent-thread-1", turn: { id: "agent-turn-1" } },
+    });
+    expect(
+      registry.resolve({
+        accountId: "account-1",
+        connectionGeneration: 1,
+        threadId: "agent-thread-1",
+        turnId: "agent-turn-1",
+      }),
+    ).toMatchObject({
+      taskId: "task-1",
+      accountId: "account-1",
+      actorContext: { userId: "user-1" },
+    });
+    rpc.emit("serverRequest", {
+      id: "child-approval-1",
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "agent-thread-1",
+        turnId: "agent-turn-1",
+        itemId: "child-command-1",
+        command: "pnpm test",
+      },
+    });
+    expect(approvals).toEqual([
+      expect.objectContaining({
+        taskId: "task-1",
+        threadId: "agent-thread-1",
+        turnId: "agent-turn-1",
+        parentTurnId: "turn-1",
+      }),
+    ]);
+    rpc.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "agent-thread-1",
+        turnId: "agent-turn-1",
+        itemId: "child-message-1",
+        delta: "child detail",
+      },
+    });
+    rpc.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "agent-thread-1",
+        turn: { id: "agent-turn-1", status: "completed" },
+      },
+    });
+
+    expect(events.map((event) => event.type)).toEqual([
+      "SUBAGENT_ACTIVITY",
+      "TURN_STARTED",
+      "AGENT_MESSAGE_DELTA",
+      "TURN_COMPLETED",
+    ]);
+    expect(events[0]).not.toHaveProperty("subagentThreadId");
+    expect(events.slice(1)).toEqual([
+      expect.objectContaining({ subagentThreadId: "agent-thread-1" }),
+      expect.objectContaining({
+        subagentThreadId: "agent-thread-1",
+        payload: expect.objectContaining({ delta: "child detail" }),
+      }),
+      expect.objectContaining({ subagentThreadId: "agent-thread-1" }),
+    ]);
+    expect(
+      registry.resolve({
+        accountId: "account-1",
+        connectionGeneration: 1,
+        threadId: "agent-thread-1",
+        turnId: "agent-turn-1",
+      }),
+    ).toBeNull();
+
+    rpc.emit("notification", {
+      method: "turn/completed",
+      params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } },
+    });
+    expect(
+      registry.resolve({
+        accountId: "account-1",
+        connectionGeneration: 1,
+        threadId: "agent-thread-1",
+        turnId: "agent-turn-1",
+      }),
+    ).toBeNull();
+  });
+
   test("persists the exact approval RPC id and replies only after a user decision", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();
@@ -98,6 +782,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
 
     rpc.emit("serverRequest", {
@@ -159,6 +844,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
     await nextTick();
     rpc.emit("serverRequest", {
@@ -205,6 +891,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
     await nextTick();
     rpc.emit("notification", {
@@ -214,7 +901,14 @@ describe("AppServerExecutionAdapter", () => {
     turnStarted.resolve({ turn: { id: "turn-1" } });
     await start;
 
-    expect(actors.resolve("thread-1", "turn-1")).toBeNull();
+    expect(
+      actors.resolve({
+        accountId: "account-1",
+        connectionGeneration: 1,
+        threadId: "thread-1",
+        turnId: "turn-1",
+      }),
+    ).toBeNull();
     rpc.emit("serverRequest", {
       id: 22,
       method: "item/commandExecution/requestApproval",
@@ -260,6 +954,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
     await nextTick();
     rpc.emit("serverRequest", {
@@ -276,7 +971,12 @@ describe("AppServerExecutionAdapter", () => {
 
     await expect(start).rejects.toThrow("turn start failed");
     await nextTick();
-    expect(crashes).toEqual([{ accountId: "account-1" }]);
+    expect(crashes).toEqual([
+      {
+        accountId: "account-1",
+        reason: "Codex response delivery failed; recovery is required.",
+      },
+    ]);
     expect(stopAccount).toHaveBeenCalledWith("account-1");
   });
 
@@ -298,6 +998,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
     const transport = {
       accountId: "account-1",
@@ -370,6 +1071,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
     const toolAck = deferred<void>();
     rpc.respond.mockReturnValueOnce(toolAck.promise);
@@ -409,6 +1111,66 @@ describe("AppServerExecutionAdapter", () => {
     await expect(unsupportedResponse).resolves.toBeUndefined();
   });
 
+  test("rejects a dynamic Tool request from a stale or different App Server connection", async () => {
+    const rpc = new FakeRpc();
+    const invoke = vi.fn(async () => ({ success: true, contentItems: [] }));
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime: runtimePort() }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke },
+      actors: new ActorRegistry(),
+    });
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Build it",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+    const message = {
+      id: 77,
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-stale",
+        tool: "demo",
+        arguments: {},
+      },
+    };
+    const handle = (
+      adapter as unknown as {
+        handleServerRequest(
+          accountId: string,
+          connectionGeneration: number,
+          rpc: FakeRpc,
+          message: unknown,
+        ): Promise<void>;
+      }
+    ).handleServerRequest.bind(adapter);
+
+    await handle("account-other", 1, rpc, message);
+    await handle("account-1", 99, rpc, message);
+    const replacedRpc = new FakeRpc();
+    await handle("account-1", 1, replacedRpc, message);
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(rpc.respondError).toHaveBeenCalledTimes(2);
+    expect(rpc.respondError).toHaveBeenCalledWith(77, {
+      code: -32_601,
+      message: "Tool call is not bound to this App Server connection",
+    });
+    expect(replacedRpc.respondError).toHaveBeenCalledWith(77, {
+      code: -32_601,
+      message: "Tool call is not bound to this App Server connection",
+    });
+  });
+
   test("contains an asynchronous server-response failure at the real event listener", async () => {
     const rpc = new FakeRpc();
     const stopAccount = vi.fn(async () => undefined);
@@ -437,6 +1199,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
     rpc.respond.mockRejectedValueOnce(new Error("transport write failed"));
 
@@ -454,18 +1217,22 @@ describe("AppServerExecutionAdapter", () => {
     await nextTick();
     await nextTick();
 
-    expect(events).toContainEqual(
-      expect.objectContaining({
-        taskId: "task-1",
+    expect(events).toEqual([]);
+    expect(quarantined).toEqual([
+      {
+        accountId: "account-1",
+        reason: "Codex response delivery failed; recovery is required.",
+      },
+    ]);
+    expect(stopAccount).toHaveBeenCalledWith("account-1");
+    expect(
+      actors.resolve({
+        accountId: "account-1",
+        connectionGeneration: 1,
         threadId: "thread-1",
         turnId: "turn-1",
-        type: "RECOVERY_REQUIRED",
-        payload: { reason: "Codex response delivery failed; recovery is required." },
       }),
-    );
-    expect(quarantined).toEqual([{ accountId: "account-1" }]);
-    expect(stopAccount).toHaveBeenCalledWith("account-1");
-    expect(actors.resolve("thread-1", "turn-1")).toBeNull();
+    ).toBeNull();
     await expect(adapter.steerTask("thread-1", "turn-1", "continue")).rejects.toThrow(
       "not attached",
     );
@@ -499,6 +1266,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace/a",
       prompt: "A",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
     await adapter.startTask({
       accountId: "account-b",
@@ -508,6 +1276,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace/b",
       prompt: "B",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
 
     rpcA.emit("serverRequest", {
@@ -558,6 +1327,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
     const params = {
       threadId: "thread-1",
@@ -636,9 +1406,10 @@ describe("AppServerExecutionAdapter", () => {
     await expect(adapter.refreshWeeklyQuota(account)).resolves.toMatchObject({ status: "KNOWN" });
   });
 
-  test("quarantines a crashed account boundary and marks every attached turn for recovery", async () => {
+  test("detaches a crashed account boundary and delegates persisted recovery once", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();
+    const registry = new ActorRegistry();
     const supervisor = Object.assign(new EventEmitter(), {
       startAccount: vi.fn(async () => ({ accountId: "account-1", rpc, runtime })),
       stopAll: vi.fn(async () => undefined),
@@ -646,12 +1417,14 @@ describe("AppServerExecutionAdapter", () => {
     const adapter = new AppServerExecutionAdapter({
       supervisor,
       tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
-      actors: new ActorRegistry(),
+      actors: registry,
     });
     const taskEvents: unknown[] = [];
     const crashes: unknown[] = [];
+    const approvals: ApprovalDraft[] = [];
     adapter.on("taskEvent", (event) => taskEvents.push(event));
     adapter.on("accountCrashed", (event) => crashes.push(event));
+    adapter.on("approval", (approval) => approvals.push(approval));
     await adapter.startTask({
       accountId: "account-1",
       codexHome: "/tmp/account-1",
@@ -660,20 +1433,64 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
+    rpc.emit("serverRequest", {
+      id: "crash-approval",
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "command-before-crash",
+        command: "pnpm test",
+      },
+    });
+    await nextTick();
+    expect(approvals).toHaveLength(1);
 
     supervisor.emit("accountCrashed", { accountId: "account-1", exitCode: 9, signal: null });
 
-    expect(crashes).toEqual([expect.objectContaining({ accountId: "account-1" })]);
-    expect(taskEvents).toEqual([
-      expect.objectContaining({
-        taskId: "task-1",
+    expect(crashes).toEqual([
+      {
+        accountId: "account-1",
+        reason: "Codex App Server exited; recovery is required.",
+      },
+    ]);
+    expect(
+      registry.resolve({
+        accountId: "account-1",
+        connectionGeneration: 1,
         threadId: "thread-1",
         turnId: "turn-1",
-        type: "RECOVERY_REQUIRED",
-        payload: { reason: "Codex App Server exited; recovery is required." },
       }),
-    ]);
+    ).toBeNull();
+    await expect(adapter.steerTask("thread-1", "turn-1", "continue")).rejects.toThrow(
+      "not attached",
+    );
+    const approval = approvals[0] as ApprovalDraft;
+    await expect(
+      adapter.respondApproval(approval.requestId, "accept", {
+        approvalType: approval.approvalType,
+        transport: {
+          accountId: approval.accountId,
+          connectionGeneration: approval.connectionGeneration,
+          threadId: approval.threadId,
+          turnId: approval.turnId,
+          requestId: approval.requestId,
+          rawRpcId: approval.rawRpcId,
+        },
+      }),
+    ).rejects.toThrow("no longer attached");
+    rpc.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "late-after-crash",
+        delta: "must be ignored",
+      },
+    });
+    expect(taskEvents).toEqual([]);
   });
 
   test("detaches pending approvals when their Turn becomes terminal", async () => {
@@ -696,6 +1513,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
     rpc.emit("serverRequest", {
       id: 17,
@@ -766,6 +1584,7 @@ describe("AppServerExecutionAdapter", () => {
       cwd: "/workspace",
       prompt: "Build it",
       existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
     });
 
     rpc.emit("notification", {
@@ -786,8 +1605,9 @@ class FakeRpc extends EventEmitter {
 function runtimePort(threadId = "thread-1", turnId = "turn-1"): ManagedRuntimePort["runtime"] {
   return {
     startThread: vi.fn(async () => ({ thread: { id: threadId } })),
-    resumeThread: vi.fn(async () => ({ thread: { id: threadId } })),
+    resumeThread: vi.fn(async () => resumeResponse(threadId, { type: "idle" }, [])),
     startTurn: vi.fn(async () => ({ turn: { id: turnId } })),
+    disableThreadMemory: vi.fn(async () => ({})),
     steerTurn: vi.fn(async () => undefined),
     interruptTurn: vi.fn(async () => undefined),
     startChatGptLogin: vi.fn(async () => ({
@@ -803,6 +1623,28 @@ function runtimePort(threadId = "thread-1", turnId = "turn-1"): ManagedRuntimePo
       resetsAt: 1_785_225_600,
     })),
   };
+}
+
+function resumeResponse(
+  threadId: string,
+  status: ThreadResumeResponse["thread"]["status"],
+  turns: Array<{ id: string; status: ThreadResumeResponse["thread"]["turns"][number]["status"] }>,
+): ThreadResumeResponse {
+  return {
+    thread: {
+      id: threadId,
+      status,
+      turns: turns.map((turn) => ({
+        ...turn,
+        items: [],
+        itemsView: { type: "full" },
+        error: null,
+        startedAt: null,
+        completedAt: null,
+        durationMs: null,
+      })),
+    },
+  } as unknown as ThreadResumeResponse;
 }
 
 async function nextTick(): Promise<void> {

@@ -30,6 +30,7 @@ describe("task SSE subscription", () => {
     });
 
     await waitFor(() => expect(fetcher.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(fetcher.mock.calls[0]?.[0]).toBe("/api/threads/task-1/events");
     expect(fetcher.mock.calls[0]?.[1]).toMatchObject({
       headers: { "Last-Event-ID": "17" },
     });

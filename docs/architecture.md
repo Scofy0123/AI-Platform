@@ -2,44 +2,143 @@
 
 ## 目标与部署边界
 
-当前交付是运行在单台 Mac、仅监听 loopback 的模块化单体。它验证从飞书具名用户到任务执行、账号租约、事件展示和企业 Tool 的完整纵切，但不包含容器集群、HA、KMS、Redis/NATS 或 PostgreSQL。
+CodexPlatform 1.1 的产品边界是“员工 Codex 工作区 + 独立管理后台”，技术边界分为两段：
+
+- **1.1A 当前实现**：单台 Mac、loopback、Fastify + React + SQLite、单进程 API、账号级长期 App Server。真实 Codex 仅允许首位管理员单操作者使用。
+- **1.1B 规划**：每位内部用户独立 Worker 和 `CODEX_HOME`，账号级 Credential Broker、正式 MCP Gateway、PostgreSQL、消息总线、KMS 和 HA。
+
+当前仓库不包含容器集群、独立系统用户、分布式租约或生产密钥托管，不能把 1.1B 架构图视为已交付能力。
+
+## 1.1A 总体架构
 
 ```mermaid
 flowchart LR
-    U["飞书具名用户"] -->|"OAuth + Session Cookie"| W["React 工作台 :5173"]
-    W -->|"REST + CSRF"| A["Fastify API :4310"]
-    A --> P["Platform Service"]
-    P --> S["SQLite WAL"]
-    P --> L["Lease Scheduler"]
-    P --> E{"Runtime Mode"}
-    E -->|"fake"| F["Deterministic Fake Runtime"]
-    E -->|"real"| C["Codex App Server 0.144.6"]
-    C --> T["Dynamic Tool Adapter"]
-    T -->|"当前飞书用户 Token"| D["飞书搜索 / Docx 读取"]
-    T --> M["Demo DB / Mock 业务"]
-    P -->|"SSE + Last-Event-ID"| W
+    User["飞书具名用户"] -->|"OAuth + Session"| UserWeb["Codex 用户工作区 :5173"]
+    Admin["飞书管理员"] -->|"独立路由与导航"| AdminWeb["管理后台 :5173/admin"]
+    UserWeb -->|"REST + CSRF\nThread SSE"| API["Fastify API :4310"]
+    AdminWeb -->|"Admin API + CSRF"| API
+    API --> Policy["ACL / Policy / ActorContext"]
+    API --> Store["SQLite WAL"]
+    API --> Lease["Lease Scheduler"]
+    Lease --> Mode{"Runtime Mode"}
+    Mode -->|"fake"| Fake["Deterministic Fake Runtime"]
+    Mode -->|"real"| Codex["Codex App Server 0.144.6\nstdio JSONL"]
+    Codex --> Adapter["Event / Approval / Dynamic Tool Adapter"]
+    Adapter --> Gateway["Tool Runtime"]
+    Gateway -->|"当前飞书用户 Token"| Feishu["飞书 Wiki / Docx"]
+    Gateway --> Demo["Demo DB / Mock Business"]
+    API -->|"持久化后推送\nLast-Event-ID 重放"| UserWeb
 ```
 
-## 模块职责
+### 模块职责
 
-| 模块 | 当前职责 |
+| 模块 | 1.1A 当前职责 |
 | --- | --- |
-| `apps/web` | 飞书登录入口、项目/任务、执行时间线、排队、审批、账号池和审计界面 |
+| `apps/web` | 飞书登录、CODEX-only 用户工作区、连续 Thread、Settings、Subagents 可观测面、独立管理后台 |
 | `apps/api/src/auth` | 飞书 OAuth、租户校验、用户/Session、Token 刷新 |
-| `apps/api/src/domain` | 项目/任务、事件、审批、账号状态、租约和 FIFO 排队 |
-| `apps/api/src/infra/codex` | JSONL RPC、App Server 进程、协议类型、Thread/Turn 和事件规范化 |
-| `apps/api/src/tools` | Actor 绑定、飞书只读 Tool、安全 Demo SQL、Mock 业务 Tool |
-| `apps/api/src/security` | AES-GCM Token 加密与 Codex 凭证隔离探针 |
-| `packages/contracts` | 浏览器与后端共享的 `TaskEvent` 判别联合类型，以及严格 `TaskSummary` / `TaskDetail` Zod DTO |
+| `apps/api/src/domain` | Project/Thread/Turn/Item 投影、用户设置、审批、账号状态、租约、排队、用量与审计 |
+| `apps/api/src/infra/codex` | JSONL RPC、账号级 App Server、协议类型、Thread/Turn/Item/Subagent 事件规范化 |
+| `apps/api/src/tools` | `ActorContext` 绑定、飞书只读 Tool、安全 Demo SQL、Mock 业务 Tool |
+| `apps/api/src/security` | AES-GCM Token 加密、运行环境白名单和 Codex 凭证隔离探针 |
+| `packages/contracts` | CODEX bootstrap、Thread/Turn/Item、Settings、Subagent、用量和事件 DTO |
 
-## 身份和权限分离
+## 用户端与管理后台
 
-系统中存在两类身份，不能互相替代：
+用户端和管理后台共享登录态与后端，但不共享信息架构：
 
-1. 飞书用户身份决定谁能登录、能看到哪些项目/任务，以及飞书知识内容是否可读。
-2. Codex 账号身份仅用于模型执行。浏览器不会拿到账号邮箱、Cookie、Token 或 `CODEX_HOME`。
+```mermaid
+flowchart TB
+    Login["飞书 OAuth"] --> Role{"角色"}
+    Role -->|"MEMBER / ADMIN"| Workspace["用户端\nNew chat / Projects / Threads\nSettings / Archived"]
+    Role -->|"ADMIN"| Console["管理后台\nAccounts / Policies / Connectors\nUsage / Audit / Runtime health"]
+    Workspace --> Thread["Codex 三栏工作区\nConversation + Composer\nPlan / Outputs / Subagents / Sources"]
+    Thread --> Inspector["按需详情\nTerminal / Changes / Files / Tool details"]
+```
 
-真实 Dynamic Tool 请求会带 `threadId + turnId + callId` 回到后端。后端先通过 `ActorRegistry` 将 Thread/Turn 解析为任务所有者，再读取该用户加密保存的飞书 Token。Turn 已结束或绑定不匹配时，Tool 调用会失败关闭，而不是回退到共享 Codex 身份。
+- 普通用户只能访问自己的 Project、Thread、Turn、Item、审批、Settings 和企业连接状态。
+- 管理员可以从用户端进入独立管理后台，但管理页面不嵌入个人 Settings。
+- 1.1A 的 Users/Roles 目录、生产 Worker 管理和完整插件目录尚未接入，页面会明确显示不可用。
+- `GET /api/bootstrap` 当前只返回 `enabledModes: ["CODEX"]`；ChatGPT Chat / Work 没有 Runtime，因此不显示入口。
+
+## 核心信息模型
+
+```text
+Tenant
+ └─ User
+     ├─ UserSettings
+     ├─ UserConnection
+     └─ Project
+         └─ Thread
+             ├─ Turn
+             │   ├─ EffectiveThreadConfigSnapshot
+             │   └─ Item
+             └─ SubagentThread
+                 └─ Item
+```
+
+### Project → Thread → Turn → Item
+
+- `Project` 组织 Thread。
+- `Thread` 是用户可连续使用的任务上下文，对原 Codex 账号和 `CODEX_HOME` 保持粘性。
+- `Turn` 保存本次 Prompt、状态、时间和不可变配置快照。
+- `Item` 是消息、Plan、推理摘要、命令、Tool、Diff、审批、Subagent 活动、Token 用量或结果。
+- `SubagentThread` 是父 Thread/Turn 下的独立可观测线程，保存 Active/Done 状态、摘要、事件和用量。
+
+数据库仍保留早期 `tasks` / `task_events` 命名以兼容迁移；对外 1.1 API 和产品语义已经使用 Thread/Turn/Item。旧 `/tasks/:id` URL 仅作为兼容入口，重定向到 `/threads/:id`。
+
+### 主要用户 API
+
+```text
+GET  /api/bootstrap
+GET  /api/projects
+POST /api/projects
+GET  /api/threads
+POST /api/threads
+GET  /api/threads/:id
+POST /api/threads/:id/turns
+POST /api/threads/:id/steer
+POST /api/threads/:id/interrupt
+GET  /api/threads/:id/events
+GET  /api/threads/:id/subagents
+GET  /api/subagents/:threadId
+GET  /api/me/settings
+PATCH /api/me/settings
+GET  /api/me/usage
+GET  /api/me/connections
+GET  /api/me/plugins
+```
+
+## Settings 与有效配置
+
+Settings 归属于飞书用户，不写入共享 Codex 账号目录。当前实现边界是：
+
+- General：语言、主题、默认 Project、通知均可持久化；只有默认 Project 已接入 New chat 流程，语言、主题和通知尚未全局生效。
+- Profile：飞书身份与角色只读展示。
+- Execution：Reasoning Effort、权限模式和固定为 `ASK` 的审批偏好进入有效配置；模型目录未接入，因此模型选择保持禁用。
+- Personalization：Personality 和个人 Instructions 会进入有效配置。
+- Connections 与 Usage：只读用户视图。
+- Plugins：返回管理员批准目录的接口已保留，1.1A 目录为空且不允许安装。
+- Archived chats：仅保留导航与空状态，归档数据流尚未实现。
+
+1.1A 当前生效配置按以下顺序合并：
+
+```text
+组织强制约束
+  → 组织默认值
+  → 用户 Settings
+  → Thread override
+  → Turn override
+  → EffectiveThreadConfigSnapshot
+```
+
+任何覆盖都不能突破组织策略。每个 Turn 保存不可变快照，后续修改个人 Settings 不会改写历史。Project 级执行设置和完整组织策略编辑是后续能力，当前不宣称已经生效。
+
+## 身份、共享账号与 Tool 权限
+
+系统存在两种不能互相替代的身份：
+
+1. 飞书用户身份决定登录、资源 ACL、Settings、企业连接和 Tool 可访问内容。
+2. Codex 账号身份只提供模型认证和共享额度。
 
 ```mermaid
 sequenceDiagram
@@ -49,51 +148,44 @@ sequenceDiagram
     participant Tools as Tool Runtime
     participant Feishu as 飞书 OpenAPI
 
-    User->>API: 创建任务并提交 Turn
-    API->>API: ACL + 安全门禁 + 原子获取租约
-    API->>Codex: thread/start 或 resume + turn/start
-    Codex-->>API: Item / Plan / Command / Diff 事件
-    Codex->>Tools: item/tool/call(threadId, turnId, callId)
-    Tools->>API: 解析当前 Actor 和用户 Token
-    Tools->>Feishu: Bearer 当前用户 access_token
-    Feishu-->>Tools: 仅返回该用户可见内容
-    Tools-->>Codex: 脱敏后的 Tool 结果
-    API-->>User: 持久化后经 SSE 推送
+    User->>API: 在自己的 Thread 提交 Turn
+    API->>API: owner ACL + ActorContext + 配置快照
+    API->>API: 原子获取指定账号租约和 Turn 槽
+    API->>Codex: thread/start 或同账号 thread/resume
+    Codex-->>API: Item / Plan / Summary / Command / Diff
+    Codex->>Tools: dynamic tool(threadId, turnId, callId)
+    Tools->>API: 校验 Actor、账号与连接代次
+    API->>Feishu: 当前用户 access_token
+    Feishu-->>API: 仅返回该用户可见内容
+    API-->>Codex: 脱敏 Tool 结果
+    API-->>User: 持久化后的 SSE Item
 ```
 
-## 调度模型
+`ActorContext` 缺失、Thread/Turn 不匹配、连接代次过期或子 Thread 所有者冲突时，Tool 请求 fail closed。共享 Codex 账号不会授予任何飞书或业务系统权限。
 
-账号预选不占槽，用户提交 Turn 时才在 SQLite `BEGIN IMMEDIATE` 事务中获取资源：
+## 调度、账号粘性与排队
 
-- 每个账号预建 4 个用户槽；第 5 个不同用户进入单调递增的 FIFO 队列。
-- 同一用户在同一账号上复用一个用户槽，并拥有 2 个 Turn 槽；第 3 个并行 Turn 排队。
-- 同一任务任一时刻最多有一个 active Turn；并发重复提交在 SQLite `BEGIN IMMEDIATE` 中原子拒绝并返回 HTTP 409。
-- Turn 结束立即释放 Turn 槽；用户没有运行 Turn 后，用户槽保留到 30 分钟空闲超时。
-- 如果保留用户槽的账号在下一个 Turn 边界已排空、隔离、失效或额度不可用，且该用户没有仍在运行的 Turn，调度器会原子释放旧槽并迁移到健康账号。
-- 队列获得容量后自动从队首提升，并使用已持久化的 Prompt 启动。
-- ETA 取最近 20 个已完成 Turn 的滚动中位数；样本不足时使用 10 分钟默认值并标记为估算。
+账号预选不占槽；提交 Turn 时才在 SQLite `BEGIN IMMEDIATE` 事务中获取资源：
 
-多个账号的固定排序为：
+- 每个账号最多 4 个不同用户槽。
+- 同一用户在同一账号复用一个用户槽，最多同时运行 2 个 Turn。
+- 第 5 名用户或同用户第 3 个 Turn 进入单调递增队列。
+- 新 Thread 按周额度剩余、活跃用户数、健康度、最久未分配和账号 ID 稳定排序。
+- 已有 Thread 通过 `requiredAccountId` 固定到原账号；排队项也持久化该约束，不能切换到其他高额度账号。
+- 排队提升会选择最早的可运行项，避免不可用账号上的队首阻塞其他账号；新请求不能越过更早且可运行的兼容等待项。
+- Turn 终态立即释放 Turn 槽；用户没有运行 Turn 后，用户槽保留到 30 分钟空闲超时。
 
-1. 有已知周额度的账号优先，周额度剩余比例降序。
-2. 活跃用户数升序。
-3. 健康度降序。
-4. 最久未分配优先。
-5. 最后用账号 ID 保证稳定排序。
+账号必须处于可分配状态、已认证、健康且有新鲜额度。没有精确 7 天额度桶时记录 `WEEKLY_QUOTA_UNKNOWN`；当前默认不放行。
 
-账号必须满足：`AVAILABLE`、已认证、健康度大于 0、额度大于 0，且额度快照不超过 5 分钟。没有精确 7 天窗口时会记录 `WEEKLY_QUOTA_UNKNOWN`；当前默认账号不允许以未知额度执行。
-
-## Runtime 模式
+## Runtime 与恢复边界
 
 ### fake
 
-`fake` 是默认模式。它使用同一套登录、项目、任务、槽位、队列、事件存储和 UI，但 Runtime 会立即产生确定性的 Plan、命令、Tool、Diff、Agent 消息和完成事件。它不启动 Codex App Server，也不调用真实 Feishu Tool。
-
-因此，fake 可验证 4 人调度和产品展示，不能验证真实模型认证、沙箱隔离、额度接口或飞书 Tool 的端到端调用。
+`fake` 使用真实登录、数据、ACL、调度、事件和 UI，但产生确定性的 Plan、命令、Tool、Diff 和结果。它不会启动 Codex App Server，也不会调用真实飞书 Tool。因此 fake 可以验证产品和调度，不能证明真实凭证隔离或真实外部链路。
 
 ### real
 
-`real` 为每个账号维护一个长期 App Server 进程和独立 `CODEX_HOME`，并固定使用：
+1.1A 为每个 Codex 账号维护一个长期 App Server 进程和一个账号级 `CODEX_HOME`：
 
 - `@openai/codex@0.144.6`
 - `app-server --stdio --strict-config`
@@ -101,34 +193,78 @@ sequenceDiagram
 - `approvalPolicy: on-request`
 - `sandbox: workspace-write`
 
-真实执行会先在隔离后的环境变量白名单中验证 CLI 版本，再执行 `initialize -> initialized`。任务使用 `thread/start` 或 `thread/resume`，Turn 使用 `turn/start`、`turn/steer`、`turn/interrupt`。同一账号的并发首次启动会复用一个 in-flight Promise，防止创建多个 App Server；停止时采用有界信号升级，服务端错误流只做内部排空。协议生成文件锁定在仓库中，可用 `pnpm codex:verify-protocol` 检查漂移。
+使用 `thread/start/resume` 和 `turn/start/steer/interrupt`。协议类型锁定在仓库中，通过 `pnpm codex:verify-protocol` 检查漂移。
 
-## 数据与事件
+### active Turn fail closed
 
-SQLite 保存：
+恢复旧 Thread 时，只有满足以下条件才允许启动新 Turn：
 
-- 用户、飞书加密凭证、OAuth state、Session。
-- Codex 账号安全摘要、用户槽、Turn 槽、租约、额度和队列。
-- 项目、任务、Turn、审批、Tool 调用摘要和审计事件。
-- 每任务单调递增 `sequence` 的 `task_events`。
+1. Thread 状态明确为 idle。
+2. 返回的每个 Turn 状态都能识别。
+3. 所有已有 Turn 都是已知终态。
 
-浏览器首次打开任务时读取历史事件，随后用 SSE 订阅增量。断线重连会提交 `Last-Event-ID`，后端从 SQLite 重放更大的 sequence；SSE 随 Session 到期关闭，并在心跳时复核撤销状态。原始 Token、`CODEX_HOME`、租约 ID、排队票据、原始审批 RPC ID 和审批 payload 不属于浏览器响应。
+若返回 active/in-progress、未知、Malformed、`notLoaded` 或 `systemError` 等无法证明安全的状态，1.1A 不会再次调用 `turn/start`。平台会：
 
-任务详情通过共享 DTO 精确投影，只包含标题、状态、最新 Prompt、账号别名和实时排队信息；`ownerId`、租约 ID、Thread/Turn 内部标识及排队票据不会作为任务详情返回。事件中的 Thread、Turn 和 Item ID 仅作为用户自己任务的工作流关联标识保留，仍受 owner 鉴权；调度器 Turn、租约和 transport identity 不对浏览器公开。
+1. 拒绝本次新 Prompt。
+2. 停止并隔离对应账号 App Server。
+3. 清除该账号的 Actor/审批运行绑定。
+4. 将受影响任务标记为 `NEEDS_RECOVERY` 并释放调度槽。
 
-审批请求先生成平台 UUID，再将账号、App Server 连接代次、Thread、Turn 和原始 RPC ID 作为内部 transport identity 保存。管理员决定后，状态按 `PENDING -> DELIVERY_PENDING -> DELIVERED` 推进；只有 App Server 的响应写入被确认后才算交付。连接已脱离或 Turn 已结束时进入 `RECOVERY_REQUIRED`，普通写失败则释放为可重试状态。若响应 delivery 本身失效，平台会清除该账号的 Actor/Thread 上下文、隔离账号并停止 App Server，然后才释放 Turn 槽。
+这不是“接回原 Turn”。1.1A 没有活动 Turn 重新附着能力，也不会自动重放可能产生副作用的 Tool。
 
-终态任务更新使用 `task_id + current_turn_id` 条件写入。来自旧 Turn 的延迟事件可以继续进入不可变事件时间线，但不会覆盖新 Turn 的运行状态；Web 的即时投影把最新 `QUEUED` / `LEASE_ACQUIRED` 视为分配边界。`QUEUED` 不携带内部调度器 Turn ID，并会阻断所有旧 Turn 投影，直到带 Runtime Turn ID 的 `LEASE_ACQUIRED` 到达；仅在旧数据没有分配事件时才回退到最新 `TURN_STARTED`。启动 reconciliation 同时扫描运行/恢复中槽、残留等待队列和无租约的 `ALLOCATING` 记录，覆盖进程退出发生在“创建 Turn”“取得租约”和“写回队列状态”之间的窗口。
+## Subagent 数据流
 
-`startTask` 返回 Thread/Turn ID 前到达的 App Server 通知和审批请求，会先在 adapter 内按 Thread 暂存；Turn 身份和 Actor 绑定完成后才按原顺序处理。Platform Service 还会在运行映射和租约事件落库前暂存 adapter 事件，避免早到终态被后续 `RUNNING` 写入覆盖。若启动期间先收到终态，Actor 不会在启动 Promise 返回后被重新绑定；审批只在请求 Turn 仍是当前活跃 Turn 时进入可操作状态，adapter 还会再次校验连接代次和 Turn。
+Codex App Server 的协作/子 Agent Item 会被规范化为 `SUBAGENT_ACTIVITY`。平台：
+
+- 继承父 Turn 的飞书用户 `ActorContext` 和 Tool Scope。
+- 持久化父子 Thread 关系、状态、耗时、结果摘要、独立 Item 和 Token 用量。
+- 在用户端按 Active/Done 展示，并允许打开独立只读详情。
+- 将 Token 用量按用户拥有的 Thread 树归集；共享账号额度不会伪装成可精确归因到个人。
+
+1.1A 没有伪造“直接停止任意子 Agent”的接口，也未交付完整的组织级 Subagent 并发/预算执行器；控制仍通过父 Turn 的 Interrupt/Steer 边界完成。
+
+## SSE、投影与敏感数据
+
+Item 先写入 SQLite，再通过 `/api/threads/:id/events` 推送。断线后客户端携带 `Last-Event-ID`，后端只重放更大 sequence：
+
+- 增量仅在相同 `threadId + turnId + itemId + type` 内合并。
+- 缺少稳定 Item 边界时不跨 Item 猜测合并。
+- SSE 在 Session 到期/撤销时关闭，所有历史与实时读取都执行 owner ACL。
+- 用户端 Thread、旧 Task 兼容响应和实时 SSE 会移除账号别名、租约、transport identity、原始审批 RPC ID 和 Runtime Turn ID 等敏感运行标识；Subagent Thread ID 与部分 Item ID 仍作为受 owner ACL 保护的工作流关联标识返回。
+- `reasoning.summary` 可作为“执行思路”显示，但不属于审计证据。
+- `reasoningTextDelta`、原始 `content`、`encrypted_content`、凭证、租约 ID 和原始审批 RPC ID 不会进入用户浏览器。
+- 管理员审计可保留账号别名以支持责任追踪，但仍不返回凭证或 `CODEX_HOME`。
+
+## 1.1B 演进
+
+```mermaid
+flowchart LR
+    A["1.1A\n本机单进程\n账号级 App Server\n真实单操作者"] --> Gate{"生产门禁"}
+    Gate -->|"OpenAI 书面许可"| Broker["Credential Broker\n账号认证和串行刷新"]
+    Gate -->|"OpenAI known-client 登记"| Known["企业 App Server client 获准"]
+    Gate -->|"凭证隔离通过"| Worker["每用户独立 Worker\n独立 CODEX_HOME"]
+    Gate -->|"企业 Tool 治理通过"| MCP["正式 MCP Gateway\n用户 OAuth / Scope"]
+    Broker --> B["1.1B 组织试点"]
+    Known --> B
+    Worker --> B
+    MCP --> B
+    B --> Scale["PostgreSQL / Redis-NATS\n容器编排 / KMS / HA"]
+```
+
+1.1B 的共享范围仅是模型凭证与账号额度。Thread、Settings、Connection、文件、插件状态、Memory 和 Tool 身份都必须按 `tenant + user` 隔离。
+
+1.1A real Runtime 已在每次新建或恢复 Thread 后、启动 Turn 前强制调用
+`thread/memoryMode/set { mode: "disabled" }`。该调用或响应校验失败会触发账号级
+fail-closed 恢复；它降低共享 Home 的原生 Memory 串用风险，但不能替代 1.1B
+的独立 Worker、独立 `CODEX_HOME` 和跨用户哨兵验收。
 
 ## Tool 范围
 
-| Tool | 数据源 | 当前限制 |
+| Tool | 数据源 | 1.1A 限制 |
 | --- | --- | --- |
-| `feishu_wiki_search` | 真实飞书搜索 | 查询最多 30 个 Unicode 字符，结果使用当前用户 Token |
-| `feishu_doc_read` | 真实 Wiki/Docx | 只读文本块，最多 10,000 Blocks，返回 URL、revision 和 Block 引用 |
-| `demo_db_query` | 本地 Demo SQLite | 仅单条 `SELECT`，仅 `demo_orders` / `demo_customers`，最多 100 行、256 KiB |
+| `feishu_wiki_search` | 真实飞书搜索 | 当前用户 Token；只读 |
+| `feishu_doc_read` | 真实 Wiki/Docx | 当前用户 Token；只读文本块和引用 |
+| `demo_db_query` | 本地 Demo SQLite | 单条 allowlist `SELECT`，最多 100 行、256 KiB |
 | `demo_business_get` | 确定性 Mock | 仅 `order` / `customer`，不是实际业务系统 |
 
-所有企业外部写操作在本 MVP 中均未接入。
+Dynamic Tools 是 1.1A 的锁版本过渡适配层。生产版计划替换为正式 MCP Gateway。所有企业外部写操作在当前 MVP 中均未接入。

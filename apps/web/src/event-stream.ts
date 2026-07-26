@@ -28,7 +28,7 @@ export function subscribeTaskEvents(
 
     while (!stopped) {
       try {
-        const response = await fetcher(`/api/tasks/${encodeURIComponent(taskId)}/events`, {
+        const response = await fetcher(`/api/threads/${encodeURIComponent(taskId)}/events`, {
           credentials: "include",
           headers: {
             Accept: "text/event-stream",

@@ -46,6 +46,7 @@ describe("real Codex integration", () => {
           await managed.runtime.startThread({ cwd: workspace, dynamicTools: [] }),
         );
         const threadId = requiredNestedId(thread, "thread");
+        await managed.runtime.disableThreadMemory(threadId);
         const completion = trackCompletedTurn(managed.rpc);
         try {
           const turn = asRecord(await managed.runtime.startTurn(threadId, smokePrompt()));

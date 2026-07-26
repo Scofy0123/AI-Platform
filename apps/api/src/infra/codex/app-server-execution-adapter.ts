@@ -1,19 +1,26 @@
 import { EventEmitter } from "node:events";
+import type { ActorContext, EffectiveThreadConfigSnapshot } from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
 import type {
   ApprovalDraft,
   TaskEventDraft,
   TaskExecutionAdapter,
 } from "../../domain/platform-service.js";
-import { ApprovalTransportUnavailableError as ApprovalUnavailable } from "../../domain/platform-service.js";
+import {
+  ActiveTurnResumeConflictError,
+  ApprovalTransportUnavailableError as ApprovalUnavailable,
+  InvalidThreadResumeResponseError,
+  ThreadResumeSafetyError,
+} from "../../domain/platform-service.js";
 import type { ApprovalTransportIdentity } from "../../domain/platform-store.js";
 import type { ActorRegistry } from "../../tools/actor-registry.js";
 import type { DynamicToolCall, DynamicToolResponse } from "../../tools/tool-runtime.js";
-import type { WeeklyQuota } from "./codex-runtime.js";
+import type { DynamicToolDefinition, WeeklyQuota } from "./codex-runtime.js";
 import { CodexEventNormalizer } from "./event-normalizer.js";
 import type { CommandExecutionRequestApprovalResponse } from "./generated/v2/CommandExecutionRequestApprovalResponse.js";
 import type { FileChangeRequestApprovalResponse } from "./generated/v2/FileChangeRequestApprovalResponse.js";
 import type { PermissionsRequestApprovalResponse } from "./generated/v2/PermissionsRequestApprovalResponse.js";
+import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse.js";
 
 interface RpcPort extends EventEmitter {
   respond(id: number | string, result: unknown): Promise<void>;
@@ -24,9 +31,18 @@ interface RuntimePort {
   startThread(input: {
     cwd: string;
     dynamicTools: ReturnType<ToolRuntimePort["definitions"]>;
+    effectiveConfig: EffectiveThreadConfigSnapshot;
   }): Promise<unknown>;
-  resumeThread(threadId: string): Promise<unknown>;
-  startTurn(threadId: string, prompt: string): Promise<unknown>;
+  resumeThread(
+    threadId: string,
+    options: { cwd: string; effectiveConfig: EffectiveThreadConfigSnapshot },
+  ): Promise<ThreadResumeResponse>;
+  startTurn(
+    threadId: string,
+    prompt: string,
+    options: { cwd: string; effectiveConfig: EffectiveThreadConfigSnapshot },
+  ): Promise<unknown>;
+  disableThreadMemory(threadId: string): Promise<unknown>;
   steerTurn(threadId: string, turnId: string, prompt: string): Promise<unknown>;
   interruptTurn(threadId: string, turnId: string): Promise<unknown>;
   startChatGptLogin(): Promise<{ loginId: string; authUrl: string }>;
@@ -54,12 +70,7 @@ export interface RuntimeSupervisorPort {
 }
 
 interface ToolRuntimePort {
-  definitions(): Array<{
-    type: "function";
-    name: string;
-    description: string;
-    inputSchema: Record<string, unknown>;
-  }>;
+  definitions(): DynamicToolDefinition[];
   invoke(call: DynamicToolCall): Promise<DynamicToolResponse>;
 }
 
@@ -76,6 +87,8 @@ interface ThreadContext {
   connectionGeneration: number;
   threadId: string;
   turnId: string | null;
+  parentThreadId: string | null;
+  actorContext: ActorContext;
 }
 
 interface PendingApproval {
@@ -120,23 +133,65 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     cwd: string;
     prompt: string;
     existingThreadId: string | null;
+    effectiveConfig: EffectiveThreadConfigSnapshot;
+    actorContext: ActorContext;
   }): Promise<{ threadId: string; turnId: string }> {
     const managed = await this.options.supervisor.startAccount({
       accountId: input.accountId,
       codexHome: input.codexHome,
     });
     const connectionGeneration = this.attach(managed);
-    const threadId = input.existingThreadId
-      ? extractThreadId(
-          await managed.runtime.resumeThread(input.existingThreadId),
-          input.existingThreadId,
-        )
-      : extractThreadId(
+    let threadId: string;
+    if (input.existingThreadId) {
+      try {
+        const resumed = await managed.runtime.resumeThread(input.existingThreadId, {
+          cwd: input.cwd,
+          effectiveConfig: input.effectiveConfig,
+        });
+        const state = inspectResumedThread(resumed, input.existingThreadId);
+        threadId = state.threadId;
+        if (state.kind === "ACTIVE_CONFLICT") {
+          throw new ActiveTurnResumeConflictError(threadId, state.turnId, state.reason);
+        }
+        assertMemoryDisabledResponse(await managed.runtime.disableThreadMemory(threadId));
+      } catch (error) {
+        const safetyError =
+          error instanceof ThreadResumeSafetyError
+            ? error
+            : new InvalidThreadResumeResponseError(
+                input.existingThreadId,
+                "Thread resume response is unsafe; the new prompt was not accepted",
+              );
+        this.detachAccount(input.accountId, safetyError.message, {
+          sourceTaskId: input.taskId,
+          ...(safetyError.turnId ? { sourceRuntimeTurnId: safetyError.turnId } : {}),
+        });
+        await this.options.supervisor.stopAccount?.(input.accountId).catch(() => undefined);
+        throw safetyError;
+      }
+    } else {
+      try {
+        threadId = extractThreadId(
           await managed.runtime.startThread({
             cwd: input.cwd,
             dynamicTools: this.options.tools.definitions(),
+            effectiveConfig: input.effectiveConfig,
           }),
         );
+        assertMemoryDisabledResponse(await managed.runtime.disableThreadMemory(threadId));
+      } catch (error) {
+        const safetyError =
+          error instanceof ThreadResumeSafetyError
+            ? error
+            : new InvalidThreadResumeResponseError(
+                "unknown",
+                "Thread memory isolation is unsafe; the new prompt was not accepted",
+              );
+        this.detachAccount(input.accountId, safetyError.message);
+        await this.options.supervisor.stopAccount?.(input.accountId).catch(() => undefined);
+        throw safetyError;
+      }
+    }
     const contextKey = connectionThreadKey(input.accountId, connectionGeneration, threadId);
     this.contextByThread.set(contextKey, {
       taskId: input.taskId,
@@ -145,21 +200,30 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       connectionGeneration,
       threadId,
       turnId: null,
+      parentThreadId: null,
+      actorContext: cloneActorContext(input.actorContext),
     });
     this.runtimeByThread.set(threadId, managed.runtime);
     this.normalizerByTask.set(input.taskId, new CodexEventNormalizer({ taskId: input.taskId }));
     const startingSignals: BufferedRpcSignal[] = [];
     this.startingSignalsByThread.set(contextKey, startingSignals);
     try {
-      const turnId = extractTurnId(await managed.runtime.startTurn(threadId, input.prompt));
+      const turnId = extractTurnId(
+        await managed.runtime.startTurn(threadId, input.prompt, {
+          cwd: input.cwd,
+          effectiveConfig: input.effectiveConfig,
+        }),
+      );
       const context = this.contextByThread.get(contextKey);
       if (!context) throw new Error("Codex Turn context detached while starting");
       context.turnId = turnId;
-      this.options.actors.bind(threadId, {
+      this.options.actors.bind({
         taskId: input.taskId,
-        userId: input.userId,
         accountId: input.accountId,
+        connectionGeneration,
+        threadId,
         turnId,
+        actorContext: input.actorContext,
       });
       await this.flushStartingSignals(
         input.accountId,
@@ -181,7 +245,14 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         startingSignals,
       );
       const context = this.contextByThread.get(contextKey);
-      if (context?.turnId) this.options.actors.clearTurn(threadId, context.turnId);
+      if (context?.turnId) {
+        this.options.actors.clearTurn({
+          accountId: input.accountId,
+          connectionGeneration,
+          threadId,
+          turnId: context.turnId,
+        });
+      }
       this.contextByThread.delete(contextKey);
       this.runtimeByThread.delete(threadId);
       this.normalizerByTask.delete(input.taskId);
@@ -385,10 +456,27 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     const normalizer = this.normalizerByTask.get(context.taskId);
     if (!normalizer) return;
     for (const event of normalizer.normalizeNotification(message)) {
+      if (event.type === "TURN_STARTED" && event.turnId) {
+        context.turnId = event.turnId;
+        this.options.actors.bind({
+          taskId: context.taskId,
+          accountId: context.accountId,
+          connectionGeneration: context.connectionGeneration,
+          threadId: context.threadId,
+          turnId: event.turnId,
+          actorContext: context.actorContext,
+        });
+      }
+      if (event.type === "SUBAGENT_ACTIVITY") {
+        this.attachSubagentContext(context, event.payload.agentThreadId);
+      }
       const draft: TaskEventDraft = {
         taskId: event.taskId,
         threadId: event.threadId,
         turnId: event.turnId,
+        ...(context.parentThreadId !== null && event.type !== "SUBAGENT_ACTIVITY"
+          ? { subagentThreadId: context.threadId }
+          : {}),
         type: event.type,
         payload: event.payload,
       } as TaskEventDraft;
@@ -400,8 +488,68 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
           event.type === "TURN_INTERRUPTED")
       ) {
         this.deletePendingApprovalsForTurn(accountId, connectionGeneration, threadId, event.turnId);
-        this.options.actors.clearTurn(threadId, event.turnId);
+        this.options.actors.clearTurn({
+          accountId,
+          connectionGeneration,
+          threadId,
+          turnId: event.turnId,
+        });
         if (context.turnId === event.turnId) context.turnId = null;
+        this.detachDescendantContexts(context);
+      }
+    }
+  }
+
+  private attachSubagentContext(parent: ThreadContext, childThreadId: string): void {
+    if (!childThreadId || childThreadId === parent.threadId) return;
+    const key = connectionThreadKey(parent.accountId, parent.connectionGeneration, childThreadId);
+    const existing = this.contextByThread.get(key);
+    if (existing) {
+      if (
+        existing.taskId !== parent.taskId ||
+        existing.userId !== parent.userId ||
+        existing.parentThreadId !== parent.threadId
+      ) {
+        this.detachAccount(
+          parent.accountId,
+          "Subagent actor context conflicted with its parent; recovery is required.",
+        );
+      }
+      return;
+    }
+    this.contextByThread.set(key, {
+      taskId: parent.taskId,
+      userId: parent.userId,
+      accountId: parent.accountId,
+      connectionGeneration: parent.connectionGeneration,
+      threadId: childThreadId,
+      turnId: null,
+      parentThreadId: parent.threadId,
+      actorContext: cloneActorContext(parent.actorContext),
+    });
+    const runtime = this.runtimeByThread.get(parent.threadId);
+    if (runtime) this.runtimeByThread.set(childThreadId, runtime);
+  }
+
+  private detachDescendantContexts(parent: ThreadContext): void {
+    const pending = [parent.threadId];
+    while (pending.length > 0) {
+      const parentThreadId = pending.shift();
+      if (!parentThreadId) continue;
+      for (const [key, context] of this.contextByThread) {
+        if (context.parentThreadId !== parentThreadId) continue;
+        pending.push(context.threadId);
+        if (context.turnId) {
+          this.options.actors.clearTurn({
+            accountId: context.accountId,
+            connectionGeneration: context.connectionGeneration,
+            threadId: context.threadId,
+            turnId: context.turnId,
+          });
+        }
+        this.runtimeByThread.delete(context.threadId);
+        this.contextByThread.delete(key);
+        this.startingSignalsByThread.delete(key);
       }
     }
   }
@@ -416,9 +564,40 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     if (message.id === undefined) return;
     const params = asRecord(message.params);
     if (message.method === "item/tool/call") {
+      const attached = this.attachedConnectionByAccount.get(accountId);
+      if (!attached || attached.generation !== connectionGeneration || attached.rpc !== rpc) {
+        await rpc.respondError?.(message.id, {
+          code: -32_601,
+          message: "Tool call is not bound to this App Server connection",
+        });
+        return;
+      }
+      const threadId = requiredString(params.threadId, "threadId");
+      const turnId = requiredString(params.turnId, "turnId");
+      const context = this.contextByThread.get(
+        connectionThreadKey(accountId, connectionGeneration, threadId),
+      );
+      if (
+        !context ||
+        context.turnId !== turnId ||
+        !this.options.actors.resolve({
+          accountId,
+          connectionGeneration,
+          threadId,
+          turnId,
+        })
+      ) {
+        await rpc.respondError?.(message.id, {
+          code: -32_601,
+          message: "Tool call is not bound to this App Server connection",
+        });
+        return;
+      }
       const response = await this.options.tools.invoke({
-        threadId: requiredString(params.threadId, "threadId"),
-        turnId: requiredString(params.turnId, "turnId"),
+        accountId,
+        connectionGeneration,
+        threadId,
+        turnId,
         callId: requiredString(params.callId, "callId"),
         namespace: stringValue(params.namespace),
         tool: requiredString(params.tool, "tool"),
@@ -462,6 +641,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         approvalType: approvalEvent.payload.approvalType,
         params,
       });
+      const rootTurnId = context.parentThreadId !== null ? this.findRootTurnId(context) : null;
       this.emit("approval", {
         requestId,
         rawRpcId: message.id,
@@ -470,6 +650,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         taskId: context.taskId,
         threadId,
         turnId,
+        ...(rootTurnId ? { parentTurnId: rootTurnId } : {}),
         itemId: String(approvalEvent.payload.itemId),
         approvalType: approvalEvent.payload.approvalType,
         payload: params,
@@ -488,6 +669,25 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     return runtime;
   }
 
+  private findRootTurnId(context: ThreadContext): string | null {
+    let current = context;
+    const visited = new Set<string>();
+    while (current.parentThreadId !== null) {
+      if (visited.has(current.threadId)) return null;
+      visited.add(current.threadId);
+      const parent = this.contextByThread.get(
+        connectionThreadKey(
+          current.accountId,
+          current.connectionGeneration,
+          current.parentThreadId,
+        ),
+      );
+      if (!parent) return null;
+      current = parent;
+    }
+    return current.turnId;
+  }
+
   private handleAccountCrash(event: {
     accountId: string;
     exitCode: number | null;
@@ -496,20 +696,21 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     this.detachAccount(event.accountId, "Codex App Server exited; recovery is required.");
   }
 
-  private detachAccount(accountId: string, reason: string): void {
+  private detachAccount(
+    accountId: string,
+    reason: string,
+    source?: { sourceTaskId: string; sourceRuntimeTurnId?: string },
+  ): void {
     this.attachedConnectionByAccount.delete(accountId);
-    this.emit("accountCrashed", { accountId });
     for (const [contextKey, context] of this.contextByThread) {
       if (context.accountId !== accountId) continue;
       if (context.turnId) {
-        this.emit("taskEvent", {
-          taskId: context.taskId,
+        this.options.actors.clearTurn({
+          accountId: context.accountId,
+          connectionGeneration: context.connectionGeneration,
           threadId: context.threadId,
           turnId: context.turnId,
-          type: "RECOVERY_REQUIRED",
-          payload: { reason },
-        } satisfies TaskEventDraft<"RECOVERY_REQUIRED">);
-        this.options.actors.clearTurn(context.threadId, context.turnId);
+        });
       }
       this.runtimeByThread.delete(context.threadId);
       this.contextByThread.delete(contextKey);
@@ -519,6 +720,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     for (const [key, pending] of this.pendingApprovals) {
       if (pending.accountId === accountId) this.pendingApprovals.delete(key);
     }
+    this.emit("accountCrashed", { accountId, reason, ...source });
   }
 
   private deletePendingApprovalsForTurn(
@@ -542,6 +744,16 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
 
 function connectionThreadKey(accountId: string, generation: number, threadId: string): string {
   return JSON.stringify([accountId, generation, threadId]);
+}
+
+function cloneActorContext(actor: ActorContext): ActorContext {
+  return {
+    tenantKey: actor.tenantKey,
+    userId: actor.userId,
+    role: actor.role,
+    toolScopes: [...actor.toolScopes],
+    approvalPolicy: actor.approvalPolicy,
+  };
 }
 
 function messageThreadId(value: unknown): string | null {
@@ -604,13 +816,92 @@ function isBasicApprovalDecision(
   return ["accept", "acceptForSession", "decline", "cancel"].includes(decision);
 }
 
-function extractThreadId(value: unknown, fallback?: string): string {
+function extractThreadId(value: unknown): string {
   const thread = asRecord(asRecord(value).thread);
-  return stringValue(thread.id) ?? fallback ?? requiredString(asRecord(value).threadId, "threadId");
+  return stringValue(thread.id) ?? requiredString(asRecord(value).threadId, "threadId");
+}
+
+function inspectResumedThread(
+  value: ThreadResumeResponse,
+  expectedThreadId: string,
+):
+  | { kind: "IDLE"; threadId: string }
+  | {
+      kind: "ACTIVE_CONFLICT";
+      threadId: string;
+      turnId: string | null;
+      reason: string;
+    } {
+  const thread = asRecord(asRecord(value).thread);
+  const threadId = requiredString(thread.id, "thread.id");
+  if (threadId !== expectedThreadId) {
+    throw new Error("Resumed Thread id does not match the requested Thread");
+  }
+  const status = asRecord(thread.status);
+  const statusType = requiredString(status.type, "thread.status.type");
+  const turns = thread.turns;
+  if (!Array.isArray(turns)) throw new Error("Missing thread.turns");
+  const allowedTurnStatuses = new Set(["completed", "interrupted", "failed", "inProgress"]);
+  const normalizedTurns = turns.map((turn) => {
+    const value = asRecord(turn);
+    const id = requiredString(value.id, "thread.turns[].id");
+    const turnStatus = requiredString(value.status, "thread.turns[].status");
+    if (!allowedTurnStatuses.has(turnStatus)) {
+      throw new Error(`Unknown thread.turns[].status: ${turnStatus}`);
+    }
+    return { id, status: turnStatus };
+  });
+  const inProgressTurnIds = normalizedTurns
+    .filter((turn) => turn.status === "inProgress")
+    .map((turn) => turn.id);
+
+  if (statusType === "active") {
+    if (!Array.isArray(status.activeFlags)) throw new Error("Invalid thread.status.activeFlags");
+    const allowedActiveFlags = new Set(["waitingOnApproval", "waitingOnUserInput"]);
+    if (status.activeFlags.some((flag) => !allowedActiveFlags.has(String(flag)))) {
+      throw new Error("Unknown thread.status.activeFlags value");
+    }
+    return {
+      kind: "ACTIVE_CONFLICT",
+      threadId,
+      turnId: inProgressTurnIds.length === 1 ? (inProgressTurnIds[0] as string) : null,
+      reason: "Thread already has an active Turn; the new prompt was not accepted",
+    };
+  }
+  if (inProgressTurnIds.length > 0) {
+    return {
+      kind: "ACTIVE_CONFLICT",
+      threadId,
+      turnId: inProgressTurnIds.length === 1 ? (inProgressTurnIds[0] as string) : null,
+      reason:
+        "Thread resume state is inconsistent with an in-progress Turn; the new prompt was not accepted",
+    };
+  }
+  if (!["idle", "notLoaded", "systemError"].includes(statusType)) {
+    throw new Error(`Unknown thread.status.type: ${statusType}`);
+  }
+  if (statusType === "idle" && "activeFlags" in status) {
+    throw new Error("Idle thread.status must not contain activeFlags");
+  }
+  if (statusType !== "idle") {
+    throw new Error(`Thread resume did not return an idle Thread: ${statusType}`);
+  }
+  return { kind: "IDLE", threadId };
 }
 
 function extractTurnId(value: unknown): string {
   return requiredString(asRecord(asRecord(value).turn).id, "turn.id");
+}
+
+function assertMemoryDisabledResponse(value: unknown): void {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length > 0
+  ) {
+    throw new Error("Invalid thread/memoryMode/set response");
+  }
 }
 
 function asMessage(value: unknown): {

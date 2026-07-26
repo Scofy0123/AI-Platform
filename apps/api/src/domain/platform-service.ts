@@ -3,6 +3,15 @@ import { EventEmitter } from "node:events";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  type ActorContext,
+  type Bootstrap,
+  type EffectiveConfigOverride,
+  EffectiveConfigOverrideSchema,
+  type EffectiveThreadConfigSnapshot,
+  EffectiveThreadConfigSnapshotSchema,
+  PLATFORM_VERSION,
+  type SubagentThread,
+  type SubagentThreadDetail,
   type TaskDetail,
   type TaskEvent,
   type TaskEventPayloadMap,
@@ -10,6 +19,12 @@ import {
   type TaskStatus,
   TaskStatusSchema,
   type TaskSummary,
+  type Thread,
+  type ThreadItem,
+  TurnStatusSchema,
+  type UserSettings,
+  type UserSettingsPatch,
+  type UserSettingsView,
 } from "@codexplatform/contracts";
 import type { WeeklyQuota } from "../infra/codex/codex-runtime.js";
 import type { PlatformApi } from "../web-api.js";
@@ -19,6 +34,7 @@ import type {
   ApprovalTransportIdentity,
   SQLitePlatformStore,
   TaskRecord,
+  TurnRecord,
 } from "./platform-store.js";
 
 export interface RuntimeSafetyPort {
@@ -29,6 +45,8 @@ export interface TaskEventDraft<Type extends TaskEventType = TaskEventType> {
   taskId: string;
   threadId: string | null;
   turnId: string | null;
+  /** Present only for events that belong to a child Agent Thread. */
+  subagentThreadId?: string;
   type: Type;
   payload: TaskEventPayloadMap[Type];
   at?: Date;
@@ -42,6 +60,7 @@ export interface ApprovalDraft {
   taskId: string;
   threadId: string;
   turnId: string;
+  parentTurnId?: string;
   itemId: string;
   approvalType: "COMMAND" | "FILE_CHANGE" | "PERMISSIONS";
   payload: unknown;
@@ -55,6 +74,45 @@ export class ApprovalTransportUnavailableError extends Error {
   }
 }
 
+export abstract class ThreadResumeSafetyError extends Error {
+  abstract readonly code: string;
+  readonly promptAccepted = false;
+  readonly rejoined = false;
+
+  constructor(
+    readonly threadId: string,
+    readonly turnId: string | null,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export class ActiveTurnResumeConflictError extends ThreadResumeSafetyError {
+  readonly code = "ACTIVE_TURN_RESUME_CONFLICT";
+
+  constructor(
+    threadId: string,
+    turnId: string | null,
+    message = "Thread already has an active Turn; the new prompt was not accepted",
+  ) {
+    super(threadId, turnId, message);
+    this.name = "ActiveTurnResumeConflictError";
+  }
+}
+
+export class InvalidThreadResumeResponseError extends ThreadResumeSafetyError {
+  readonly code = "INVALID_THREAD_RESUME_RESPONSE";
+
+  constructor(
+    threadId: string,
+    message = "Thread resume response is unsafe; the new prompt was not accepted",
+  ) {
+    super(threadId, null, message);
+    this.name = "InvalidThreadResumeResponseError";
+  }
+}
+
 export interface TaskExecutionAdapter {
   startTask(input: {
     accountId: string;
@@ -64,6 +122,8 @@ export interface TaskExecutionAdapter {
     cwd: string;
     prompt: string;
     existingThreadId: string | null;
+    effectiveConfig: EffectiveThreadConfigSnapshot;
+    actorContext: ActorContext;
   }): Promise<{ threadId: string; turnId: string }>;
   steerTask(threadId: string, turnId: string, prompt: string): Promise<void>;
   interruptTask(threadId: string, turnId: string): Promise<void>;
@@ -81,7 +141,15 @@ export interface TaskExecutionAdapter {
   on(event: "approval", listener: (event: ApprovalDraft) => void): this;
   on(event: "accountAuthenticated", listener: (event: { accountId: string }) => void): this;
   on(event: "accountAuthFailed", listener: (event: { accountId: string }) => void): this;
-  on(event: "accountCrashed", listener: (event: { accountId: string }) => void): this;
+  on(
+    event: "accountCrashed",
+    listener: (event: {
+      accountId: string;
+      reason?: string;
+      sourceTaskId?: string;
+      sourceRuntimeTurnId?: string;
+    }) => void,
+  ): this;
   emit(event: "taskEvent", value: TaskEventDraft): boolean;
   emit(event: "approval", value: ApprovalDraft): boolean;
   close(): Promise<void>;
@@ -107,6 +175,15 @@ const TERMINAL_STATUS_BY_EVENT = {
   TURN_INTERRUPTED: "INTERRUPTED",
 } as const satisfies Partial<Record<TaskEventType, TaskStatus>>;
 
+const SUBAGENT_TERMINAL_STATUS_BY_EVENT: Partial<
+  Record<TaskEventType, "DONE" | "FAILED" | "INTERRUPTED">
+> = {
+  TURN_COMPLETED: "DONE",
+  TURN_FAILED: "FAILED",
+  TURN_INTERRUPTED: "INTERRUPTED",
+  RECOVERY_REQUIRED: "FAILED",
+};
+
 export class LocalPlatformService implements PlatformApi {
   private readonly now: () => Date;
   private readonly eventBus = new EventEmitter();
@@ -125,8 +202,27 @@ export class LocalPlatformService implements PlatformApi {
     options.execution.on("accountAuthFailed", ({ accountId }) => {
       options.accounts.markReauthenticationRequired(accountId);
     });
-    options.execution.on("accountCrashed", ({ accountId }) => {
-      options.accounts.setState(accountId, "QUARANTINED");
+    options.execution.on("accountCrashed", ({ accountId, reason }) => {
+      const occurredAt = this.now();
+      const recoveryReason = reason ?? "Codex App Server exited; recovery is required.";
+      const recovered = options.store.recoverAccountRuntimeState(accountId, occurredAt);
+      for (const task of recovered) {
+        if (task.runtimeTurnId) {
+          const key = runtimeTurnKey(task.taskId, task.runtimeTurnId);
+          if (key) this.schedulerTurnByRuntimeTurn.delete(key);
+        }
+        this.pendingStartSignalsByTask.delete(task.taskId);
+        const event = options.store.appendTaskEvent({
+          taskId: task.taskId,
+          threadId: task.runtimeThreadId,
+          turnId: task.platformTurnId,
+          type: "RECOVERY_REQUIRED",
+          payload: { reason: recoveryReason },
+          now: occurredAt,
+        });
+        this.publish(event);
+      }
+      this.startPromotedTurns(options.leases.promoteQueue(occurredAt));
     });
   }
 
@@ -136,6 +232,20 @@ export class LocalPlatformService implements PlatformApi {
 
   async listProjects(userId: string) {
     return this.options.store.listProjects(userId);
+  }
+
+  async getBootstrap(): Promise<Bootstrap> {
+    return {
+      platformVersion: PLATFORM_VERSION,
+      defaultMode: "CODEX" as const,
+      enabledModes: ["CODEX"],
+      capabilities: {
+        threads: true as const,
+        settings: true as const,
+        subagents: true as const,
+        reasoningSummaries: true as const,
+      },
+    };
   }
 
   async createTask(userId: string, input: { projectId: string; title: string }) {
@@ -158,7 +268,7 @@ export class LocalPlatformService implements PlatformApi {
     return {
       ...toTaskSummary(task),
       prompt: this.options.store.getLatestTurnPrompt(taskId, userId),
-      accountAlias: task.accountAlias,
+      accountAlias: null,
       queue: queued
         ? {
             position: queued.position,
@@ -169,8 +279,108 @@ export class LocalPlatformService implements PlatformApi {
     };
   }
 
-  async startTurn(taskId: string, userId: string, prompt: string) {
+  async createThread(
+    userId: string,
+    input: { projectId: string; title: string; config?: EffectiveConfigOverride },
+  ) {
+    const task = this.options.store.createTask({
+      ownerId: userId,
+      projectId: input.projectId,
+      title: input.title,
+      threadConfig: input.config ? this.validateConfigOverride(input.config) : null,
+      now: this.now(),
+    });
+    return (await this.getThread(task.id, userId)) as Thread;
+  }
+
+  async listThreads(userId: string, projectId?: string): Promise<Thread[]> {
+    return Promise.all(
+      this.options.store
+        .listTasks(userId, projectId)
+        .map((task) => this.projectThread(task, userId)),
+    );
+  }
+
+  async getThread(threadId: string, userId: string): Promise<Thread | null> {
+    const task = this.options.store.getTaskForUser(threadId, userId);
+    return task ? this.projectThread(task, userId) : null;
+  }
+
+  async startThreadTurn(
+    threadId: string,
+    userId: string,
+    prompt: string,
+    config?: EffectiveConfigOverride,
+  ) {
+    return this.startTurn(threadId, userId, prompt, config);
+  }
+
+  async steerThread(threadId: string, userId: string, prompt: string) {
+    return this.steerTask(threadId, userId, prompt);
+  }
+
+  async interruptThread(threadId: string, userId: string) {
+    return this.interruptTask(threadId, userId);
+  }
+
+  async listThreadEvents(threadId: string, userId: string, afterSequence: number) {
+    const events = this.options.store.listTaskEvents(threadId, userId, afterSequence);
+    return events?.map((event) => projectThreadEvent(threadId, event)) ?? null;
+  }
+
+  subscribeThreadEvents(threadId: string, listener: (event: TaskEvent) => void): () => void {
+    return this.subscribeTaskEvents(threadId, (event) =>
+      listener(projectThreadEvent(threadId, event)),
+    );
+  }
+
+  async listSubagents(threadId: string, userId: string): Promise<SubagentThread[] | null> {
+    return this.options.store.listSubagents(threadId, userId, this.now());
+  }
+
+  async getSubagent(threadId: string, userId: string): Promise<SubagentThreadDetail | null> {
+    return this.options.store.getSubagentDetail(threadId, userId, this.now());
+  }
+
+  async getMySettings(userId: string): Promise<UserSettingsView> {
+    return withSettingsPolicy(this.options.store.getUserSettings(userId, this.now()));
+  }
+
+  async patchMySettings(userId: string, patch: UserSettingsPatch): Promise<UserSettingsView> {
+    this.validateSettingsPatch(patch);
+    const defaultProjectId = patch.general?.defaultProjectId;
+    if (
+      defaultProjectId !== undefined &&
+      defaultProjectId !== null &&
+      !this.options.store.listProjects(userId).some((project) => project.id === defaultProjectId)
+    ) {
+      throw new Error("Invalid default project");
+    }
+    return withSettingsPolicy(this.options.store.patchUserSettings(userId, patch, this.now()));
+  }
+
+  async getMyUsage(userId: string) {
+    return this.options.store.getUserUsage(userId);
+  }
+
+  async getMyConnections(userId: string) {
+    return this.options.store.getUserConnections(userId);
+  }
+
+  async getMyPlugins(_userId: string) {
+    return [];
+  }
+
+  async startTurn(
+    taskId: string,
+    userId: string,
+    prompt: string,
+    turnConfig?: EffectiveConfigOverride,
+  ) {
     const task = this.requireTask(taskId, userId);
+    if (task.threadId && !task.accountId) {
+      throw new Error("Thread runtime account binding is missing");
+    }
     const safety = this.options.safety.authorize(userId);
     if (!safety.allowed) throw new Error(safety.reason ?? "Real Codex execution is not allowed");
 
@@ -180,6 +390,11 @@ export class LocalPlatformService implements PlatformApi {
     }
 
     await this.refreshStaleQuotas();
+    const configSnapshot = this.resolveEffectiveConfig(
+      userId,
+      task.threadConfig,
+      turnConfig ? this.validateConfigOverride(turnConfig) : null,
+    );
     const schedulerTurnId = randomUUID();
     this.options.store.createTurn({
       id: schedulerTurnId,
@@ -187,6 +402,7 @@ export class LocalPlatformService implements PlatformApi {
       ownerId: userId,
       prompt,
       status: "ALLOCATING",
+      configSnapshot,
       now: this.now(),
     });
     const allocation = this.options.leases.acquireTurn({
@@ -194,33 +410,57 @@ export class LocalPlatformService implements PlatformApi {
       taskId,
       turnId: schedulerTurnId,
       now: this.now(),
+      requiredAccountId: task.threadId ? task.accountId : null,
     });
     if (allocation.kind === "QUEUED") {
       this.options.store.setTurnStatus(schedulerTurnId, "QUEUED");
       this.options.store.setTaskQueued(taskId, allocation.ticket, this.now());
+      const promoted = this.options.leases.promoteQueue(this.now());
+      const current = promoted.find((turn) => turn.turnId === schedulerTurnId);
+      this.startPromotedTurns(promoted.filter((turn) => turn.turnId !== schedulerTurnId));
+      if (current) return this.startAllocatedTurn(current);
+      const queue = this.options.leases.getQueueEntry(taskId, userId);
+      if (!queue) throw new Error("Queued Turn disappeared before it could be started");
       const event = this.options.store.appendTaskEvent({
         taskId,
         threadId: task.threadId,
         turnId: null,
         type: "QUEUED",
         payload: {
-          position: allocation.position,
-          etaMs: allocation.etaMs,
-          etaEstimated: allocation.etaEstimated,
+          position: queue.position,
+          etaMs: queue.etaMs,
+          etaEstimated: queue.etaEstimated,
         },
         now: this.now(),
       });
       this.publish(event);
-      return { status: "QUEUED", ...allocation };
+      return { status: "QUEUED", ...allocation, ...queue };
     }
     return this.startAllocatedTurn(allocation);
   }
 
   async steerTask(taskId: string, userId: string, prompt: string) {
     const task = this.requireTask(taskId, userId);
+    if (task.status !== "RUNNING" && task.status !== "WAITING_APPROVAL") {
+      throw new Error(`Task status ${task.status} does not accept Steer`);
+    }
     if (!task.threadId || !task.currentTurnId) throw new Error("Task has no active Codex turn");
+    const platformTurnId = this.options.store.findPlatformTurnIdForRuntimeTurn(
+      taskId,
+      task.currentTurnId,
+    );
+    if (!platformTurnId) throw new Error("Active Turn projection is unavailable");
     await this.options.execution.steerTask(task.threadId, task.currentTurnId, prompt);
-    return { status: "RUNNING" };
+    const event = this.options.store.appendTaskEvent({
+      taskId,
+      threadId: task.threadId,
+      turnId: platformTurnId,
+      type: "USER_MESSAGE",
+      payload: { itemId: randomUUID(), kind: "STEER", text: prompt },
+      now: this.now(),
+    });
+    this.publish(event);
+    return { status: task.status, turnId: platformTurnId };
   }
 
   async interruptTask(taskId: string, userId: string) {
@@ -241,7 +481,9 @@ export class LocalPlatformService implements PlatformApi {
   }
 
   async listApprovals(taskId: string, userId: string) {
-    return this.options.store.listApprovals(taskId, userId);
+    return this.options.store
+      .listApprovals(taskId, userId)
+      ?.map((approval) => this.options.store.projectApproval(approval));
   }
 
   async decideApproval(approvalId: string, userId: string, decision: string) {
@@ -250,7 +492,9 @@ export class LocalPlatformService implements PlatformApi {
       userId,
       decision,
     });
-    if (claim.kind === "ALREADY_DELIVERED") return claim.approval;
+    if (claim.kind === "ALREADY_DELIVERED") {
+      return this.options.store.projectApproval(claim.approval);
+    }
     try {
       await this.options.execution.respondApproval(claim.approval.requestId, decision, {
         transport: claim.transport,
@@ -272,19 +516,32 @@ export class LocalPlatformService implements PlatformApi {
     });
     this.options.store.setTaskRunningIfCurrentAndUnblocked(
       approval.taskId,
-      approval.turnId,
+      approval.parentTurnId,
       this.now(),
     );
     const event = this.options.store.appendTaskEvent({
       taskId: approval.taskId,
       threadId: this.options.store.getTaskForUser(approval.taskId, userId)?.threadId ?? null,
-      turnId: approval.turnId,
+      turnId: this.options.store.findPlatformTurnIdForRuntimeTurn(
+        approval.taskId,
+        approval.parentTurnId,
+      ),
       type: "APPROVAL_DECIDED",
       payload: { approvalId: approval.id, decision },
       now: this.now(),
     });
     this.publish(event);
-    return approval;
+    const task = this.options.store.getTaskForUser(approval.taskId, userId);
+    if (task?.threadId && approval.sourceThreadId && approval.sourceThreadId !== task.threadId) {
+      this.options.store.appendSubagentEvent({
+        threadId: approval.sourceThreadId,
+        turnId: approval.turnId,
+        type: "APPROVAL_DECIDED",
+        payload: { approvalId: approval.id, decision },
+        now: this.now(),
+      });
+    }
+    return this.options.store.projectApproval(approval);
   }
 
   async listAccounts() {
@@ -359,6 +616,97 @@ export class LocalPlatformService implements PlatformApi {
     return this.options.store.listAudit();
   }
 
+  async getAdminPolicies() {
+    return {
+      productModes: {
+        enabled: ["CODEX"] as const,
+        disabled: ["CHAT", "WORK"] as const,
+      },
+      settings: SETTINGS_POLICY,
+      memory: { nativeSharedAccountMemory: false },
+      deploymentStage: "LOCAL_1_1A" as const,
+      productionMultiUserEnabled: false,
+    };
+  }
+
+  async getAdminConnectors() {
+    return [
+      {
+        id: "feishu",
+        name: "飞书",
+        managed: true,
+        mode: "USER_OAUTH",
+        status: "CONFIGURED",
+      },
+      {
+        id: "demo-database",
+        name: "Demo Database",
+        managed: true,
+        mode: "MOCK",
+        status: "CONFIGURED",
+      },
+      {
+        id: "demo-business",
+        name: "Demo Business",
+        managed: true,
+        mode: "MOCK",
+        status: "CONFIGURED",
+      },
+    ];
+  }
+
+  async getAdminUsage() {
+    return this.options.store.getGlobalUsage();
+  }
+
+  async getAdminRuntimeHealth(adminUserId: string) {
+    const safety = this.options.safety.authorize(adminUserId);
+    const accounts = this.options.accounts.list();
+    return {
+      deploymentStage: "LOCAL_1_1A",
+      multiUserReady: false,
+      workerIsolation: "NOT_IMPLEMENTED",
+      safetyMode: safety.mode,
+      safetyAllowedForActor: safety.allowed,
+      accounts: {
+        total: accounts.length,
+        available: accounts.filter((account) => account.status === "AVAILABLE").length,
+        unhealthy: accounts.filter((account) =>
+          ["QUARANTINED", "REAUTH_REQUIRED", "EXHAUSTED"].includes(account.status),
+        ).length,
+      },
+    };
+  }
+
+  private async projectThread(task: TaskRecord, userId: string): Promise<Thread> {
+    const queued = this.options.leases.getQueueEntry(task.id, userId);
+    const turns = this.options.store.listTurnsForTask(task.id, userId) ?? [];
+    const activeTurn =
+      [...turns]
+        .reverse()
+        .find((turn) =>
+          ["ALLOCATING", "QUEUED", "RUNNING", "WAITING_APPROVAL"].includes(turn.status),
+        ) ?? null;
+    const events = this.options.store.listTaskEvents(task.id, userId, 0) ?? [];
+    return {
+      id: task.id,
+      projectId: task.projectId,
+      title: task.title,
+      status: TaskStatusSchema.parse(task.status),
+      updatedAt: task.updatedAt,
+      currentTurn: activeTurn ? projectTurn(task.id, activeTurn) : null,
+      turns: turns.map((turn) => projectTurn(task.id, turn)),
+      queue: queued
+        ? {
+            position: queued.position,
+            etaMs: queued.etaMs,
+            etaEstimated: queued.etaEstimated,
+          }
+        : null,
+      items: events.map((event) => eventToThreadItem(task.id, event)),
+    };
+  }
+
   async runMaintenance(now = this.now()): Promise<void> {
     for (const schedulerTurnId of this.schedulerTurnByRuntimeTurn.values()) {
       this.options.leases.heartbeatTurn(schedulerTurnId, now);
@@ -394,6 +742,95 @@ export class LocalPlatformService implements PlatformApi {
   async close(): Promise<void> {
     this.eventBus.removeAllListeners();
     await this.options.execution.close();
+  }
+
+  private validateSettingsPatch(patch: UserSettingsPatch): void {
+    const execution = patch.execution;
+    if (!execution) return;
+    if (execution.model !== undefined && execution.model !== null) {
+      throw new Error("Model selection is unavailable until the runtime model catalog is loaded");
+    }
+    if (
+      execution.reasoningEffort !== undefined &&
+      !SETTINGS_POLICY.allowedReasoningEfforts.includes(execution.reasoningEffort)
+    ) {
+      throw new Error("Reasoning effort is not allowed by organization policy");
+    }
+    if (
+      execution.permissionMode !== undefined &&
+      !SETTINGS_POLICY.allowedPermissionModes.includes(execution.permissionMode)
+    ) {
+      throw new Error("Permission mode is not allowed in 1.1A");
+    }
+    if (
+      execution.approvalPreference !== undefined &&
+      !SETTINGS_POLICY.allowedApprovalPreferences.includes(execution.approvalPreference)
+    ) {
+      throw new Error("Approval preference is not allowed in 1.1A");
+    }
+  }
+
+  private validateConfigOverride(config: EffectiveConfigOverride): EffectiveConfigOverride {
+    const parsed = EffectiveConfigOverrideSchema.parse(config);
+    this.validateSettingsPatch({
+      execution: {
+        ...(parsed.model !== undefined ? { model: parsed.model } : {}),
+        ...(parsed.reasoningEffort !== undefined
+          ? { reasoningEffort: parsed.reasoningEffort }
+          : {}),
+        ...(parsed.permissionMode !== undefined ? { permissionMode: parsed.permissionMode } : {}),
+        ...(parsed.approvalMode !== undefined ? { approvalPreference: parsed.approvalMode } : {}),
+      },
+      ...(parsed.personality !== undefined || parsed.instructions !== undefined
+        ? {
+            personalization: {
+              ...(parsed.personality !== undefined ? { personality: parsed.personality } : {}),
+              ...(parsed.instructions !== undefined ? { instructions: parsed.instructions } : {}),
+            },
+          }
+        : {}),
+    });
+    return parsed;
+  }
+
+  private resolveEffectiveConfig(
+    userId: string,
+    threadOverride: EffectiveConfigOverride | null,
+    turnOverride: EffectiveConfigOverride | null,
+  ): EffectiveThreadConfigSnapshot {
+    const settings = this.options.store.getUserSettings(userId, this.now());
+    const userConfig: EffectiveConfigOverride = {
+      model: settings.execution.model,
+      reasoningEffort: settings.execution.reasoningEffort,
+      permissionMode: settings.execution.permissionMode,
+      approvalMode: settings.execution.approvalPreference,
+      personality: settings.personalization.personality,
+      instructions: settings.personalization.instructions,
+    };
+    const merged = {
+      ...ORGANIZATION_DEFAULT_CONFIG,
+      ...userConfig,
+      ...(threadOverride ?? {}),
+      ...(turnOverride ?? {}),
+    };
+    this.validateConfigOverride(merged);
+    return EffectiveThreadConfigSnapshotSchema.parse({
+      ...merged,
+      instructions: joinInstructions(
+        ORGANIZATION_DEVELOPER_INSTRUCTIONS,
+        merged.instructions ?? "",
+      ),
+      sourceVersion: ORGANIZATION_CONFIG_SOURCE_VERSION,
+    });
+  }
+
+  private actorContextFor(userId: string): ActorContext {
+    const identity = this.options.store.getUserIdentity(userId);
+    return {
+      ...identity,
+      toolScopes: [...ORGANIZATION_TOOL_SCOPES],
+      approvalPolicy: "ASK",
+    };
   }
 
   private requireTask(taskId: string, userId: string) {
@@ -432,19 +869,83 @@ export class LocalPlatformService implements PlatformApi {
 
   private handleTaskEvent(draft: TaskEventDraft): void {
     const occurredAt = draft.at ?? this.now();
+    const ownerId = this.options.store.getTaskOwnerId(draft.taskId);
+    if (draft.subagentThreadId) {
+      if (draft.type === "TOKEN_USAGE_UPDATED" && ownerId) {
+        const payload = draft.payload as TaskEventPayloadMap["TOKEN_USAGE_UPDATED"];
+        this.options.store.upsertThreadTokenUsage({
+          taskId: draft.taskId,
+          ownerId,
+          runtimeThreadId: draft.subagentThreadId,
+          turnId: draft.turnId,
+          ...payload,
+          now: occurredAt,
+        });
+      }
+      this.options.store.appendSubagentEvent({
+        threadId: draft.subagentThreadId,
+        turnId: draft.turnId,
+        type: draft.type,
+        payload: draft.payload,
+        now: occurredAt,
+      });
+      const terminalSubagentStatus = SUBAGENT_TERMINAL_STATUS_BY_EVENT[draft.type];
+      if (terminalSubagentStatus) {
+        this.options.store.setSubagentStatus(
+          draft.subagentThreadId,
+          terminalSubagentStatus,
+          occurredAt,
+        );
+      }
+      return;
+    }
     const schedulerKey = runtimeTurnKey(draft.taskId, draft.turnId);
     const schedulerTurnId = schedulerKey
       ? this.schedulerTurnByRuntimeTurn.get(schedulerKey)
       : undefined;
+    const platformTurnId =
+      schedulerTurnId ??
+      this.options.store.findPlatformTurnIdForRuntimeTurn(draft.taskId, draft.turnId);
     if (schedulerTurnId) this.options.leases.heartbeatTurn(schedulerTurnId, occurredAt);
+    if (draft.type === "TOKEN_USAGE_UPDATED" && ownerId && draft.threadId) {
+      const payload = draft.payload as TaskEventPayloadMap["TOKEN_USAGE_UPDATED"];
+      this.options.store.upsertThreadTokenUsage({
+        taskId: draft.taskId,
+        ownerId,
+        runtimeThreadId: draft.threadId,
+        turnId: draft.turnId,
+        ...payload,
+        now: occurredAt,
+      });
+    }
     const event = this.options.store.appendTaskEvent({
       taskId: draft.taskId,
       threadId: draft.threadId,
-      turnId: draft.turnId,
+      turnId: platformTurnId,
       type: draft.type,
       payload: draft.payload,
       now: occurredAt,
     });
+    if (draft.type === "SUBAGENT_ACTIVITY") {
+      const payload = draft.payload as TaskEventPayloadMap["SUBAGENT_ACTIVITY"];
+      if (ownerId && payload.agentThreadId) {
+        this.options.store.upsertSubagent({
+          threadId: payload.agentThreadId,
+          parentTaskId: draft.taskId,
+          parentRuntimeThreadId: draft.threadId,
+          parentTurnId: draft.turnId,
+          ownerId,
+          sessionId: null,
+          name: payload.name ?? payload.agentThreadId,
+          role: payload.role ?? "subagent",
+          model: payload.model,
+          effort: payload.effort,
+          status: payload.status,
+          resultSummary: payload.resultSummary,
+          now: occurredAt,
+        });
+      }
+    }
     this.publish(event);
     const terminalStatus = TERMINAL_STATUS_BY_EVENT[
       draft.type as keyof typeof TERMINAL_STATUS_BY_EVENT
@@ -471,8 +972,8 @@ export class LocalPlatformService implements PlatformApi {
       if (draft.turnId) {
         this.options.store.markTurnApprovalsForRecovery(draft.taskId, draft.turnId);
       }
-      if (schedulerTurnId) {
-        this.finishSchedulerTurn(schedulerTurnId, "NEEDS_RECOVERY", occurredAt);
+      if (platformTurnId) {
+        this.finishSchedulerTurn(platformTurnId, "NEEDS_RECOVERY", occurredAt);
       }
       if (schedulerKey) this.schedulerTurnByRuntimeTurn.delete(schedulerKey);
       if (draft.turnId) {
@@ -496,33 +997,42 @@ export class LocalPlatformService implements PlatformApi {
     this.startPromotedTurns(this.options.leases.releaseTurn(schedulerTurnId, finishedAt));
   }
 
-  private persistInterruptedTurns(schedulerTurnIds: string[], reason: string, now: Date): void {
+  private persistInterruptedTurns(
+    schedulerTurnIds: string[],
+    reason: string,
+    now: Date,
+    source: { sourceTaskId: string; sourceRuntimeTurnId: string } | null = null,
+  ): void {
     for (const schedulerTurnId of schedulerTurnIds) {
-      const turn = this.options.store.getTurn(schedulerTurnId);
-      if (!turn) {
+      try {
+        const turn = this.options.store.getTurn(schedulerTurnId);
+        if (!turn) continue;
+        this.options.store.setTurnStatus(schedulerTurnId, "NEEDS_RECOVERY");
+        const codexTurnId = turn.codexTurnId;
+        const schedulerKey = runtimeTurnKey(turn.taskId, codexTurnId);
+        if (schedulerKey) this.schedulerTurnByRuntimeTurn.delete(schedulerKey);
+        const task = this.options.store.getTaskForUser(turn.taskId, turn.ownerId);
+        if (!task) continue;
+        const sourceRuntimeTurnId =
+          source?.sourceTaskId === turn.taskId
+            ? source.sourceRuntimeTurnId
+            : (codexTurnId ?? task.currentTurnId);
+        if (sourceRuntimeTurnId) {
+          this.options.store.markTurnApprovalsForRecovery(turn.taskId, sourceRuntimeTurnId);
+        }
+        this.options.store.setTaskInactive(turn.taskId, "NEEDS_RECOVERY", now);
+        const event = this.options.store.appendTaskEvent({
+          taskId: turn.taskId,
+          threadId: task.threadId,
+          turnId: schedulerTurnId,
+          type: "RECOVERY_REQUIRED",
+          payload: { reason },
+          now,
+        });
+        this.publish(event);
+      } finally {
         this.startPromotedTurns(this.options.leases.releaseTurn(schedulerTurnId, now));
-        continue;
       }
-      this.options.store.setTurnStatus(schedulerTurnId, "NEEDS_RECOVERY");
-      const task = this.options.store.getTaskForUser(turn.taskId, turn.ownerId);
-      if (!task) continue;
-      const codexTurnId = turn.codexTurnId ?? task.currentTurnId;
-      if (codexTurnId) {
-        this.options.store.markTurnApprovalsForRecovery(turn.taskId, codexTurnId);
-      }
-      const schedulerKey = runtimeTurnKey(turn.taskId, codexTurnId);
-      if (schedulerKey) this.schedulerTurnByRuntimeTurn.delete(schedulerKey);
-      this.options.store.setTaskInactive(turn.taskId, "NEEDS_RECOVERY", now);
-      const event = this.options.store.appendTaskEvent({
-        taskId: turn.taskId,
-        threadId: task.threadId,
-        turnId: codexTurnId,
-        type: "RECOVERY_REQUIRED",
-        payload: { reason },
-        now,
-      });
-      this.publish(event);
-      this.startPromotedTurns(this.options.leases.releaseTurn(schedulerTurnId, now));
     }
   }
 
@@ -531,6 +1041,43 @@ export class LocalPlatformService implements PlatformApi {
       draft.payload && typeof draft.payload === "object" && !Array.isArray(draft.payload)
         ? (draft.payload as Record<string, unknown>)
         : {};
+    const parentTurnId = draft.parentTurnId ?? draft.turnId;
+    const platformParentTurnId = this.options.store.findPlatformTurnIdForRuntimeTurn(
+      draft.taskId,
+      parentTurnId,
+    );
+    const task = this.options.store.getTaskForUser(
+      draft.taskId,
+      this.options.store.getTaskOwnerId(draft.taskId) ?? "",
+    );
+    const sourceSubagent = Boolean(task?.threadId && task.threadId !== draft.threadId);
+    const ownerId = this.options.store.getTaskOwnerId(draft.taskId);
+    let sourceSubagentName: string | null = null;
+    if (sourceSubagent && task && ownerId) {
+      const existing = this.options.store.getSubagent(
+        draft.threadId,
+        ownerId,
+        draft.at ?? this.now(),
+      );
+      sourceSubagentName = existing?.name ?? draft.threadId;
+      if (!existing) {
+        this.options.store.upsertSubagent({
+          threadId: draft.threadId,
+          parentTaskId: draft.taskId,
+          parentRuntimeThreadId: task.threadId,
+          parentTurnId,
+          ownerId,
+          sessionId: null,
+          name: sourceSubagentName,
+          role: "subagent",
+          model: null,
+          effort: null,
+          status: "ACTIVE",
+          resultSummary: null,
+          now: draft.at ?? this.now(),
+        });
+      }
+    }
     const approval = this.options.store.createApproval({
       requestId: draft.requestId,
       rawRpcId: draft.rawRpcId,
@@ -539,6 +1086,7 @@ export class LocalPlatformService implements PlatformApi {
       threadId: draft.threadId,
       taskId: draft.taskId,
       turnId: draft.turnId,
+      parentTurnId,
       itemId: draft.itemId,
       approvalType: draft.approvalType,
       payload: draft.payload,
@@ -546,32 +1094,45 @@ export class LocalPlatformService implements PlatformApi {
     });
     const actionable = this.options.store.setTaskWaitingApprovalIfCurrent(
       draft.taskId,
-      draft.turnId,
+      parentTurnId,
       draft.at ?? this.now(),
     );
     if (!actionable) {
-      this.options.store.markTurnApprovalsForRecovery(draft.taskId, draft.turnId);
+      this.options.store.markTurnApprovalsForRecovery(draft.taskId, parentTurnId);
     }
+    const approvalPayload: TaskEventPayloadMap["APPROVAL_REQUESTED"] = {
+      approvalId: approval.id,
+      itemId: draft.itemId,
+      approvalType: draft.approvalType,
+      reason: typeof payload.reason === "string" ? payload.reason : null,
+      sourceThreadId: sourceSubagent ? draft.threadId : null,
+      sourceSubagent,
+      sourceSubagentName,
+      ...(draft.approvalType === "COMMAND"
+        ? {
+            command: typeof payload.command === "string" ? payload.command : null,
+            cwd: typeof payload.cwd === "string" ? payload.cwd : null,
+          }
+        : {}),
+    };
     const event = this.options.store.appendTaskEvent({
       taskId: draft.taskId,
-      threadId: draft.threadId,
-      turnId: draft.turnId,
+      threadId: task?.threadId ?? draft.threadId,
+      turnId: platformParentTurnId,
       type: "APPROVAL_REQUESTED",
-      payload: {
-        approvalId: approval.id,
-        itemId: draft.itemId,
-        approvalType: draft.approvalType,
-        reason: typeof payload.reason === "string" ? payload.reason : null,
-        ...(draft.approvalType === "COMMAND"
-          ? {
-              command: typeof payload.command === "string" ? payload.command : null,
-              cwd: typeof payload.cwd === "string" ? payload.cwd : null,
-            }
-          : {}),
-      },
+      payload: approvalPayload,
       now: draft.at ?? this.now(),
     });
     this.publish(event);
+    if (sourceSubagent) {
+      this.options.store.appendSubagentEvent({
+        threadId: draft.threadId,
+        turnId: draft.turnId,
+        type: "APPROVAL_REQUESTED",
+        payload: approvalPayload,
+        now: draft.at ?? this.now(),
+      });
+    }
   }
 
   private publish(event: TaskEvent): void {
@@ -586,6 +1147,13 @@ export class LocalPlatformService implements PlatformApi {
       throw new Error("Allocated turn no longer exists");
     }
     const task = this.requireTask(queuedTurn.taskId, queuedTurn.ownerId);
+    if (task.threadId && task.accountId !== allocation.accountId) {
+      const error = new Error(
+        "Thread runtime account binding does not match its allocated account",
+      );
+      this.failAllocatedTurn(allocation);
+      throw error;
+    }
     const account = this.options.accounts.getInternal(allocation.accountId);
     if (!account) {
       const error = new Error("Allocated Codex account no longer exists");
@@ -610,6 +1178,8 @@ export class LocalPlatformService implements PlatformApi {
         cwd,
         prompt: queuedTurn.prompt,
         existingThreadId: task.threadId,
+        effectiveConfig: queuedTurn.configSnapshot,
+        actorContext: this.actorContextFor(queuedTurn.ownerId),
       });
       this.schedulerTurnByRuntimeTurn.set(
         runtimeTurnKey(queuedTurn.taskId, started.turnId) as string,
@@ -627,7 +1197,7 @@ export class LocalPlatformService implements PlatformApi {
       const event = this.options.store.appendTaskEvent({
         taskId: queuedTurn.taskId,
         threadId: started.threadId,
-        turnId: started.turnId,
+        turnId: allocation.turnId,
         type: "LEASE_ACQUIRED",
         payload: { accountAlias: account.alias },
         now: this.now(),
@@ -642,13 +1212,22 @@ export class LocalPlatformService implements PlatformApi {
         status: reconciledTask?.status ?? "RUNNING",
         accountAlias: account.alias,
         threadId: started.threadId,
-        turnId: started.turnId,
+        turnId: allocation.turnId,
       };
     } catch (error) {
       if (this.pendingStartSignalsByTask.get(queuedTurn.taskId) === pendingSignals) {
         this.pendingStartSignalsByTask.delete(queuedTurn.taskId);
       }
-      this.failAllocatedTurn(allocation);
+      if (error instanceof ThreadResumeSafetyError) {
+        this.options.accounts.setState(account.id, "QUARANTINED");
+      }
+      const persisted = this.options.store.getTurn(allocation.turnId);
+      if (persisted?.status !== "NEEDS_RECOVERY") {
+        this.failAllocatedTurn(
+          allocation,
+          error instanceof ThreadResumeSafetyError ? error.turnId : null,
+        );
+      }
       throw error;
     }
   }
@@ -659,22 +1238,26 @@ export class LocalPlatformService implements PlatformApi {
     }
   }
 
-  private failAllocatedTurn(allocation: LeasedTurn): void {
+  private failAllocatedTurn(
+    allocation: LeasedTurn,
+    sourceRuntimeTurnId: string | null = null,
+  ): void {
     const failedAt = this.now();
     const persisted = this.options.store.getTurn(allocation.turnId);
     if (persisted) {
       this.options.store.completeTurn(allocation.turnId, "NEEDS_RECOVERY", failedAt);
       const task = this.options.store.getTaskForUser(persisted.taskId, persisted.ownerId);
       if (task) {
+        if (sourceRuntimeTurnId) {
+          this.options.store.markTurnApprovalsForRecovery(persisted.taskId, sourceRuntimeTurnId);
+        }
         this.options.store.setTaskInactive(persisted.taskId, "NEEDS_RECOVERY", failedAt);
         const event = this.options.store.appendTaskEvent({
           taskId: persisted.taskId,
           threadId: task.threadId,
-          turnId: persisted.codexTurnId,
+          turnId: allocation.turnId,
           type: "RECOVERY_REQUIRED",
-          payload: {
-            reason: "Codex Turn could not be started; explicit recovery is required.",
-          },
+          payload: { reason: "Codex Turn could not be started; explicit recovery is required." },
           now: failedAt,
         });
         this.publish(event);
@@ -715,12 +1298,109 @@ export class LocalPlatformService implements PlatformApi {
   }
 }
 
+const SETTINGS_POLICY = {
+  // 1.1A does not yet expose model/list. Until that catalog is wired, a
+  // non-null model override is rejected rather than silently accepting an
+  // unverified model id.
+  allowedModels: null,
+  allowedReasoningEfforts: ["LOW", "MEDIUM", "HIGH", "XHIGH", "ULTRA"] as readonly string[],
+  allowedPermissionModes: [
+    "DEFAULT",
+    "READ_ONLY",
+    "WORKSPACE_WRITE",
+  ] as readonly UserSettings["execution"]["permissionMode"][],
+  allowedApprovalPreferences: ["ASK"] as readonly UserSettings["execution"]["approvalPreference"][],
+  lockedFields: [] as const,
+};
+
+const ORGANIZATION_CONFIG_SOURCE_VERSION = "org-policy-1.1a-v1";
+const ORGANIZATION_DEVELOPER_INSTRUCTIONS =
+  "Apply organization policy and use the authenticated employee identity for enterprise tools.";
+const ORGANIZATION_DEFAULT_CONFIG: EffectiveConfigOverride = {
+  model: null,
+  reasoningEffort: "MEDIUM",
+  permissionMode: "DEFAULT",
+  approvalMode: "ASK",
+  personality: "PRAGMATIC",
+  instructions: "",
+};
+const ORGANIZATION_TOOL_SCOPES = [
+  "feishu_wiki_search",
+  "feishu_doc_read",
+  "demo_db_query",
+  "demo_business_get",
+] as const;
+
+function withSettingsPolicy(settings: UserSettings): UserSettingsView {
+  return {
+    ...settings,
+    policy: {
+      allowedModels: SETTINGS_POLICY.allowedModels,
+      allowedReasoningEfforts: [...SETTINGS_POLICY.allowedReasoningEfforts],
+      allowedPermissionModes: [...SETTINGS_POLICY.allowedPermissionModes],
+      allowedApprovalPreferences: [...SETTINGS_POLICY.allowedApprovalPreferences],
+      lockedFields: [...SETTINGS_POLICY.lockedFields],
+    },
+  };
+}
+
+function projectThreadEvent(threadId: string, event: TaskEvent): TaskEvent {
+  return {
+    ...event,
+    threadId,
+    itemId: event.itemId ?? derivePublicItemId(threadId, event),
+    payload: event.type === "LEASE_ACQUIRED" ? {} : event.payload,
+  } as TaskEvent;
+}
+
+function eventToThreadItem(threadId: string, event: TaskEvent): ThreadItem {
+  const projected = projectThreadEvent(threadId, event);
+  return {
+    id: projected.itemId ?? derivePublicItemId(threadId, projected),
+    threadId,
+    turnId: projected.turnId,
+    sequence: projected.sequence,
+    type: projected.type,
+    timestamp: projected.timestamp,
+    payload: projected.payload,
+  };
+}
+
+function derivePublicItemId(threadId: string, event: TaskEvent): string {
+  const payload =
+    event.payload && typeof event.payload === "object"
+      ? (event.payload as Record<string, unknown>)
+      : {};
+  if (typeof payload.itemId === "string" && payload.itemId.length > 0) return payload.itemId;
+  return `${event.type.toLowerCase()}:${event.turnId ?? threadId}`;
+}
+
 function normalizeResetTimestamp(value: number): Date {
   return new Date(value < 10_000_000_000 ? value * 1_000 : value);
 }
 
 function runtimeTurnKey(taskId: string, turnId: string | null): string | null {
   return turnId ? `${taskId}:${turnId}` : null;
+}
+
+function projectTurn(threadId: string, turn: TurnRecord): Thread["turns"][number] {
+  return {
+    id: turn.id,
+    threadId,
+    prompt: turn.prompt,
+    status: TurnStatusSchema.parse(turn.status),
+    startedAt: turn.startedAt,
+    completedAt: turn.completedAt,
+    durationMs: turn.durationMs,
+    model: turn.configSnapshot.model,
+    effort: turn.configSnapshot.reasoningEffort,
+    permissionMode: turn.configSnapshot.permissionMode,
+    configSnapshot: turn.configSnapshot,
+  };
+}
+
+function joinInstructions(required: string, personal: string): string {
+  return personal.length > 0 ? `${required}\n\n${personal}` : required;
 }
 
 function toTaskSummary(task: TaskRecord): TaskSummary {

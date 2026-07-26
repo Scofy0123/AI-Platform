@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
+import type { ActorContext as EnterpriseActorContext } from "@codexplatform/contracts";
 import type { DynamicToolDefinition } from "../infra/codex/codex-runtime.js";
+import type { JsonValue } from "../infra/codex/generated/serde_json/JsonValue.js";
 import type { SafeDemoDatabase } from "./demo-db.js";
 import type { FeishuContentClient } from "./feishu-client.js";
 
 export interface DynamicToolCall {
+  accountId: string;
+  connectionGeneration: number;
   threadId: string;
   turnId: string;
   callId: string;
@@ -17,9 +21,8 @@ export interface DynamicToolResponse {
   contentItems: Array<{ type: "inputText"; text: string }>;
 }
 
-interface ActorContext {
+interface ActorContext extends EnterpriseActorContext {
   taskId: string;
-  userId: string;
   accessToken: string;
 }
 
@@ -29,10 +32,12 @@ interface FeishuClientPort {
 }
 
 interface EnterpriseToolRuntimeOptions {
-  resolveActor: (
-    threadId: string,
-    turnId: string,
-  ) => ActorContext | null | Promise<ActorContext | null>;
+  resolveActor: (identity: {
+    accountId: string;
+    connectionGeneration: number;
+    threadId: string;
+    turnId: string;
+  }) => ActorContext | null | Promise<ActorContext | null>;
   createFeishuClient: (accessToken: string) => FeishuClientPort | FeishuContentClient;
   demoDatabase: SafeDemoDatabase;
   onInvocation?: (event: ToolInvocationAudit) => void | Promise<void>;
@@ -99,8 +104,16 @@ export class EnterpriseToolRuntime {
   }
 
   async invoke(call: DynamicToolCall): Promise<DynamicToolResponse> {
-    const actor = await this.options.resolveActor(call.threadId, call.turnId);
+    const actor = await this.options.resolveActor({
+      accountId: call.accountId,
+      connectionGeneration: call.connectionGeneration,
+      threadId: call.threadId,
+      turnId: call.turnId,
+    });
     if (!actor) return failure("Tool call is not bound to an active user turn");
+    if (!actor.toolScopes.includes(call.tool)) {
+      return failure("Enterprise tool is not allowed for this actor");
+    }
 
     const key = `${call.threadId}:${call.turnId}:${call.callId}`;
     const fingerprint = digest({
@@ -119,13 +132,20 @@ export class EnterpriseToolRuntime {
     let response: DynamicToolResponse;
     try {
       const args = asRecord(call.arguments);
-      const feishu = this.options.createFeishuClient(actor.accessToken);
       switch (call.tool) {
         case "feishu_wiki_search":
-          response = success(await feishu.search(requiredString(args.query, "query"), {}));
+          response = success(
+            await this.options
+              .createFeishuClient(actor.accessToken)
+              .search(requiredString(args.query, "query"), {}),
+          );
           break;
         case "feishu_doc_read":
-          response = success(await feishu.readDocument(requiredString(args.url, "url")));
+          response = success(
+            await this.options
+              .createFeishuClient(actor.accessToken)
+              .readDocument(requiredString(args.url, "url")),
+          );
           break;
         case "demo_db_query":
           response = success(this.options.demoDatabase.query(requiredString(args.sql, "sql")));
@@ -171,7 +191,7 @@ export class EnterpriseToolRuntime {
 function definition(
   name: string,
   description: string,
-  inputSchema: Record<string, unknown>,
+  inputSchema: JsonValue,
 ): DynamicToolDefinition {
   return { type: "function", name, description, inputSchema };
 }
