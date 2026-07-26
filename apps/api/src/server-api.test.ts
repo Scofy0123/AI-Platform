@@ -1,0 +1,505 @@
+import { EventEmitter } from "node:events";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { buildApp, streamTaskEvents, subscribeWithReplay } from "./server.js";
+import type { AuthApi, PlatformApi } from "./web-api.js";
+
+describe("CodexPlatform HTTP API", () => {
+  const apps: Array<ReturnType<typeof buildApp>> = [];
+
+  afterEach(async () => {
+    await Promise.all(apps.splice(0).map((app) => app.close()));
+  });
+
+  test("completes Feishu OAuth and sets HttpOnly SameSite session cookies", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform, webOrigin: "http://127.0.0.1:5173" });
+    apps.push(app);
+
+    const start = await app.inject({ method: "GET", url: "/api/auth/feishu/start" });
+    expect(start.statusCode).toBe(302);
+    expect(start.headers.location).toBe("https://auth.example.test/start");
+    expect(start.headers["set-cookie"]).toContain(
+      "codexplatform_oauth_binding=binding-1; Max-Age=600; Path=/api/auth/feishu/callback; HttpOnly; SameSite=Lax",
+    );
+
+    const missingBinding = await app.inject({
+      method: "GET",
+      url: "/api/auth/feishu/callback?code=code-1&state=state-1",
+    });
+    expect(missingBinding.statusCode).toBe(400);
+
+    const wrongBinding = await app.inject({
+      method: "GET",
+      url: "/api/auth/feishu/callback?code=code-1&state=state-1",
+      cookies: { codexplatform_oauth_binding: "wrong-binding" },
+    });
+    expect(wrongBinding.statusCode).toBe(400);
+
+    const callback = await app.inject({
+      method: "GET",
+      url: "/api/auth/feishu/callback?code=code-1&state=state-1",
+      cookies: { codexplatform_oauth_binding: "binding-1" },
+    });
+    expect(callback.statusCode).toBe(302);
+    const cookies = callback.headers["set-cookie"];
+    expect(cookies).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          "codexplatform_session=valid-session; Path=/; HttpOnly; SameSite=Strict",
+        ),
+        expect.stringContaining("codexplatform_csrf=valid-csrf; Path=/; SameSite=Strict"),
+        expect.stringContaining(
+          "codexplatform_oauth_binding=; Max-Age=0; Path=/api/auth/feishu/callback; HttpOnly; SameSite=Lax",
+        ),
+      ]),
+    );
+    expect(auth.completeLogin).toHaveBeenCalledWith({
+      code: "code-1",
+      state: "state-1",
+      browserBinding: "binding-1",
+    });
+
+    const replay = await app.inject({
+      method: "GET",
+      url: "/api/auth/feishu/callback?code=code-1&state=state-1",
+      cookies: { codexplatform_oauth_binding: "binding-1" },
+    });
+    expect(replay.statusCode).toBe(400);
+  });
+
+  test("buffers events published during replay and emits every sequence once", async () => {
+    const event = (sequence: number) => ({
+      taskId: "task-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      sequence,
+      timestamp: "2026-07-21T12:00:00.000Z",
+      type: "AGENT_MESSAGE_DELTA" as const,
+      payload: { delta: `chunk-${sequence}` },
+    });
+    const emitted: number[] = [];
+    let listener: ((value: ReturnType<typeof event>) => void) | undefined;
+    const unsubscribe = vi.fn();
+
+    const stop = await subscribeWithReplay({
+      afterSequence: 4,
+      subscribe(next) {
+        listener = next;
+        return unsubscribe;
+      },
+      async loadReplay() {
+        listener?.(event(6));
+        return [event(5), event(6)];
+      },
+      emit(value) {
+        emitted.push(value.sequence);
+      },
+    });
+    listener?.(event(7));
+
+    expect(emitted).toEqual([5, 6, 7]);
+    stop();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  test("closes an SSE subscription when its session expires", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-21T12:00:00.000Z"));
+    try {
+      const raw = Object.assign(new EventEmitter(), {
+        writeHead: vi.fn(),
+        write: vi.fn(() => true),
+        end: vi.fn(function (this: EventEmitter) {
+          this.emit("close");
+        }),
+        destroy: vi.fn(),
+      });
+      const unsubscribe = vi.fn();
+
+      await streamTaskEvents({ hijack: vi.fn(), raw } as never, {
+        afterSequence: 0,
+        loadReplay: async () => [],
+        subscribe: () => unsubscribe,
+        sessionExpiresAt: new Date("2026-07-21T12:00:01.000Z"),
+        isSessionValid: () => true,
+      });
+      await vi.advanceTimersByTimeAsync(1_001);
+
+      expect(raw.end).toHaveBeenCalledOnce();
+      expect(unsubscribe).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("requires a session and CSRF token for writes", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const anonymous = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      payload: { name: "Platform" },
+    });
+    expect(anonymous.statusCode).toBe(401);
+
+    const noCsrf = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      cookies: { codexplatform_session: "valid-session" },
+      payload: { name: "Platform" },
+    });
+    expect(noCsrf.statusCode).toBe(403);
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/projects",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { name: "Platform" },
+    });
+    expect(created.statusCode).toBe(201);
+    expect(platform.createProject).toHaveBeenCalledWith("user-1", { name: "Platform" });
+  });
+
+  test("replays task events after Last-Event-ID without exposing another user's task", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/tasks/task-1/events",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "last-event-id": "4", accept: "application/json" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(platform.listTaskEvents).toHaveBeenCalledWith("task-1", "user-1", 4);
+    expect(response.json()).toEqual([
+      expect.objectContaining({ taskId: "task-1", sequence: 5, type: "TURN_COMPLETED" }),
+    ]);
+  });
+
+  test("projects internal scheduling and approval records before returning browser DTOs", async () => {
+    const { auth, platform } = services();
+    platform.startTurn.mockResolvedValueOnce({
+      status: "QUEUED",
+      ticket: 91,
+      position: 2,
+      etaMs: 300_000,
+      etaEstimated: true,
+      userId: "user-1",
+      taskId: "task-1",
+      turnId: "scheduler-turn-secret",
+      leaseId: "lease-secret",
+    } as never);
+    platform.listTaskEvents.mockResolvedValueOnce([
+      {
+        taskId: "task-1",
+        threadId: "thread-visible",
+        turnId: "turn-visible",
+        sequence: 6,
+        timestamp: "2026-07-21T12:00:01.000Z",
+        type: "LEASE_ACQUIRED",
+        payload: { accountAlias: "Codex A", leaseId: "lease-secret" },
+      },
+    ] as never);
+    platform.listApprovals.mockResolvedValueOnce([
+      {
+        id: "approval-platform-1",
+        requestId: "raw-rpc-secret",
+        taskId: "task-1",
+        turnId: "turn-visible",
+        itemId: "item-visible",
+        approvalType: "COMMAND",
+        status: "PENDING",
+        payload: { command: "echo secret", bearer: "credential-secret" },
+        decision: null,
+        requestedAt: "2026-07-21T12:00:01.000Z",
+        decidedAt: null,
+      },
+    ] as never);
+    platform.decideApproval.mockResolvedValueOnce({
+      id: "approval-platform-1",
+      requestId: "raw-rpc-secret",
+      payload: { bearer: "credential-secret" },
+      status: "DELIVERED",
+      decision: "accept",
+    } as never);
+    platform.listAudit.mockResolvedValueOnce([
+      {
+        id: "audit-1",
+        actorUserId: "user-1",
+        accountAlias: "Codex A",
+        leaseId: "audit-lease-secret",
+        taskId: "task-1",
+        threadId: "audit-thread-secret",
+        turnId: "audit-turn-secret",
+        toolCallId: "audit-tool-secret",
+        approvalId: "audit-approval-secret",
+        action: "LEASE_ACQUIRED",
+        outcome: "SUCCESS",
+        summary: "Lease acquired",
+        createdAt: "2026-07-21T12:00:02.000Z",
+      },
+    ] as never);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const write = (url: string, payload: Record<string, unknown>) =>
+      app.inject({
+        method: "POST",
+        url,
+        cookies: { codexplatform_session: "valid-session" },
+        headers: { "x-csrf-token": "valid-csrf" },
+        payload,
+      });
+
+    const started = await write("/api/tasks/task-1/turns", { prompt: "Build it" });
+    const events = await app.inject({
+      method: "GET",
+      url: "/api/tasks/task-1/events",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { accept: "application/json" },
+    });
+    const approvals = await app.inject({
+      method: "GET",
+      url: "/api/tasks/task-1/approvals",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const decided = await write("/api/approvals/approval-platform-1/decision", {
+      decision: "accept",
+    });
+    const audit = await app.inject({
+      method: "GET",
+      url: "/api/admin/audit",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    expect(started.json()).toEqual({
+      status: "QUEUED",
+      position: 2,
+      etaMs: 300_000,
+      etaEstimated: true,
+    });
+    expect(events.json()).toEqual([
+      expect.objectContaining({
+        threadId: "thread-visible",
+        turnId: "turn-visible",
+        payload: { accountAlias: "Codex A" },
+      }),
+    ]);
+    expect(approvals.json()).toEqual([
+      {
+        id: "approval-platform-1",
+        taskId: "task-1",
+        turnId: "turn-visible",
+        itemId: "item-visible",
+        approvalType: "COMMAND",
+        status: "PENDING",
+        decision: null,
+        requestedAt: "2026-07-21T12:00:01.000Z",
+        decidedAt: null,
+      },
+    ]);
+    expect(decided.json()).toEqual({
+      id: "approval-platform-1",
+      status: "DELIVERED",
+      decision: "accept",
+    });
+    expect(audit.json()).toEqual([
+      {
+        id: "audit-1",
+        actorUserId: "user-1",
+        accountAlias: "Codex A",
+        taskId: "task-1",
+        action: "LEASE_ACQUIRED",
+        outcome: "SUCCESS",
+        summary: "Lease acquired",
+        createdAt: "2026-07-21T12:00:02.000Z",
+      },
+    ]);
+    for (const response of [started, events, approvals, decided, audit]) {
+      expect(response.body).not.toContain("raw-rpc-secret");
+      expect(response.body).not.toContain("lease-secret");
+      expect(response.body).not.toContain("credential-secret");
+      expect(response.body).not.toContain("scheduler-turn-secret");
+      expect(response.body).not.toContain("audit-thread-secret");
+      expect(response.body).not.toContain("audit-turn-secret");
+      expect(response.body).not.toContain("audit-tool-secret");
+      expect(response.body).not.toContain("audit-approval-secret");
+    }
+  });
+
+  test("rejects session-wide approval grants at the browser boundary", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/approvals/approval-1/decision",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { decision: "acceptForSession" },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(platform.decideApproval).not.toHaveBeenCalled();
+  });
+
+  test("restricts account administration and audit to administrators", async () => {
+    const { auth, platform } = services("MEMBER");
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const denied = await app.inject({
+      method: "GET",
+      url: "/api/admin/accounts",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    expect(denied.statusCode).toBe(403);
+    expect(platform.listAccounts).not.toHaveBeenCalled();
+  });
+
+  test("routes turns, steer, interrupt and approval decisions through the actor-aware service", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const request = (url: string, payload: Record<string, unknown>) =>
+      app.inject({
+        method: "POST",
+        url,
+        cookies: { codexplatform_session: "valid-session" },
+        headers: { "x-csrf-token": "valid-csrf" },
+        payload,
+      });
+
+    expect((await request("/api/tasks/task-1/turns", { prompt: "Build it" })).statusCode).toBe(202);
+    expect((await request("/api/tasks/task-1/steer", { prompt: "Focus on auth" })).statusCode).toBe(
+      202,
+    );
+    expect((await request("/api/tasks/task-1/interrupt", {})).statusCode).toBe(202);
+    expect(
+      (await request("/api/approvals/approval-1/decision", { decision: "accept" })).statusCode,
+    ).toBe(200);
+    expect(platform.startTurn).toHaveBeenCalledWith("task-1", "user-1", "Build it");
+    expect(platform.decideApproval).toHaveBeenCalledWith("approval-1", "user-1", "accept");
+  });
+
+  test("returns stable HTTP errors without leaking runtime credentials", async () => {
+    const { auth, platform } = services();
+    platform.startTurn.mockRejectedValueOnce(
+      new Error("spawn failed with Bearer secret_token_value_abcdefghijklmnopqrstuvwxyz"),
+    );
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/tasks/task-1/turns",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "Build it" },
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ error: "Internal server error" });
+    expect(response.body).not.toContain("secret_token_value");
+    expect(response.body).not.toContain("Bearer");
+  });
+
+  test("returns 409 when the task already has an active Turn", async () => {
+    const { auth, platform } = services();
+    platform.startTurn.mockRejectedValueOnce(new Error("Task already has an active Turn"));
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/tasks/task-1/turns",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "Build it again" },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({ error: "Task already has an active Turn" });
+  });
+});
+
+function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
+  let loginConsumed = false;
+  const user = {
+    id: "user-1",
+    tenantKey: "tenant-1",
+    openId: "ou_1",
+    unionId: null,
+    name: "User",
+    avatarUrl: null,
+    role,
+  };
+  const auth: AuthApi = {
+    startLogin: () => ({
+      state: "state-1",
+      browserBinding: "binding-1",
+      authorizationUrl: "https://auth.example.test/start",
+    }),
+    completeLogin: vi.fn(async (input) => {
+      if (input.browserBinding !== "binding-1") {
+        throw new Error("OAuth state is invalid, expired, or already used");
+      }
+      if (loginConsumed) throw new Error("OAuth state is invalid, expired, or already used");
+      loginConsumed = true;
+      return {
+        user,
+        sessionToken: "valid-session",
+        csrfToken: "valid-csrf",
+      };
+    }),
+    resolveSession: (token) =>
+      token === "valid-session"
+        ? { user, csrfHash: "csrf-hash", expiresAt: new Date("2099-01-01T00:00:00.000Z") }
+        : null,
+    verifyCsrf: (_hash, token) => token === "valid-csrf",
+  };
+  const event = {
+    taskId: "task-1",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    sequence: 5,
+    timestamp: "2026-07-21T12:00:00.000Z",
+    type: "TURN_COMPLETED" as const,
+    payload: { status: "completed" as const },
+  };
+  const platform = {
+    createProject: vi.fn(async () => ({ id: "project-1" })),
+    listProjects: vi.fn(async () => []),
+    createTask: vi.fn(async () => ({ id: "task-1" })),
+    listTasks: vi.fn(async () => []),
+    getTask: vi.fn(async () => ({
+      id: "task-1",
+      projectId: "project-1",
+      title: "Build it",
+      status: "RUNNING" as const,
+      updatedAt: "2026-07-21T12:00:00.000Z",
+      prompt: "Build it",
+      accountAlias: "Codex A",
+      queue: null,
+    })),
+    startTurn: vi.fn(async () => ({ status: "RUNNING" })),
+    steerTask: vi.fn(async () => ({ status: "RUNNING" })),
+    interruptTask: vi.fn(async () => ({ status: "INTERRUPTING" })),
+    listTaskEvents: vi.fn(async () => [event]),
+    subscribeTaskEvents: vi.fn(() => () => undefined),
+    listApprovals: vi.fn(async () => []),
+    decideApproval: vi.fn(async () => ({ id: "approval-1", status: "DECIDED" })),
+    listAccounts: vi.fn(async () => []),
+    addAccount: vi.fn(async () => ({ id: "account-1" })),
+    loginAccount: vi.fn(async () => ({ authUrl: "https://auth.example.test/codex" })),
+    setAccountState: vi.fn(async () => ({ id: "account-1" })),
+    listAudit: vi.fn(async () => []),
+  } satisfies PlatformApi;
+  return { auth, platform };
+}

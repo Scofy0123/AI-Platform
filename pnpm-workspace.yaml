@@ -1,0 +1,22 @@
+packages:
+  - apps/*
+  - packages/*
+
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+
+minimumReleaseAgeExclude:
+  - '@biomejs/biome@2.5.5'
+  - '@biomejs/cli-darwin-arm64@2.5.5'
+  - '@biomejs/cli-darwin-x64@2.5.5'
+  - '@biomejs/cli-linux-arm64-musl@2.5.5'
+  - '@biomejs/cli-linux-arm64@2.5.5'
+  - '@biomejs/cli-linux-x64-musl@2.5.5'
+  - '@biomejs/cli-linux-x64@2.5.5'
+  - '@biomejs/cli-win32-arm64@2.5.5'
+  - '@biomejs/cli-win32-x64@2.5.5'
+  - '@tanstack/query-core@5.101.3'
+  - '@tanstack/react-query@5.101.3'
+  - '@testing-library/jest-dom@7.0.0'
+  - better-sqlite3@13.0.1

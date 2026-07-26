@@ -1,0 +1,28 @@
+{
+  "name": "@codexplatform/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file-if-exists=../../.env.local --import tsx --watch src/index.ts",
+    "start": "node --env-file-if-exists=../../.env.local dist/index.js",
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "test": "vitest run --root ../.. apps/api/src",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "db:migrate": "tsx src/infra/db/migrate.ts"
+  },
+  "dependencies": {
+    "@codexplatform/contracts": "workspace:*",
+    "@fastify/cookie": "11.1.2",
+    "@fastify/cors": "11.3.0",
+    "@fastify/sensible": "6.0.4",
+    "better-sqlite3": "13.0.1",
+    "drizzle-orm": "0.45.2",
+    "fastify": "5.10.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.13",
+    "drizzle-kit": "0.31.10"
+  }
+}

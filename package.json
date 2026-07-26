@@ -1,0 +1,45 @@
+{
+  "name": "codexplatform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.5.1",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,magenta \"pnpm --filter @codexplatform/api dev\" \"pnpm --filter @codexplatform/web dev\"",
+    "build": "pnpm -r --if-present build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start:test": "tsx tests/e2e/start-test-server.ts",
+    "test:e2e": "playwright test",
+    "test:real-codex": "vitest run tests/real/codex.real.test.ts",
+    "test:real-feishu": "vitest run tests/real/feishu.real.test.ts",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm test:e2e && pnpm codex:verify-protocol && pnpm build",
+    "db:migrate": "pnpm --filter @codexplatform/api db:migrate",
+    "codex:generate-protocol": "pnpm exec codex app-server generate-ts --out apps/api/src/infra/codex/generated --experimental",
+    "codex:verify-protocol": "bash scripts/verify-codex-protocol.sh"
+  },
+  "dependencies": {
+    "@openai/codex": "0.144.6"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.5",
+    "@playwright/test": "1.61.1",
+    "@testing-library/jest-dom": "7.0.0",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "26.1.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "concurrently": "10.0.3",
+    "jsdom": "29.1.1",
+    "tsx": "4.23.1",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}
