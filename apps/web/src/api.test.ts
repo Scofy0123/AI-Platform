@@ -126,7 +126,9 @@ describe("HTTP API adapter", () => {
             maxActiveUsers: 4,
             weeklyRemaining: 73,
             healthScore: 98,
-            quotaUpdatedAt: null,
+            authStatus: "AUTHENTICATED",
+            quotaUpdatedAt: "2026-07-21T12:00:00.000Z",
+            quotaResetsAt: "2026-07-28T12:00:00.000Z",
           },
         ]),
       );
@@ -134,7 +136,13 @@ describe("HTTP API adapter", () => {
 
     await expect(httpApi.getSession()).resolves.toMatchObject({ authenticated: true });
     await expect(httpApi.listAccounts()).resolves.toEqual([
-      expect.objectContaining({ maxUsers: 4, weeklyRemainingPercent: 73, health: 98 }),
+      expect.objectContaining({
+        maxUsers: 4,
+        weeklyRemainingPercent: 73,
+        authStatus: "AUTHENTICATED",
+        quotaUpdatedAt: "2026-07-21T12:00:00.000Z",
+        quotaResetsAt: "2026-07-28T12:00:00.000Z",
+      }),
     ]);
   });
 

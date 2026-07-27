@@ -786,7 +786,8 @@ describe("CodexPlatform workspace", () => {
 
     expect(await screen.findByRole("heading", { name: "Codex 账号池" })).toBeInTheDocument();
     expect(await screen.findByText("2 / 4")).toBeInTheDocument();
-    expect(await screen.findByText("周额度剩余 73%")).toBeInTheDocument();
+    expect(await screen.findByText("本周已用 27%")).toBeInTheDocument();
+    expect(screen.getByText("剩余 73%")).toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/@|CODEX_HOME|token|cookie/i);
     fireEvent.click(screen.getByRole("button", { name: "添加账号" }));
     fireEvent.change(screen.getByLabelText("账号别名"), { target: { value: "Codex 02" } });

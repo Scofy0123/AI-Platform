@@ -609,6 +609,22 @@ describe("CodexPlatform HTTP API", () => {
     expect(platform.listAccounts).not.toHaveBeenCalled();
   });
 
+  test("routes an administrator quota refresh through the account service", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/admin/accounts/account-1/refresh-quota",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(platform.refreshAccountQuotaNow).toHaveBeenCalledWith("account-1", "user-1");
+  });
+
   test("routes turns, steer, interrupt and approval decisions through the actor-aware service", async () => {
     const { auth, platform } = services();
     const app = buildApp({ auth, platform });
@@ -1379,6 +1395,7 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
     listAccounts: vi.fn(async () => []),
     addAccount: vi.fn(async () => ({ id: "account-1" })),
     loginAccount: vi.fn(async () => ({ authUrl: "https://auth.example.test/codex" })),
+    refreshAccountQuotaNow: vi.fn(async () => ({ id: "account-1", weeklyRemaining: 55 })),
     setAccountState: vi.fn(async () => ({ id: "account-1" })),
     listAudit: vi.fn(async () => []),
     getAdminPolicies: vi.fn(async () => ({})),

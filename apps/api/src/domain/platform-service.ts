@@ -175,6 +175,10 @@ export interface TaskExecutionAdapter {
   on(event: "accountAuthenticated", listener: (event: { accountId: string }) => void): this;
   on(event: "accountAuthFailed", listener: (event: { accountId: string }) => void): this;
   on(
+    event: "accountQuotaUpdated",
+    listener: (event: { accountId: string; quota: WeeklyQuota }) => void,
+  ): this;
+  on(
     event: "accountCrashed",
     listener: (event: {
       accountId: string;
@@ -185,6 +189,7 @@ export interface TaskExecutionAdapter {
   ): this;
   emit(event: "taskEvent", value: TaskEventDraft): boolean;
   emit(event: "approval", value: ApprovalDraft): boolean;
+  emit(event: "accountQuotaUpdated", value: { accountId: string; quota: WeeklyQuota }): boolean;
   close(): Promise<void>;
 }
 
@@ -257,6 +262,13 @@ export class LocalPlatformService implements PlatformApi {
       this.invalidateAccountModelCatalog(accountId);
       options.accounts.markReauthenticationRequired(accountId);
     });
+    options.execution.on(
+      "accountQuotaUpdated",
+      ({ accountId, quota }: { accountId: string; quota: WeeklyQuota }) => {
+        if (quota.status !== "KNOWN" || !options.accounts.getInternal(accountId)) return;
+        this.storeWeeklyQuota(accountId, quota, this.now());
+      },
+    );
     options.execution.on("accountCrashed", ({ accountId, reason }) => {
       this.invalidateAccountModelCatalog(accountId);
       const occurredAt = this.now();
@@ -777,6 +789,38 @@ export class LocalPlatformService implements PlatformApi {
     });
     this.invalidateAccountModelCatalog(accountId);
     return this.options.accounts.list().find((account) => account.id === accountId) ?? null;
+  }
+
+  async refreshAccountQuotaNow(accountId: string, adminUserId: string) {
+    const account = this.options.accounts.getInternal(accountId);
+    if (!account) throw new Error("Codex account not found");
+    const observedAt = this.now();
+    try {
+      const quota = await this.options.execution.refreshWeeklyQuota(account);
+      this.storeWeeklyQuota(accountId, quota, observedAt);
+      this.options.accounts.recordLifecycleEvent({
+        accountId,
+        actorUserId: adminUserId,
+        action: "ACCOUNT_QUOTA_REFRESHED",
+        outcome: "SUCCESS",
+        summary:
+          quota.status === "KNOWN"
+            ? `Codex weekly quota refreshed: ${quota.remainingPercent}% remaining`
+            : "Codex weekly quota could not be identified",
+        now: observedAt,
+      });
+      return this.options.accounts.list().find((item) => item.id === accountId) ?? null;
+    } catch (error) {
+      this.options.accounts.recordLifecycleEvent({
+        accountId,
+        actorUserId: adminUserId,
+        action: "ACCOUNT_QUOTA_REFRESHED",
+        outcome: "FAILED",
+        summary: "Codex weekly quota refresh failed",
+        now: observedAt,
+      });
+      throw error;
+    }
   }
 
   async listAudit() {
@@ -1667,14 +1711,7 @@ export class LocalPlatformService implements PlatformApi {
     refresh = (async () => {
       try {
         const quota = await this.options.execution.refreshWeeklyQuota(account);
-        this.options.accounts.updateWeeklyQuota(accountId, {
-          remainingPercent: quota.status === "KNOWN" ? quota.remainingPercent : null,
-          resetsAt:
-            quota.status === "KNOWN" && quota.resetsAt !== null
-              ? normalizeResetTimestamp(quota.resetsAt)
-              : null,
-          observedAt,
-        });
+        this.storeWeeklyQuota(accountId, quota, observedAt);
       } catch {
         // A stale quota already fails account eligibility. Transient network
         // failures must not be promoted to an account/authentication failure.
@@ -1686,6 +1723,17 @@ export class LocalPlatformService implements PlatformApi {
     })();
     this.quotaRefreshByAccount.set(accountId, refresh);
     return refresh;
+  }
+
+  private storeWeeklyQuota(accountId: string, quota: WeeklyQuota, observedAt: Date): void {
+    this.options.accounts.updateWeeklyQuota(accountId, {
+      remainingPercent: quota.status === "KNOWN" ? quota.remainingPercent : null,
+      resetsAt:
+        quota.status === "KNOWN" && quota.resetsAt !== null
+          ? normalizeResetTimestamp(quota.resetsAt)
+          : null,
+      observedAt,
+    });
   }
 }
 

@@ -44,8 +44,9 @@ interface RateLimitWindow {
   resetsAt: number | null;
 }
 
-interface RateLimitSnapshot {
+export interface RateLimitSnapshot {
   limitId: string | null;
+  limitName?: string | null;
   primary: RateLimitWindow | null;
   secondary: RateLimitWindow | null;
 }
@@ -102,22 +103,17 @@ export class CodexAppServerRuntime {
   async readWeeklyQuota(): Promise<WeeklyQuota> {
     const response = await this.rpc.request<RateLimitsResponse>("account/rateLimits/read");
     const snapshots = response.rateLimitsByLimitId
-      ? Object.values(response.rateLimitsByLimitId).filter(isRateLimitSnapshot)
+      ? Object.entries(response.rateLimitsByLimitId)
+          .filter((entry): entry is [string, RateLimitSnapshot] => isRateLimitSnapshot(entry[1]))
+          .sort(([leftKey, left], [rightKey, right]) => {
+            return codexBucketPriority(rightKey, right) - codexBucketPriority(leftKey, left);
+          })
+          .map(([, snapshot]) => snapshot)
       : [response.rateLimits];
 
     for (const snapshot of snapshots) {
-      for (const window of [snapshot.primary, snapshot.secondary]) {
-        if (window?.windowDurationMins !== 10_080) continue;
-        const usedPercent = clamp(window.usedPercent, 0, 100);
-        return {
-          status: "KNOWN",
-          limitId: snapshot.limitId,
-          usedPercent,
-          remainingPercent: 100 - usedPercent,
-          windowDurationMins: 10_080,
-          resetsAt: window.resetsAt,
-        };
-      }
+      const quota = weeklyQuotaFromRateLimitSnapshot(snapshot);
+      if (quota.status === "KNOWN") return quota;
     }
     return { status: "WEEKLY_QUOTA_UNKNOWN" };
   }
@@ -257,6 +253,31 @@ export class CodexAppServerRuntime {
   }
 }
 
+export function weeklyQuotaFromRateLimitSnapshot(snapshot: RateLimitSnapshot): WeeklyQuota {
+  for (const window of [snapshot.primary, snapshot.secondary]) {
+    if (window?.windowDurationMins !== 10_080) continue;
+    const usedPercent = clamp(window.usedPercent, 0, 100);
+    return {
+      status: "KNOWN",
+      limitId: snapshot.limitId,
+      usedPercent,
+      remainingPercent: 100 - usedPercent,
+      windowDurationMins: 10_080,
+      resetsAt: window.resetsAt,
+    };
+  }
+  return { status: "WEEKLY_QUOTA_UNKNOWN" };
+}
+
+function codexBucketPriority(key: string, snapshot: RateLimitSnapshot): number {
+  const candidates = [key, snapshot.limitId, snapshot.limitName]
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => value.trim().toLowerCase());
+  if (candidates.includes("codex")) return 2;
+  if (candidates.some((value) => value.includes("codex"))) return 1;
+  return 0;
+}
+
 function textInput(text: string) {
   return { type: "text" as const, text, text_elements: [] };
 }
@@ -338,6 +359,23 @@ function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
-function isRateLimitSnapshot(value: RateLimitSnapshot | undefined): value is RateLimitSnapshot {
-  return value !== undefined;
+export function isRateLimitSnapshot(value: unknown): value is RateLimitSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const snapshot = value as Record<string, unknown>;
+  return (
+    (snapshot.limitId === null || typeof snapshot.limitId === "string") &&
+    isRateLimitWindow(snapshot.primary) &&
+    isRateLimitWindow(snapshot.secondary)
+  );
+}
+
+function isRateLimitWindow(value: unknown): value is RateLimitWindow | null {
+  if (value === null) return true;
+  if (!value || typeof value !== "object") return false;
+  const window = value as Record<string, unknown>;
+  return (
+    typeof window.usedPercent === "number" &&
+    (window.windowDurationMins === null || typeof window.windowDurationMins === "number") &&
+    (window.resetsAt === null || typeof window.resetsAt === "number")
+  );
 }

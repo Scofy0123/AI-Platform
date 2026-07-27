@@ -63,8 +63,10 @@ export interface AccountSummary {
   activeUsers: number;
   maxUsers: number;
   weeklyRemainingPercent: number | null;
+  authStatus?: "AUTHENTICATED" | "UNAUTHENTICATED" | "EXPIRED";
   health: number;
   quotaUpdatedAt?: string | null;
+  quotaResetsAt?: string | null;
 }
 
 export interface AuditEntry {
@@ -207,7 +209,7 @@ export interface PlatformApi {
   addAccount(alias: string): Promise<{ id: string }>;
   accountAction(
     accountId: string,
-    action: "login" | "drain" | "quarantine" | "restore",
+    action: "login" | "drain" | "quarantine" | "restore" | "refresh-quota",
   ): Promise<unknown>;
   listAudit(): Promise<AuditEntry[]>;
 }

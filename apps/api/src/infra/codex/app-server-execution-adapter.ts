@@ -20,7 +20,12 @@ import {
 import type { ApprovalTransportIdentity } from "../../domain/platform-store.js";
 import type { ActorRegistry } from "../../tools/actor-registry.js";
 import type { DynamicToolCall, DynamicToolResponse } from "../../tools/tool-runtime.js";
-import type { DynamicToolDefinition, WeeklyQuota } from "./codex-runtime.js";
+import {
+  type DynamicToolDefinition,
+  isRateLimitSnapshot,
+  type WeeklyQuota,
+  weeklyQuotaFromRateLimitSnapshot,
+} from "./codex-runtime.js";
 import { CodexEventNormalizer } from "./event-normalizer.js";
 import type { CommandExecutionRequestApprovalResponse } from "./generated/v2/CommandExecutionRequestApprovalResponse.js";
 import type { FileChangeRequestApprovalResponse } from "./generated/v2/FileChangeRequestApprovalResponse.js";
@@ -469,6 +474,12 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       this.emit(params.success === true ? "accountAuthenticated" : "accountAuthFailed", {
         accountId,
       });
+      return;
+    }
+    if (message.method === "account/rateLimits/updated") {
+      if (!isRateLimitSnapshot(params.rateLimits)) return;
+      const quota = weeklyQuotaFromRateLimitSnapshot(params.rateLimits);
+      if (quota.status === "KNOWN") this.emit("accountQuotaUpdated", { accountId, quota });
       return;
     }
     const threadId = stringValue(params.threadId);

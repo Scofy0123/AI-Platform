@@ -1745,6 +1745,45 @@ describe("LocalPlatformService", () => {
     });
   });
 
+  test("stores real-time account quota notifications with a fresh observation time", async () => {
+    currentNow = new Date(NOW.getTime() + 90_000);
+
+    execution.emit("accountQuotaUpdated", {
+      accountId: "account-1",
+      quota: {
+        status: "KNOWN",
+        limitId: "codex",
+        usedPercent: 44,
+        remainingPercent: 56,
+        windowDurationMins: 10_080,
+        resetsAt: 1_785_225_600,
+      },
+    });
+
+    expect(accounts.list()[0]).toMatchObject({
+      weeklyRemaining: 56,
+      quotaUpdatedAt: currentNow.toISOString(),
+    });
+  });
+
+  test("lets an administrator force a fresh account quota read", async () => {
+    currentNow = new Date(NOW.getTime() + 120_000);
+    execution.refreshWeeklyQuota.mockResolvedValueOnce({
+      status: "KNOWN",
+      limitId: "codex",
+      usedPercent: 45,
+      remainingPercent: 55,
+      windowDurationMins: 10_080,
+      resetsAt: 1_785_225_600,
+    });
+
+    await expect(service.refreshAccountQuotaNow("account-1", "user-1")).resolves.toMatchObject({
+      weeklyRemaining: 55,
+      quotaUpdatedAt: currentNow.toISOString(),
+    });
+    expect(execution.refreshWeeklyQuota).toHaveBeenCalledTimes(1);
+  });
+
   test("keeps an authenticated account available after a transient quota refresh failure", async () => {
     execution.refreshWeeklyQuota.mockRejectedValueOnce(new Error("temporary network failure"));
     const staleAt = new Date(NOW.getTime() + 6 * 60_000);

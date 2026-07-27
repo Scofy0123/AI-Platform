@@ -72,6 +72,43 @@ describe("CodexAppServerRuntime", () => {
     });
   });
 
+  test("prefers the codex weekly bucket when multiple seven-day limits are returned", async () => {
+    const rpc = new FakeRpc({
+      "account/rateLimits/read": {
+        rateLimits: {
+          limitId: "legacy",
+          primary: { usedPercent: 100, windowDurationMins: 10_080, resetsAt: 1 },
+          secondary: null,
+        },
+        rateLimitsByLimitId: {
+          other: {
+            limitId: "other",
+            limitName: "Other product",
+            primary: { usedPercent: 100, windowDurationMins: 10_080, resetsAt: 2 },
+            secondary: null,
+          },
+          codex: {
+            limitId: "codex",
+            limitName: "Codex",
+            primary: { usedPercent: 42, windowDurationMins: 10_080, resetsAt: 3 },
+            secondary: null,
+          },
+        },
+        rateLimitResetCredits: null,
+      },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await expect(runtime.readWeeklyQuota()).resolves.toEqual({
+      status: "KNOWN",
+      limitId: "codex",
+      usedPercent: 42,
+      remainingPercent: 58,
+      windowDurationMins: 10_080,
+      resetsAt: 3,
+    });
+  });
+
   test("returns WEEKLY_QUOTA_UNKNOWN rather than substituting a short window", async () => {
     const rpc = new FakeRpc({
       "account/rateLimits/read": {

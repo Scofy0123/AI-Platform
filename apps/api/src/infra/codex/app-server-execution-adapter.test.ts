@@ -1491,6 +1491,60 @@ describe("AppServerExecutionAdapter", () => {
     await expect(adapter.refreshWeeklyQuota(account)).resolves.toMatchObject({ status: "KNOWN" });
   });
 
+  test("emits an account quota update from an exact Codex weekly limit notification", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const quotaUpdated = vi.fn();
+    adapter.on("accountQuotaUpdated", quotaUpdated);
+    await adapter.refreshWeeklyQuota({
+      id: "account-1",
+      alias: "Codex A",
+      codexHome: "/tmp/account-1",
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+      activeUsers: 0,
+      activeTurns: 0,
+      maxActiveUsers: 4,
+      weeklyRemaining: 58,
+      quotaUpdatedAt: null,
+      quotaResetsAt: null,
+      allowUnknownQuota: false,
+      healthScore: 100,
+    });
+
+    rpc.emit("notification", {
+      method: "account/rateLimits/updated",
+      params: {
+        rateLimits: {
+          limitId: "codex",
+          limitName: "Codex",
+          primary: { usedPercent: 44, windowDurationMins: 10_080, resetsAt: 123 },
+          secondary: null,
+        },
+      },
+    });
+
+    expect(quotaUpdated).toHaveBeenCalledWith({
+      accountId: "account-1",
+      quota: {
+        status: "KNOWN",
+        limitId: "codex",
+        usedPercent: 44,
+        remainingPercent: 56,
+        windowDurationMins: 10_080,
+        resetsAt: 123,
+      },
+    });
+  });
+
   test("detaches a crashed account boundary and delegates persisted recovery once", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();

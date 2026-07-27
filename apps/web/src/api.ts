@@ -36,7 +36,9 @@ interface RawAccount {
   maxActiveUsers: number;
   weeklyRemaining: number | null;
   healthScore: number;
+  authStatus?: AccountSummary["authStatus"];
   quotaUpdatedAt?: string | null;
+  quotaResetsAt?: string | null;
 }
 
 interface RawAudit {
@@ -211,8 +213,10 @@ export const httpApi: PlatformApi = {
       activeUsers: account.activeUsers,
       maxUsers: account.maxActiveUsers,
       weeklyRemainingPercent: account.weeklyRemaining,
+      ...(account.authStatus ? { authStatus: account.authStatus } : {}),
       health: account.healthScore,
       quotaUpdatedAt: account.quotaUpdatedAt ?? null,
+      quotaResetsAt: account.quotaResetsAt ?? null,
     }));
   },
   addAccount: (alias) =>

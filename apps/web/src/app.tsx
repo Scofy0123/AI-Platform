@@ -2528,7 +2528,7 @@ function AccountsPage() {
       name,
     }: {
       id: string;
-      name: "login" | "drain" | "quarantine" | "restore";
+      name: "login" | "drain" | "quarantine" | "restore" | "refresh-quota";
     }) => api.accountAction(id, name),
     onSuccess: async (result) => {
       if (
@@ -2600,9 +2600,11 @@ function AccountCard({
 }: {
   account: AccountSummary;
   actionPending: boolean;
-  onAction: (action: "login" | "drain" | "quarantine" | "restore") => void;
+  onAction: (action: "login" | "drain" | "quarantine" | "restore" | "refresh-quota") => void;
 }) {
   const restorable = account.status === "DRAINING" || account.status === "QUARANTINED";
+  const quotaUsed =
+    account.weeklyRemainingPercent === null ? null : 100 - account.weeklyRemainingPercent;
   return (
     <article className="v11-account-card">
       <header>
@@ -2617,16 +2619,29 @@ function AccountCard({
         </strong>
       </div>
       <div>
-        <span>周额度</span>
-        <strong>
-          {account.weeklyRemainingPercent === null
-            ? "待确认"
-            : `周额度剩余 ${account.weeklyRemainingPercent}%`}
-        </strong>
+        <span>本周额度</span>
+        {quotaUsed === null ? (
+          <strong>待确认</strong>
+        ) : (
+          <strong className="v11-quota-values">
+            <span>本周已用 {quotaUsed}%</span>
+            <span>剩余 {account.weeklyRemainingPercent}%</span>
+          </strong>
+        )}
       </div>
       <div>
-        <span>健康度</span>
-        <strong>{account.health}%</strong>
+        <span>认证状态</span>
+        <strong>{accountAuthLabel(account)}</strong>
+      </div>
+      <div className="v11-account-quota-times">
+        <span>
+          额度更新{" "}
+          {account.quotaUpdatedAt ? formatAccountTimestamp(account.quotaUpdatedAt) : "尚未采集"}
+        </span>
+        <span>
+          下次重置{" "}
+          {account.quotaResetsAt ? formatAccountTimestamp(account.quotaResetsAt) : "待确认"}
+        </span>
       </div>
       <footer className="v11-account-actions">
         {restorable ? (
@@ -2643,12 +2658,37 @@ function AccountCard({
             </button>
           </>
         )}
+        <button
+          type="button"
+          disabled={actionPending || account.authStatus === "UNAUTHENTICATED"}
+          onClick={() => onAction("refresh-quota")}
+        >
+          刷新额度
+        </button>
         <button type="button" disabled={actionPending} onClick={() => onAction("login")}>
           {account.status === "REAUTH_REQUIRED" ? "登录 Codex" : "重新认证"}
         </button>
       </footer>
     </article>
   );
+}
+
+function accountAuthLabel(account: AccountSummary): string {
+  if (account.authStatus === "AUTHENTICATED") return "已认证";
+  if (account.authStatus === "EXPIRED" || account.status === "REAUTH_REQUIRED") return "认证已失效";
+  if (account.authStatus === "UNAUTHENTICATED") return "未认证";
+  return "状态待确认";
+}
+
+function formatAccountTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "时间异常";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
 }
 
 function AuditPage() {

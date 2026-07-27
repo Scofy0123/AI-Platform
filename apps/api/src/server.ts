@@ -523,6 +523,13 @@ function registerRoutes(
     return platform.loginAccount(id, actor.user.id);
   });
 
+  app.post("/api/admin/accounts/:id/refresh-quota", async (request, reply) => {
+    const actor = requireAdminWrite(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    return platform.refreshAccountQuotaNow(id, actor.user.id);
+  });
+
   app.post("/api/admin/accounts/:id/:action", async (request, reply) => {
     const actor = requireAdminWrite(request, reply, auth);
     if (!actor) return;

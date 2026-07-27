@@ -79,6 +79,7 @@ export interface PlatformApi {
   listAccounts(): Promise<unknown>;
   addAccount(input: { alias: string }, adminUserId: string): Promise<unknown>;
   loginAccount(accountId: string, adminUserId: string): Promise<unknown>;
+  refreshAccountQuotaNow(accountId: string, adminUserId: string): Promise<unknown>;
   setAccountState(
     accountId: string,
     state: "DRAINING" | "QUARANTINED" | "AVAILABLE",
