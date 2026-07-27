@@ -34,6 +34,57 @@ function transcriptGroup(rows: TranscriptRow[]): TranscriptGroup {
 }
 
 describe("Transcript", () => {
+  test("keeps the final answer visible while completed execution details are collapsed", () => {
+    const prompt: TranscriptRow = {
+      ...IDENTITY,
+      id: "user",
+      itemId: "user:turn-1",
+      kind: "user",
+      text: "修复运行时",
+    };
+    const commentary: TranscriptRow = {
+      ...IDENTITY,
+      id: "commentary",
+      itemId: "commentary-1",
+      kind: "assistant",
+      messagePhase: "commentary",
+      text: "我正在检查运行链路。",
+    };
+    const finalAnswer: TranscriptRow = {
+      ...IDENTITY,
+      id: "final",
+      itemId: "final-1",
+      kind: "assistant",
+      messagePhase: "final_answer",
+      text: "运行链路已修复。",
+    };
+    const completed = transcriptGroup([prompt, commentary, finalAnswer]);
+    completed.prompt = prompt;
+    completed.executionRows = [commentary];
+    completed.finalAnswer = finalAnswer;
+    completed.completedAt = "2026-07-27T12:00:12.000Z";
+    completed.durationMs = 12_000;
+    completed.status = "COMPLETED";
+    completed.defaultExpanded = false;
+
+    render(
+      <Transcript
+        groups={[completed]}
+        onOpenBottom={vi.fn()}
+        onOpenSide={vi.fn()}
+        renderApproval={() => null}
+      />,
+    );
+
+    expect(screen.getByText("修复运行时")).toBeInTheDocument();
+    expect(screen.getByText("运行链路已修复。")).toBeInTheDocument();
+    expect(screen.queryByText("我正在检查运行链路。")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Worked for 12s" }));
+
+    expect(screen.getByText("我正在检查运行链路。")).toBeInTheDocument();
+  });
+
   test("renders a continuous conversation and opens evidence in dedicated panels", () => {
     const groups: TranscriptGroup[] = [
       transcriptGroup([

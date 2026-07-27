@@ -6,6 +6,7 @@ import type {
 } from "../../thread-presentation.js";
 import type { BottomPanelTab, SidePanelTab } from "../../workspace-layout.js";
 import { SafeMarkdown } from "./SafeMarkdown.js";
+import { TurnExecutionGroup } from "./TurnExecutionGroup.js";
 
 interface TranscriptProps {
   groups: TranscriptGroup[];
@@ -36,16 +37,38 @@ export function Transcript({
     <div className="codex-transcript" role="log" aria-live="polite" aria-busy={busy}>
       {groups.map((group) => (
         <section className="codex-transcript-turn" key={group.id}>
-          {group.rows.map((row) => (
+          {group.prompt ? (
             <TranscriptRowView
-              row={row}
+              row={group.prompt}
               onOpenBottom={onOpenBottom}
               onOpenSide={onOpenSide}
               {...(onOpenSubagent ? { onOpenSubagent } : {})}
               renderApproval={renderApproval}
-              key={row.id}
             />
-          ))}
+          ) : null}
+          <TurnExecutionGroup group={group}>
+            {group.executionRows.map((row) => (
+              <TranscriptRowView
+                row={row}
+                onOpenBottom={onOpenBottom}
+                onOpenSide={onOpenSide}
+                {...(onOpenSubagent ? { onOpenSubagent } : {})}
+                renderApproval={renderApproval}
+                key={row.id}
+              />
+            ))}
+          </TurnExecutionGroup>
+          {group.finalAnswer ? (
+            <div className="codex-turn-final-answer">
+              <TranscriptRowView
+                row={group.finalAnswer}
+                onOpenBottom={onOpenBottom}
+                onOpenSide={onOpenSide}
+                {...(onOpenSubagent ? { onOpenSubagent } : {})}
+                renderApproval={renderApproval}
+              />
+            </div>
+          ) : null}
         </section>
       ))}
     </div>

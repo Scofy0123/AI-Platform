@@ -452,6 +452,11 @@ describe("Thread presentation projection", () => {
     expect(rows.filter((row) => row.kind === "approval")).toEqual([
       expect.objectContaining({ itemId: "approval-command-1", status: "accepted" }),
     ]);
+    expect(presentation.transcript.groups[0]?.executionRows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "user", itemId: "steer-1", text: "Check tests too." }),
+      ]),
+    );
     expect(presentation.transcript.activities.map((row) => row.kind)).toEqual([
       "command",
       "tool",

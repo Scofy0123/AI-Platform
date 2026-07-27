@@ -309,7 +309,7 @@ export function projectThreadPresentation(
         )
         .at(-1) as TranscriptMessageRow | undefined) ?? null;
     group.executionRows = group.rows.filter(
-      (row) => row !== group.prompt && row !== group.finalAnswer && row.kind !== "user",
+      (row) => row !== group.prompt && row !== group.finalAnswer,
     );
     group.currentAction = deriveCurrentAction(group.executionRows, group.status);
     group.defaultExpanded = !(
