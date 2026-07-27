@@ -2019,6 +2019,7 @@ const PUBLIC_EVENT_PAYLOAD_KEYS = {
   TURN_INTERRUPTED: ["status"],
   USER_MESSAGE: ["itemId", "kind", "text"],
   AGENT_MESSAGE_DELTA: ["itemId", "delta"],
+  AGENT_MESSAGE_PHASE: ["itemId", "phase"],
   REASONING_SUMMARY_DELTA: ["itemId", "delta"],
   PLAN_UPDATED: ["explanation", "plan"],
   COMMAND_STARTED: ["itemId", "command", "cwd"],
@@ -2086,6 +2087,7 @@ function sanitizeTaskEventPayload<Type extends TaskEventType>(
 const EVENT_TYPES_REQUIRING_STABLE_ITEM_ID = new Set<TaskEventType>([
   "USER_MESSAGE",
   "AGENT_MESSAGE_DELTA",
+  "AGENT_MESSAGE_PHASE",
   "REASONING_SUMMARY_DELTA",
   "COMMAND_STARTED",
   "COMMAND_OUTPUT",

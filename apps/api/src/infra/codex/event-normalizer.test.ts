@@ -128,6 +128,55 @@ describe("CodexEventNormalizer", () => {
     expect(events.map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5, 6]);
   });
 
+  test("normalizes agent message phase metadata without copying message or reasoning content", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+    const started = normalizer.normalizeNotification({
+      method: "item/started",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "agentMessage",
+          id: "message-1",
+          text: "Visible final answer",
+          phase: "final_answer",
+          content: "private content",
+          encrypted_content: "ciphertext",
+        },
+      },
+    });
+    const completedWithUnknownPhase = normalizer.normalizeNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "agentMessage",
+          id: "message-2",
+          text: "Visible commentary",
+          phase: null,
+          reasoningTextDelta: "private reasoning",
+        },
+      },
+    });
+
+    expect(started).toEqual([
+      expect.objectContaining({
+        type: "AGENT_MESSAGE_PHASE",
+        payload: { itemId: "message-1", phase: "final_answer" },
+      }),
+    ]);
+    expect(completedWithUnknownPhase).toEqual([
+      expect.objectContaining({
+        type: "AGENT_MESSAGE_PHASE",
+        payload: { itemId: "message-2", phase: null },
+      }),
+    ]);
+    expect(JSON.stringify({ started, completedWithUnknownPhase })).not.toMatch(
+      /Visible final answer|Visible commentary|private content|ciphertext|private reasoning/,
+    );
+  });
+
   test("normalizes command completion, dynamic tools, approvals, and turn failure", () => {
     const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
     const command = normalizer.normalizeNotification({

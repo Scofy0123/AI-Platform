@@ -204,6 +204,44 @@ describe("SQLitePlatformStore", () => {
     expect(store.listTaskEvents(task.id, "user-2", 0)).toBeNull();
   });
 
+  test("persists only safe agent message phase metadata", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Message phases",
+      now: NOW,
+    });
+
+    store.appendTaskEvent({
+      taskId: task.id,
+      threadId: "runtime-thread-1",
+      turnId: "runtime-turn-1",
+      type: "AGENT_MESSAGE_PHASE",
+      payload: {
+        itemId: "message-1",
+        phase: "final_answer",
+        text: "must not persist",
+        encrypted_content: "ciphertext",
+      } as never,
+      now: NOW,
+    });
+
+    expect(store.listTaskEvents(task.id, "user-1", 0)).toEqual([
+      expect.objectContaining({
+        itemId: "message-1",
+        payload: { itemId: "message-1", phase: "final_answer" },
+      }),
+    ]);
+    expect(
+      JSON.stringify(
+        database.sqlite
+          .prepare("SELECT payload_json FROM task_events WHERE task_id = ?")
+          .get(task.id),
+      ),
+    ).not.toMatch(/must not persist|ciphertext|encrypted_content/);
+  });
+
   test("derives stable item boundaries for events without a protocol item id", () => {
     const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
     const task = store.createTask({

@@ -195,6 +195,14 @@ export class CodexEventNormalizer {
     turnId: string | null,
   ): TaskEvent[] {
     if (!stableItemId(item.id)) return [];
+    if (item.type === "agentMessage") {
+      return [
+        this.event("AGENT_MESSAGE_PHASE", threadId, turnId, {
+          itemId: stringOrEmpty(item.id),
+          phase: normalizeAgentMessagePhase(item.phase),
+        }),
+      ];
+    }
     if (item.type === "commandExecution") {
       return [
         this.event("COMMAND_STARTED", threadId, turnId, {
@@ -225,6 +233,14 @@ export class CodexEventNormalizer {
     turnId: string | null,
   ): TaskEvent[] {
     if (!stableItemId(item.id)) return [];
+    if (item.type === "agentMessage") {
+      return [
+        this.event("AGENT_MESSAGE_PHASE", threadId, turnId, {
+          itemId: stringOrEmpty(item.id),
+          phase: normalizeAgentMessagePhase(item.phase),
+        }),
+      ];
+    }
     if (item.type === "commandExecution") {
       return [
         this.event("COMMAND_COMPLETED", threadId, turnId, {
@@ -421,6 +437,12 @@ function normalizeSubagentStatus(
   if (toolStatus === "completed") return "DONE";
   if (toolStatus === "failed") return "FAILED";
   return "UNKNOWN";
+}
+
+function normalizeAgentMessagePhase(
+  value: unknown,
+): TaskEventPayloadMap["AGENT_MESSAGE_PHASE"]["phase"] {
+  return value === "commentary" || value === "final_answer" ? value : null;
 }
 
 function normalizeModelRerouteReason(
