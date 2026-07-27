@@ -152,6 +152,18 @@ describe("Thread event projection", () => {
     ).toBe(true);
     expect(
       isSafeConversationEvent({
+        taskId: "thread-1",
+        threadId: "runtime-thread-1",
+        turnId: "turn-1",
+        itemId: "message-1",
+        sequence: 2,
+        timestamp: "2026-07-25T12:00:02.000Z",
+        type: "AGENT_MESSAGE_PHASE",
+        payload: { itemId: "message-1", phase: "final_answer" },
+      }),
+    ).toBe(true);
+    expect(
+      isSafeConversationEvent({
         ...delta(2, { text: "ignored" }),
         type: "PLAN_UPDATED",
         payload: {

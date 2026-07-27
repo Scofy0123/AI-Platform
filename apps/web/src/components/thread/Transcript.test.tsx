@@ -3,7 +3,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import type { TranscriptGroup } from "../../thread-presentation.js";
+import type { TranscriptGroup, TranscriptRow } from "../../thread-presentation.js";
 import { Transcript } from "./Transcript.js";
 
 const IDENTITY = {
@@ -15,14 +15,28 @@ const IDENTITY = {
 
 afterEach(cleanup);
 
+function transcriptGroup(rows: TranscriptRow[]): TranscriptGroup {
+  return {
+    id: "thread-1:turn-1",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    rows,
+    prompt: (rows.find((row) => row.kind === "user") as TranscriptGroup["prompt"]) ?? null,
+    executionRows: rows.filter((row) => row.kind !== "user"),
+    finalAnswer: null,
+    startedAt: "2026-07-27T12:00:00.000Z",
+    completedAt: null,
+    durationMs: null,
+    status: "RUNNING",
+    currentAction: "Thinking",
+    defaultExpanded: true,
+  };
+}
+
 describe("Transcript", () => {
   test("renders a continuous conversation and opens evidence in dedicated panels", () => {
     const groups: TranscriptGroup[] = [
-      {
-        id: "thread-1:turn-1",
-        threadId: "thread-1",
-        turnId: "turn-1",
-        rows: [
+      transcriptGroup([
           {
             ...IDENTITY,
             id: "user",
@@ -87,8 +101,7 @@ describe("Transcript", () => {
             status: "DONE",
             resultSummary: "代码审查完成",
           },
-        ],
-      },
+      ]),
     ];
     const openBottom = vi.fn();
     const openSide = vi.fn();
@@ -129,11 +142,7 @@ describe("Transcript", () => {
 
   test("shows nested Subagent activity as read-only when no navigation handler is available", () => {
     const groups: TranscriptGroup[] = [
-      {
-        id: "agent-thread:agent-turn",
-        threadId: "agent-thread",
-        turnId: "agent-turn",
-        rows: [
+      transcriptGroup([
           {
             ...IDENTITY,
             id: "nested-subagent",
@@ -146,8 +155,7 @@ describe("Transcript", () => {
             status: "ACTIVE",
             resultSummary: null,
           },
-        ],
-      },
+      ]),
     ];
 
     render(
@@ -165,11 +173,7 @@ describe("Transcript", () => {
 
   test("uses safe Markdown for user, assistant, and reasoning summary rows", () => {
     const groups: TranscriptGroup[] = [
-      {
-        id: "thread-1:turn-1",
-        threadId: "thread-1",
-        turnId: "turn-1",
-        rows: [
+      transcriptGroup([
           {
             ...IDENTITY,
             id: "user-markdown",
@@ -191,8 +195,7 @@ describe("Transcript", () => {
             kind: "reasoning-summary",
             text: "`inspect` then [run](javascript:alert(1))",
           },
-        ],
-      },
+      ]),
     ];
 
     render(

@@ -26,6 +26,7 @@ interface TranscriptRowBase {
 
 export interface TranscriptMessageRow extends TranscriptRowBase {
   kind: "user" | "assistant" | "reasoning-summary";
+  messagePhase?: "commentary" | "final_answer" | null;
 }
 
 export interface TranscriptPlanRow extends TranscriptRowBase {
@@ -95,6 +96,15 @@ export interface TranscriptGroup {
   threadId: string | null;
   turnId: string | null;
   rows: TranscriptRow[];
+  prompt: TranscriptMessageRow | null;
+  executionRows: TranscriptRow[];
+  finalAnswer: TranscriptMessageRow | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  durationMs: number | null;
+  status: Turn["status"] | "UNKNOWN";
+  currentAction: string;
+  defaultExpanded: boolean;
 }
 
 export interface PlanDetail {
@@ -209,6 +219,7 @@ const PRESENTABLE_EVENT_TYPES = new Set<string>([
   "TURN_INTERRUPTED",
   "USER_MESSAGE",
   "AGENT_MESSAGE_DELTA",
+  "AGENT_MESSAGE_PHASE",
   "REASONING_SUMMARY_DELTA",
   "PLAN_UPDATED",
   "COMMAND_STARTED",
@@ -245,6 +256,10 @@ export function projectThreadPresentation(
 ): ThreadPresentation {
   const merged = normalizePresentationEvents(events);
   const orderedTurns = orderTurns(turns);
+  const turnsByGroupId = new Map(
+    orderedTurns.map((turn) => [groupId(turn.threadId, turn.id), turn] as const),
+  );
+  const messagePhases = collectAgentMessagePhases(merged);
   const rowsById = new Map<string, TranscriptRow>();
   const approvalRows = new Map<string, string>();
 
@@ -259,20 +274,23 @@ export function projectThreadPresentation(
   }
 
   for (const event of merged) {
-    projectEventRow(event, rowsById, approvalRows);
+    projectEventRow(event, rowsById, approvalRows, messagePhases);
   }
 
   const groupsById = new Map<string, TranscriptGroup>();
   const groupOrder: string[] = [];
   for (const turn of orderedTurns) {
     const id = groupId(turn.threadId, turn.id);
-    groupsById.set(id, { id, threadId: turn.threadId, turnId: turn.id, rows: [] });
+    groupsById.set(id, emptyTranscriptGroup(id, turn.threadId, turn.id, turn));
     groupOrder.push(id);
   }
   for (const row of rowsById.values()) {
     const id = groupId(row.threadId, row.turnId);
     if (!groupsById.has(id)) {
-      groupsById.set(id, { id, threadId: row.threadId, turnId: row.turnId, rows: [] });
+      groupsById.set(
+        id,
+        emptyTranscriptGroup(id, row.threadId, row.turnId, turnsByGroupId.get(id)),
+      );
       groupOrder.push(id);
     }
     groupsById.get(id)?.rows.push(row);
@@ -281,6 +299,22 @@ export function projectThreadPresentation(
   const groups = groupOrder.map((id) => {
     const group = groupsById.get(id) as TranscriptGroup;
     group.rows.sort(compareRows);
+    group.prompt =
+      (group.rows.find((row) => row.kind === "user") as TranscriptMessageRow | undefined) ?? null;
+    group.finalAnswer =
+      (group.rows
+        .filter(
+          (row): row is TranscriptMessageRow =>
+            row.kind === "assistant" && row.messagePhase === "final_answer",
+        )
+        .at(-1) as TranscriptMessageRow | undefined) ?? null;
+    group.executionRows = group.rows.filter(
+      (row) => row !== group.prompt && row !== group.finalAnswer && row.kind !== "user",
+    );
+    group.currentAction = deriveCurrentAction(group.executionRows, group.status);
+    group.defaultExpanded = !(
+      group.status === "COMPLETED" && group.finalAnswer !== null
+    );
     return group;
   });
   const rows = groups.flatMap((group) => group.rows);
@@ -563,6 +597,7 @@ function projectEventRow(
   event: TaskEvent,
   rows: Map<string, TranscriptRow>,
   approvalRows: Map<string, string>,
+  messagePhases: Map<string, "commentary" | "final_answer" | null>,
 ): void {
   const sourceItemId = eventItemId(event);
   const itemId = preservesEveryRuntimeNotice(event.type)
@@ -582,7 +617,14 @@ function projectEventRow(
       rows.set(id, { ...identity, kind: "user", text: event.payload.text });
       return;
     case "AGENT_MESSAGE_DELTA":
-      rows.set(id, { ...identity, kind: "assistant", text: event.payload.delta });
+      rows.set(id, {
+        ...identity,
+        kind: "assistant",
+        text: event.payload.delta,
+        messagePhase: messagePhases.get(messagePhaseKey(event)) ?? null,
+      });
+      return;
+    case "AGENT_MESSAGE_PHASE":
       return;
     case "REASONING_SUMMARY_DELTA":
       rows.set(id, { ...identity, kind: "reasoning-summary", text: event.payload.delta });
@@ -773,6 +815,79 @@ function projectEventRow(
       return;
     }
   }
+}
+
+function collectAgentMessagePhases(
+  events: TaskEvent[],
+): Map<string, "commentary" | "final_answer" | null> {
+  const phases = new Map<string, "commentary" | "final_answer" | null>();
+  for (const event of events) {
+    if (event.type !== "AGENT_MESSAGE_PHASE") continue;
+    phases.set(messagePhaseKey(event), event.payload.phase);
+  }
+  return phases;
+}
+
+function messagePhaseKey(event: TaskEvent): string {
+  return [
+    event.taskId,
+    event.threadId ?? "no-thread",
+    event.turnId ?? "no-turn",
+    eventItemId(event),
+  ].join("\u0000");
+}
+
+function emptyTranscriptGroup(
+  id: string,
+  threadId: string | null,
+  turnId: string | null,
+  turn?: Turn,
+): TranscriptGroup {
+  return {
+    id,
+    threadId,
+    turnId,
+    rows: [],
+    prompt: null,
+    executionRows: [],
+    finalAnswer: null,
+    startedAt: turn?.startedAt ?? null,
+    completedAt: turn?.completedAt ?? null,
+    durationMs: turn?.durationMs ?? null,
+    status: turn?.status ?? "UNKNOWN",
+    currentAction: "Thinking",
+    defaultExpanded: true,
+  };
+}
+
+function deriveCurrentAction(rows: TranscriptRow[], status: TranscriptGroup["status"]): string {
+  if (status === "WAITING_APPROVAL" || rows.some(isPendingApprovalRow)) {
+    return "Waiting for approval";
+  }
+  const subagent = rows.find(
+    (row): row is TranscriptSubagentRow => row.kind === "subagent" && row.status === "ACTIVE",
+  );
+  if (subagent) return subagent.name ? `Delegating to ${subagent.name}` : "Delegating";
+  const tool = rows.find(
+    (row): row is TranscriptToolRow => row.kind === "tool" && row.status === "running",
+  );
+  if (tool) return `Using ${tool.tool}`;
+  const command = rows.find(
+    (row): row is TranscriptCommandRow => row.kind === "command" && row.status === "running",
+  );
+  if (command) return command.command ? `Running ${command.command}` : "Running command";
+  if (
+    rows.some(
+      (row) => row.kind === "status" && row.status === "context-compacted",
+    )
+  ) {
+    return "Compacting context";
+  }
+  return "Thinking";
+}
+
+function isPendingApprovalRow(row: TranscriptRow): row is TranscriptApprovalRow {
+  return row.kind === "approval" && row.status === "pending";
 }
 
 function preservesEveryRuntimeNotice(type: TaskEventType): boolean {

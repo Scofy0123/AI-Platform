@@ -76,6 +76,119 @@ function subagent(parentTurnId: string): SubagentThread {
 }
 
 describe("Thread presentation projection", () => {
+  test("separates Codex commentary execution from the final answer independent of phase arrival order", () => {
+    const presentation = projectThreadPresentation(
+      [
+        event({
+          sequence: 1,
+          turnId: "turn-1",
+          itemId: "turn:turn-1",
+          type: "TURN_STARTED",
+          payload: { status: "inProgress" },
+        }),
+        event({
+          sequence: 2,
+          turnId: "turn-1",
+          itemId: "message-commentary",
+          type: "AGENT_MESSAGE_DELTA",
+          payload: { itemId: "message-commentary", delta: "I’m inspecting the runtime." },
+        }),
+        event({
+          sequence: 3,
+          turnId: "turn-1",
+          itemId: "message-commentary",
+          type: "AGENT_MESSAGE_PHASE",
+          payload: { itemId: "message-commentary", phase: "commentary" },
+        }),
+        event({
+          sequence: 4,
+          turnId: "turn-1",
+          itemId: "cmd-1",
+          type: "COMMAND_STARTED",
+          payload: { itemId: "cmd-1", command: "pnpm test", cwd: "/repo" },
+        }),
+        event({
+          sequence: 5,
+          turnId: "turn-1",
+          itemId: "cmd-1",
+          type: "COMMAND_COMPLETED",
+          payload: {
+            itemId: "cmd-1",
+            command: "pnpm test",
+            aggregatedOutput: "PASS",
+            exitCode: 0,
+            durationMs: 1_000,
+          },
+        }),
+        event({
+          sequence: 6,
+          turnId: "turn-1",
+          itemId: "message-final",
+          type: "AGENT_MESSAGE_PHASE",
+          payload: { itemId: "message-final", phase: "final_answer" },
+        }),
+        event({
+          sequence: 7,
+          turnId: "turn-1",
+          itemId: "message-final",
+          type: "AGENT_MESSAGE_DELTA",
+          payload: { itemId: "message-final", delta: "The runtime is fixed." },
+        }),
+        event({
+          sequence: 8,
+          turnId: "turn-1",
+          itemId: "turn:turn-1",
+          type: "TURN_COMPLETED",
+          payload: { status: "completed", durationMs: 59_000 },
+        }),
+      ],
+      [turn("turn-1", "Fix the runtime")],
+      [],
+    );
+
+    expect(presentation.transcript.groups[0]).toMatchObject({
+      prompt: expect.objectContaining({ kind: "user", text: "Fix the runtime" }),
+      executionRows: [
+        expect.objectContaining({
+          kind: "assistant",
+          itemId: "message-commentary",
+          messagePhase: "commentary",
+        }),
+        expect.objectContaining({ kind: "command", itemId: "cmd-1" }),
+        expect.objectContaining({ kind: "status", status: "completed" }),
+      ],
+      finalAnswer: expect.objectContaining({
+        kind: "assistant",
+        itemId: "message-final",
+        text: "The runtime is fixed.",
+        messagePhase: "final_answer",
+      }),
+      startedAt: "2026-07-27T12:00:01.000Z",
+      completedAt: "2026-07-27T12:01:00.000Z",
+      durationMs: 59_000,
+      status: "COMPLETED",
+      currentAction: "Thinking",
+      defaultExpanded: false,
+    });
+  });
+
+  test.each(["FAILED", "INTERRUPTED", "NEEDS_RECOVERY"] as const)(
+    "keeps a %s Turn execution process expanded",
+    (status) => {
+      const presentation = projectThreadPresentation(
+        [],
+        [turn("turn-1", "Recover it", status)],
+        [],
+      );
+
+      expect(presentation.transcript.groups[0]).toMatchObject({
+        status,
+        defaultExpanded: true,
+        finalAnswer: null,
+      });
+    },
+  );
+
   test("coalesces message deltas within an exact Thread, Turn and Item boundary", () => {
     const presentation = projectThreadPresentation(
       [
