@@ -277,6 +277,7 @@ function createApi(session: Session = adminSession) {
         id: "account-1",
         alias: "Codex 01",
         status: "AVAILABLE",
+        authStatus: "AUTHENTICATED",
         activeUsers: 2,
         maxUsers: 4,
         weeklyRemainingPercent: 73,
@@ -399,6 +400,113 @@ describe("CodexPlatform 1.1 user workspace", () => {
     expect(document.body).not.toHaveTextContent("SECRET SHARED ACCOUNT");
     expect(document.body).not.toHaveTextContent("RAW_CHAIN_OF_THOUGHT");
     expect(screen.queryByRole("button", { name: /attach/i })).not.toBeInTheDocument();
+  });
+
+  test("renders a completed Codex Turn as collapsed execution followed by a visible final answer", async () => {
+    const api = createApi();
+    api.getThread.mockResolvedValue({
+      ...thread,
+      status: "COMPLETED",
+      currentTurn: {
+        ...thread.currentTurn,
+        status: "COMPLETED",
+        completedAt: "2026-07-25T12:00:12.000Z",
+        durationMs: 12_000,
+      },
+      turns: [
+        {
+          ...thread.turns[0],
+          status: "COMPLETED",
+          completedAt: "2026-07-25T12:00:12.000Z",
+          durationMs: 12_000,
+        },
+      ],
+      items: [
+        {
+          id: "commentary",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 1,
+          type: "AGENT_MESSAGE_DELTA",
+          timestamp: "2026-07-25T12:00:01.000Z",
+          payload: { itemId: "commentary", delta: "正在读取企业知识库。" },
+        },
+        {
+          id: "commentary-phase",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 2,
+          type: "AGENT_MESSAGE_PHASE",
+          timestamp: "2026-07-25T12:00:02.000Z",
+          payload: { itemId: "commentary", phase: "commentary" },
+        },
+        {
+          id: "tool",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 3,
+          type: "TOOL_STARTED",
+          timestamp: "2026-07-25T12:00:03.000Z",
+          payload: { itemId: "tool", tool: "feishu_doc_read", arguments: { id: "doc-1" } },
+        },
+        {
+          id: "tool-completed",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 4,
+          type: "TOOL_COMPLETED",
+          timestamp: "2026-07-25T12:00:04.000Z",
+          payload: {
+            itemId: "tool",
+            tool: "feishu_doc_read",
+            result: { title: "企业周报" },
+            durationMs: 240,
+          },
+        },
+        {
+          id: "final",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 5,
+          type: "AGENT_MESSAGE_DELTA",
+          timestamp: "2026-07-25T12:00:05.000Z",
+          payload: { itemId: "final", delta: "企业知识库摘要已经完成。" },
+        },
+        {
+          id: "final-phase",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 6,
+          type: "AGENT_MESSAGE_PHASE",
+          timestamp: "2026-07-25T12:00:06.000Z",
+          payload: { itemId: "final", phase: "final_answer" },
+        },
+        {
+          id: "turn-completed",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 7,
+          type: "TURN_COMPLETED",
+          timestamp: "2026-07-25T12:00:12.000Z",
+          payload: { status: "completed", durationMs: 12_000 },
+        },
+      ],
+    });
+
+    render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+
+    expect(await screen.findByText("企业知识库摘要已经完成。")).toBeInTheDocument();
+    expect(screen.queryByText("正在读取企业知识库。")).not.toBeInTheDocument();
+    const execution = screen.getByRole("button", { name: "Worked for 12s" });
+    expect(execution).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(execution);
+
+    expect(screen.getByText("正在读取企业知识库。")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /查看工具 .*feishu_doc_read/ }));
+    expect(await screen.findByRole("region", { name: "Side panel" })).toHaveTextContent(
+      "feishu_doc_read",
+    );
   });
 
   test("opens pinned summary, side panel and bottom panel as independent workspace surfaces", async () => {
@@ -1635,6 +1743,45 @@ describe("CodexPlatform 1.1 personal settings", () => {
 });
 
 describe("CodexPlatform 1.1 account administration", () => {
+  test("separates weekly quota from authentication state without presenting static health as usage", async () => {
+    const api = createApi();
+    api.listAccounts.mockResolvedValue([
+      {
+        id: "account-1",
+        alias: "Codex 01",
+        status: "AVAILABLE",
+        authStatus: "AUTHENTICATED",
+        activeUsers: 2,
+        maxUsers: 4,
+        weeklyRemainingPercent: 73,
+        quotaUpdatedAt: "2026-07-21T12:00:00.000Z",
+        quotaResetsAt: "2026-07-28T12:00:00.000Z",
+        health: 100,
+      },
+    ]);
+
+    render(<App initialEntries={["/admin/accounts"]} api={api} />);
+
+    expect(await screen.findByText("本周已用 27%")).toBeInTheDocument();
+    expect(screen.getByText("剩余 73%")).toBeInTheDocument();
+    expect(screen.getByText("已认证")).toBeInTheDocument();
+    expect(screen.getByText(/额度更新/)).toBeInTheDocument();
+    expect(screen.getByText(/下次重置/)).toBeInTheDocument();
+    expect(screen.queryByText("健康度")).not.toBeInTheDocument();
+    expect(screen.queryByText("100%")).not.toBeInTheDocument();
+  });
+
+  test("lets an administrator explicitly refresh the account quota", async () => {
+    const api = createApi();
+    render(<App initialEntries={["/admin/accounts"]} api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "刷新额度" }));
+
+    await waitFor(() =>
+      expect(api.accountAction).toHaveBeenCalledWith("account-1", "refresh-quota"),
+    );
+  });
+
   test("keeps account login, drain and quarantine controls in the admin console", async () => {
     const api = createApi();
     render(<App initialEntries={["/admin/accounts"]} api={api} />);

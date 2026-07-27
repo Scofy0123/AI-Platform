@@ -45,6 +45,10 @@ test("Codex workspace completes two Turns in the same Thread with distinct Item 
   expect(threadId).toBeTruthy();
   await expect(page.getByRole("heading", { name: firstPrompt })).toBeVisible();
   const conversation = page.getByLabel("Thread conversation");
+  await expect(page.getByText(`Fake Runtime completed: ${firstPrompt}`)).toBeVisible();
+  const firstExecution = conversation.getByRole("button", { name: /^Worked for / }).first();
+  await expect(firstExecution).toHaveAttribute("aria-expanded", "false");
+  await firstExecution.click();
   await expect(conversation.getByText("已更新计划", { exact: true })).toBeVisible();
   await expect(
     conversation.getByRole("button", { name: /^查看命令 .*printf fake-codexplatform/ }),
@@ -56,7 +60,6 @@ test("Codex workspace completes two Turns in the same Thread with distinct Item 
     conversation.getByRole("button", { name: "查看文件变更 0 files changed" }),
   ).toBeVisible();
   await expect(conversation.getByRole("status").filter({ hasText: "本轮已完成" })).toBeVisible();
-  await expect(page.getByText(`Fake Runtime completed: ${firstPrompt}`)).toBeVisible();
 
   const secondPrompt = "第二轮继续验证同一 Thread";
   await page.getByLabel("Message Codex").fill(secondPrompt);
@@ -186,6 +189,9 @@ test("Pinned, Side, and Bottom surfaces coexist while command output stays out o
   await expect(bottom).toBeVisible();
   await expect(conversation.getByText(rawCommandOutput, { exact: true })).toHaveCount(0);
 
+  const execution = conversation.getByRole("button", { name: /^Worked for / });
+  await expect(execution).toHaveAttribute("aria-expanded", "false");
+  await execution.click();
   await conversation.getByRole("button", { name: /^查看工具 .*demo_business_get/ }).click();
   await expect(side).toContainText("demo_business_get");
   await expect(side).toContainText("Arguments");
@@ -257,7 +263,8 @@ test("administrator uses a separate management console", async ({ page }, testIn
   await expect(page.getByRole("link", { name: "Back to Codex" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Codex 账号池" })).toBeVisible();
   await expect(page.getByRole("heading", { name: e2eCanaries.accountAlias })).toBeVisible();
-  await expect(page.getByText("周额度剩余 90%")).toBeVisible();
+  await expect(page.getByText("本周已用 10%")).toBeVisible();
+  await expect(page.getByText("剩余 90%")).toBeVisible();
   await expect(page.getByText(/^\d \/ 4$/)).toBeVisible();
 
   await page.getByRole("link", { name: "Policies" }).click();

@@ -104,8 +104,17 @@ describe("FakeExecutionAdapter", () => {
       "TOOL_COMPLETED",
       "DIFF_UPDATED",
       "AGENT_MESSAGE_DELTA",
+      "AGENT_MESSAGE_PHASE",
       "TURN_COMPLETED",
     ]);
+    expect(listener.mock.calls.map((call) => call[0])).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "AGENT_MESSAGE_PHASE",
+          payload: expect.objectContaining({ phase: "final_answer" }),
+        }),
+      ]),
+    );
   });
 
   test("simulates account login and a known weekly quota", async () => {

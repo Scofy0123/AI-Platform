@@ -2804,6 +2804,57 @@ tbody tr:hover {
   border-top: 1px solid #2e2b31;
 }
 
+.codex-turn-execution {
+  margin: 18px 0 10px;
+}
+
+.codex-turn-execution__toggle {
+  display: flex;
+  width: 100%;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  color: #8d8792;
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.codex-turn-execution__toggle:hover {
+  color: #bbb5c0;
+}
+
+.codex-turn-execution__toggle:focus-visible {
+  border-radius: 5px;
+  outline: 2px solid rgba(173, 142, 240, 0.7);
+  outline-offset: 3px;
+}
+
+.codex-turn-execution__toggle > span:last-child {
+  flex: none;
+  color: #77717c;
+  font-size: 18px;
+}
+
+.codex-turn-execution__rows {
+  padding: 8px 0 4px;
+  border-bottom: 1px solid #29262d;
+}
+
+.codex-turn-execution--failed .codex-turn-execution__toggle,
+.codex-turn-execution--needs-recovery .codex-turn-execution__toggle {
+  color: #c98a91;
+}
+
+.codex-turn-final-answer {
+  margin-top: 20px;
+}
+
 .codex-transcript-assistant {
   color: #ded9e2;
   font-size: 14px;
@@ -2941,13 +2992,14 @@ tbody tr:hover {
 }
 
 .v11-user-message {
-  max-width: 88%;
-  margin: 0 0 26px auto;
-  padding: 13px 16px;
-  border: 1px solid #3a373f;
-  border-radius: 16px;
+  max-width: 100%;
+  margin: 0 0 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
   color: #ece9ef;
-  background: #29272c;
+  background: transparent;
+  font-size: 14px;
 }
 
 .v11-user-message p {
@@ -2958,7 +3010,8 @@ tbody tr:hover {
 
 .v11-steer-message {
   margin-top: 18px;
-  border-color: rgba(178, 152, 245, 0.35);
+  padding-left: 14px;
+  border-left: 2px solid rgba(178, 152, 245, 0.45);
 }
 
 .v11-message-label {
@@ -2968,6 +3021,10 @@ tbody tr:hover {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.v11-user-message:not(.v11-steer-message) .v11-message-label {
+  display: none;
 }
 
 .v11-event {
@@ -3755,6 +3812,31 @@ tbody tr:hover {
   color: #c6ced5;
   font-size: 12px;
   text-align: right;
+}
+
+.v11-account-card .v11-quota-values {
+  display: grid;
+  gap: 3px;
+}
+
+.v11-account-card .v11-quota-values span:first-child {
+  color: #d8dee4;
+  font-size: 12px;
+}
+
+.v11-account-card .v11-quota-values span:last-child {
+  color: #78b89b;
+  font-size: 11px;
+}
+
+.v11-account-card > .v11-account-quota-times {
+  align-items: flex-end;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.v11-account-card > .v11-account-quota-times span {
+  font-variant-numeric: tabular-nums;
 }
 
 .v11-account-actions {

@@ -181,6 +181,13 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
         taskId,
         threadId,
         turnId,
+        type: "AGENT_MESSAGE_PHASE",
+        payload: { itemId: `message-${item}`, phase: "final_answer" },
+      },
+      {
+        taskId,
+        threadId,
+        turnId,
         type: "TURN_COMPLETED",
         payload: { status: "completed", durationMs: 5 },
       },
