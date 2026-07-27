@@ -407,7 +407,17 @@ operator”门禁约束。只有 1.1B 通过 OpenAI 许可、独立 Worker / `CO
 ## 9. App Server 与协议治理
 
 - 固定使用 `@openai/codex@0.144.6`。
-- 传输固定为 stdio JSONL，不使用实验性 WebSocket。
+- 平台到 App Server 的传输固定为 stdio JSONL，不使用实验性的网络监听模式。
+- App Server 到 OpenAI 使用平台内部 HTTPS-only Provider，复用现有 ChatGPT 登录认证，并声明
+  `supports_websockets=false`；它用于消除当前环境 WebSocket 握手超时后的回退等待，不改变模型、
+  额度和账号归属。
+- Provider ID 使用 `codexplatform_openai_https`，但 Provider 名称必须保持官方精确值 `OpenAI`；
+  Codex 当前通过名称判断 OpenAI 专属能力，改名会关闭远端上下文压缩，不适用于长 Turn（见
+  [0.144.6 Provider 源码](https://github.com/openai/codex/blob/rust-v0.144.6/codex-rs/model-provider-info/src/lib.rs)）。
+- 当前 Codex 尚未提供正式的 `--transport=https` 开关（见
+  [openai/codex#27381](https://github.com/openai/codex/issues/27381)）；该适配必须随 Codex
+  固定版本锁定，并在每次升级时重新验证模型目录、认证、额度和真实 Turn。官方提供等价开关后优先
+  迁移到官方配置。
 - 初始化固定为 `initialize → initialized`。
 - 使用 `thread/start/resume`、`turn/start/steer/interrupt`。
 - 在渲染模型选择器前调用稳定的 `model/list`；目录分页读取、缓存、组织策略求交集和模型级 Effort 校验由平台负责。
