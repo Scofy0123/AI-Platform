@@ -39,6 +39,7 @@ import {
 import { PinnedExecutionSummary } from "./components/thread/PinnedExecutionSummary.js";
 import { SidePanel } from "./components/thread/SidePanel.js";
 import { Transcript } from "./components/thread/Transcript.js";
+import { WorkspaceHeader } from "./components/thread/WorkspaceHeader.js";
 import { subscribeTaskEvents } from "./event-stream.js";
 import { Icon } from "./icons.js";
 import {
@@ -729,7 +730,6 @@ function ThreadPage() {
   const status = projectStatus(thread.data.status, mergedEvents, thread.data.currentTurnId);
   const archived = thread.data.archivedAt !== null;
   const canSteer = !archived && (status === "RUNNING" || status === "WAITING_APPROVAL");
-  const canInterrupt = canSteer;
   const configLocked =
     archived ||
     ["ALLOCATING", "QUEUED", "RUNNING", "WAITING_APPROVAL"].includes(
@@ -799,84 +799,42 @@ function ThreadPage() {
   };
   return (
     <div className="v11-thread-page">
-      <header className="v11-thread-header">
-        <div>
-          <h1>{thread.data.title}</h1>
-          <StatusBadge status={status} />
+      <WorkspaceHeader
+        title={thread.data.title}
+        pinnedOpen={workspaceLayout.pinnedSummaryOpen}
+        bottomOpen={workspaceLayout.bottomPanel.open}
+        bottomAvailable={availableBottomTabs.length > 0}
+        sideOpen={workspaceLayout.sidePanel.open}
+        canArchive={canArchive}
+        archivePending={archive.isPending || action.isPending || start.isPending}
+        pinnedToggleRef={pinnedToggleRef}
+        bottomToggleRef={bottomToggleRef}
+        sideToggleRef={sideToggleRef}
+        onTogglePinned={() => dispatchWorkspaceLayout({ type: "TOGGLE_PINNED" })}
+        onToggleBottom={() => {
+          dispatchWorkspaceLayout(
+            workspaceLayout.bottomPanel.open
+              ? { type: "CLOSE_BOTTOM" }
+              : { type: "OPEN_BOTTOM", tab: defaultBottomTab },
+          );
+        }}
+        onToggleSide={() =>
+          dispatchWorkspaceLayout(
+            workspaceLayout.sidePanel.open
+              ? { type: "CLOSE_SIDE" }
+              : { type: "OPEN_SIDE", tab: workspaceLayout.sidePanel.tab },
+          )
+        }
+        onArchive={() => {
+          setRuntimeError(null);
+          archive.mutate();
+        }}
+      />
+      {connection === "reconnecting" ? (
+        <div className="v11-connection-notice" role="status">
+          正在重新连接执行流…
         </div>
-        <div className="v11-thread-actions">
-          <span className={`connection-state ${connection}`}>
-            <span className="live-dot" /> {connection === "connected" ? "Live" : "Reconnecting"}
-          </span>
-          <button
-            ref={pinnedToggleRef}
-            type="button"
-            aria-label="Toggle pinned summary"
-            aria-expanded={workspaceLayout.pinnedSummaryOpen}
-            aria-controls="thread-pinned-summary"
-            onClick={() => dispatchWorkspaceLayout({ type: "TOGGLE_PINNED" })}
-          >
-            <Icon name="grid" />
-          </button>
-          <button
-            ref={bottomToggleRef}
-            type="button"
-            aria-label="Toggle bottom panel"
-            aria-expanded={workspaceLayout.bottomPanel.open}
-            aria-controls="thread-bottom-panel"
-            disabled={availableBottomTabs.length === 0}
-            onClick={() => {
-              dispatchWorkspaceLayout(
-                workspaceLayout.bottomPanel.open
-                  ? { type: "CLOSE_BOTTOM" }
-                  : { type: "OPEN_BOTTOM", tab: defaultBottomTab },
-              );
-            }}
-          >
-            <Icon name="terminal" />
-          </button>
-          <button
-            ref={sideToggleRef}
-            type="button"
-            aria-label="Toggle side panel"
-            aria-expanded={workspaceLayout.sidePanel.open}
-            aria-controls="thread-side-panel"
-            onClick={() =>
-              dispatchWorkspaceLayout(
-                workspaceLayout.sidePanel.open
-                  ? { type: "CLOSE_SIDE" }
-                  : { type: "OPEN_SIDE", tab: workspaceLayout.sidePanel.tab },
-              )
-            }
-          >
-            <Icon name="project" />
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setRuntimeError(null);
-              action.mutate({ name: "interrupt" });
-            }}
-            disabled={!canInterrupt || action.isPending || start.isPending}
-          >
-            <Icon name="pause" /> 停止
-          </button>
-          {canArchive ? (
-            <button
-              type="button"
-              aria-label="Archive Thread"
-              title="仅整理 CodexPlatform 历史记录，不改变 Codex App Server Thread"
-              onClick={() => {
-                setRuntimeError(null);
-                archive.mutate();
-              }}
-              disabled={archive.isPending || action.isPending || start.isPending}
-            >
-              <Icon name="audit" /> Archive
-            </button>
-          ) : null}
-        </div>
-      </header>
+      ) : null}
       {archived ? (
         <div className="v11-capability-note">
           此 Thread 已被服务端标记为平台归档；归档仅整理 CodexPlatform 历史记录，不改变 Codex App

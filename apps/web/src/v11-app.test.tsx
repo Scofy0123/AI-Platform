@@ -329,6 +329,11 @@ function createApi(session: Session = adminSession) {
   };
 }
 
+async function archiveCurrentThread() {
+  fireEvent.click(await screen.findByRole("button", { name: "Thread actions" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Archive Thread" }));
+}
+
 async function openSidePanel() {
   const toggle = await screen.findByRole("button", { name: "Toggle side panel" });
   fireEvent.click(toggle);
@@ -1365,7 +1370,7 @@ describe("CodexPlatform 1.1 Thread archive", () => {
 
     render(<App initialEntries={["/threads/thread-1"]} api={api} />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Thread" }));
+    await archiveCurrentThread();
 
     await waitFor(() => expect(api.archiveThread).toHaveBeenCalledWith("thread-1"));
     expect(await screen.findByRole("heading", { name: "Archived" })).toBeInTheDocument();
@@ -1396,7 +1401,8 @@ describe("CodexPlatform 1.1 Thread archive", () => {
       render(<App initialEntries={["/threads/thread-1"]} api={api} />);
 
       await screen.findByRole("heading", { name: "梳理客户成功周报" });
-      expect(screen.queryByRole("button", { name: "Archive Thread" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Thread actions" }));
+      expect(screen.queryByRole("menuitem", { name: "Archive Thread" })).not.toBeInTheDocument();
     },
   );
 
@@ -1421,7 +1427,7 @@ describe("CodexPlatform 1.1 Thread archive", () => {
     api.archiveThread.mockRejectedValue(new Error("ARCHIVE_FAILED"));
 
     render(<App initialEntries={["/threads/thread-1"]} api={api} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Archive Thread" }));
+    await archiveCurrentThread();
 
     expect(await screen.findByRole("alert")).toHaveTextContent("ARCHIVE_FAILED");
     expect(screen.getByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
@@ -1452,7 +1458,8 @@ describe("CodexPlatform 1.1 Thread archive", () => {
     expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "继续" })).not.toBeInTheDocument();
     expect(screen.getByLabelText("Message Codex")).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "Archive Thread" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Thread actions" }));
+    expect(screen.queryByRole("menuitem", { name: "Archive Thread" })).not.toBeInTheDocument();
     expect(screen.getByText(/服务端标记为平台归档/)).toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "返回 Archived" })).not.toBeInTheDocument();
   });

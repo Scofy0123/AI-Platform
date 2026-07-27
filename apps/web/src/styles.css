@@ -2446,32 +2446,75 @@ tbody tr:hover {
   z-index: 12;
   top: 0;
   display: flex;
-  min-height: 72px;
+  min-height: 56px;
   align-items: center;
   justify-content: space-between;
-  gap: 22px;
-  padding: 12px 22px;
+  gap: 16px;
+  padding: 8px 16px 8px 18px;
   border-bottom: 1px solid #2c2a2f;
-  background: rgba(17, 16, 20, 0.91);
+  background: rgba(21, 20, 23, 0.94);
   backdrop-filter: blur(18px);
 }
 
-.v11-thread-header > div:first-child {
+.v11-thread-title {
+  position: relative;
   display: flex;
   min-width: 0;
   align-items: center;
-  gap: 12px;
+  gap: 9px;
+}
+
+.v11-thread-project-icon {
+  display: inline-grid;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  place-items: center;
+  color: #d6d2d9;
+}
+
+.v11-thread-project-icon svg {
+  width: 18px;
+  height: 18px;
 }
 
 .v11-thread-header h1 {
   overflow: hidden;
   margin: 0;
   color: #ece9ee;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 620;
   letter-spacing: -0.01em;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.v11-thread-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.v11-thread-menu-trigger {
+  min-width: 28px;
+  letter-spacing: 1px;
+}
+
+.v11-thread-menu-popover {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 7px);
+  left: 0;
+  min-width: 150px;
+  padding: 5px;
+  border: 1px solid #3b383f;
+  border-radius: 10px;
+  background: #262429;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.35);
+}
+
+.v11-thread-menu-popover button {
+  width: 100%;
+  justify-content: flex-start;
 }
 
 .v11-thread-actions {
@@ -2497,8 +2540,14 @@ tbody tr:hover {
 
 .v11-thread-actions button {
   display: inline-flex;
+  width: 36px;
+  min-height: 36px;
   align-items: center;
+  justify-content: center;
   gap: 6px;
+  padding: 0;
+  border-radius: 10px;
+  background: transparent;
 }
 
 .v11-thread-actions button:hover:not(:disabled),
@@ -2518,9 +2567,23 @@ tbody tr:hover {
 
 .v11-thread-grid {
   display: grid;
-  height: calc(100vh - 72px);
+  height: calc(100vh - 56px);
   min-height: 520px;
   grid-template-columns: minmax(0, 1fr);
+}
+
+.v11-connection-notice {
+  position: fixed;
+  z-index: 25;
+  top: 64px;
+  left: 50%;
+  padding: 6px 10px;
+  border: 1px solid #4a4650;
+  border-radius: 999px;
+  color: #c7c2cb;
+  background: #29272c;
+  font-size: 11px;
+  transform: translateX(-50%);
 }
 
 .v11-thread-grid.side-open {
@@ -4096,14 +4159,19 @@ tbody tr:hover {
   }
 
   .v11-thread-header {
-    position: relative;
-    align-items: flex-start;
-    flex-direction: column;
+    position: sticky;
+    align-items: center;
+    flex-direction: row;
+    padding: 8px 10px 8px 12px;
   }
 
   .v11-thread-actions {
-    width: 100%;
-    flex-wrap: wrap;
+    width: auto;
+    flex-wrap: nowrap;
+  }
+
+  .v11-thread-header h1 {
+    max-width: 34vw;
   }
 
   .v11-thread-grid {
