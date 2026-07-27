@@ -1190,7 +1190,22 @@ describe("CodexPlatform 1.1 user workspace", () => {
 
   test("keeps a failed follow-up in the composer and shows the runtime conflict", async () => {
     const api = createApi();
-    api.getThread.mockResolvedValue({ ...thread, status: "COMPLETED" });
+    api.getThread.mockResolvedValue({
+      ...thread,
+      status: "COMPLETED",
+      currentTurn: {
+        ...thread.currentTurn,
+        status: "COMPLETED",
+        completedAt: "2026-07-25T12:05:00.000Z",
+      },
+      turns: [
+        {
+          ...thread.turns[0],
+          status: "COMPLETED",
+          completedAt: "2026-07-25T12:05:00.000Z",
+        },
+      ],
+    });
     api.startThreadTurn.mockRejectedValue(
       new ApiError("The current Turn is still active.", 409, "ACTIVE_TURN_RESUME_CONFLICT"),
     );
@@ -1198,7 +1213,7 @@ describe("CodexPlatform 1.1 user workspace", () => {
 
     const composer = await screen.findByLabelText("Message Codex");
     fireEvent.change(composer, { target: { value: "继续处理未完成部分" } });
-    fireEvent.click(screen.getByRole("button", { name: "发送调整" }));
+    fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("ACTIVE_TURN_RESUME_CONFLICT");
     expect(composer).toHaveValue("继续处理未完成部分");
@@ -1246,7 +1261,7 @@ describe("CodexPlatform 1.1 user workspace", () => {
     fireEvent.change(screen.getByLabelText("Message Codex"), {
       target: { value: "继续完善交付物" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "发送调整" }));
+    fireEvent.click(screen.getByRole("button", { name: "发送消息" }));
 
     await waitFor(() =>
       expect(api.startThreadTurn).toHaveBeenCalledWith("thread-1", "继续完善交付物", {
@@ -1288,7 +1303,7 @@ describe("CodexPlatform 1.1 user workspace", () => {
     expect(screen.getByLabelText("Turn permission mode")).toBeDisabled();
     expect(screen.getByLabelText("Message Codex")).toBeDisabled();
     expect(screen.getByText(/正在排队，暂不能提交新的 Turn/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "发送调整" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "发送消息" })).toBeDisabled();
   });
 
   test("renders a persisted Steer user item restored from the Thread DTO", async () => {
@@ -1325,7 +1340,7 @@ describe("CodexPlatform 1.1 user workspace", () => {
     fireEvent.change(await screen.findByLabelText("Message Codex"), {
       target: { value: "优先核对权限边界" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "发送调整" }));
+    fireEvent.click(screen.getByRole("button", { name: "发送 Steer" }));
 
     await waitFor(() =>
       expect(api.threadAction).toHaveBeenCalledWith("thread-1", "steer", "优先核对权限边界"),

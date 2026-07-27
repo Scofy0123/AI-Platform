@@ -295,7 +295,7 @@ describe("CodexPlatform workspace", () => {
     expect(within(conversation).getByText("Queued at position 2")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "继续" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "发送调整" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "发送 Steer" })).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Toggle side panel" }));
     const sidePanel = screen.getByRole("region", { name: "Side panel" });
@@ -499,7 +499,7 @@ describe("CodexPlatform workspace", () => {
     render(<App initialEntries={["/tasks/task-1"]} api={api} subscribeToTaskEvents={subscribe} />);
 
     expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
-    await waitFor(() => expect(screen.getAllByText("已完成").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getByText("本轮已完成")).toBeInTheDocument());
   });
 
   test("does not project an old Turn terminal over the currently running Turn", async () => {
@@ -543,7 +543,7 @@ describe("CodexPlatform workspace", () => {
     expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: "停止" })).toBeEnabled());
     expect(screen.queryByRole("button", { name: "继续" })).not.toBeInTheDocument();
-    expect(screen.getAllByText("执行中").length).toBeGreaterThan(0);
+    expect(screen.getByText("Codex 正在工作")).toBeInTheDocument();
   });
 
   test("does not project old Turn events over a newly queued Turn", async () => {
@@ -585,8 +585,9 @@ describe("CodexPlatform workspace", () => {
     render(<App initialEntries={["/tasks/task-1"]} api={api} subscribeToTaskEvents={subscribe} />);
 
     expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
-    await waitFor(() => expect(screen.getAllByText("排队中").length).toBeGreaterThan(0));
-    expect(screen.getByText("Queued at position 1")).toHaveAttribute("role", "status");
+    await waitFor(() =>
+      expect(screen.getByText("Queued at position 1")).toHaveAttribute("role", "status"),
+    );
   });
 
   test.each(["COMPLETED", "FAILED", "INTERRUPTED", "NEEDS_RECOVERY"] as const)(

@@ -32,6 +32,7 @@ import {
 import { ApiError, httpApi } from "./api.js";
 import { ThreadNavItem } from "./components/navigation/ThreadNavItem.js";
 import { BottomPanel } from "./components/thread/BottomPanel.js";
+import { ComposerSubmitControl } from "./components/thread/ComposerSubmitControl.js";
 import {
   ModelEffortPicker,
   type ModelSelection,
@@ -733,7 +734,9 @@ function ThreadPage() {
   const mergedEvents = mergeThreadEvents(thread.data.events, events);
   const status = projectStatus(thread.data.status, mergedEvents, thread.data.currentTurnId);
   const archived = thread.data.archivedAt !== null;
-  const canSteer = !archived && (status === "RUNNING" || status === "WAITING_APPROVAL");
+  const executionStatus = thread.data.currentTurnStatus ?? status;
+  const canSteer =
+    !archived && (executionStatus === "RUNNING" || executionStatus === "WAITING_APPROVAL");
   const configLocked =
     archived ||
     ["ALLOCATING", "QUEUED", "RUNNING", "WAITING_APPROVAL"].includes(
@@ -959,10 +962,9 @@ function ThreadPage() {
                       ? "Steer 沿用当前 Turn 的执行设置"
                       : "Attachments unavailable in 1.1A"}
                 </span>
-                <button
-                  className="v11-send-button"
-                  type="submit"
-                  aria-label="发送调整"
+                <ComposerSubmitControl
+                  mode={canSteer && message.trim().length === 0 ? "stop" : "send"}
+                  steer={canSteer}
                   disabled={
                     action.isPending ||
                     start.isPending ||
@@ -971,11 +973,13 @@ function ThreadPage() {
                     (!canSteer && (models.isPending || models.isError || !selectedModel)) ||
                     waitingForAllocation ||
                     (!canSteer && !canStartTurn) ||
-                    message.trim().length === 0
+                    (message.trim().length === 0 && !canSteer)
                   }
-                >
-                  <Icon name="send" />
-                </button>
+                  onStop={() => {
+                    setRuntimeError(null);
+                    action.mutate({ name: "interrupt" });
+                  }}
+                />
               </div>
             </form>
             {settings.isError ? (
