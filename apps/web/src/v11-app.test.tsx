@@ -1315,7 +1315,7 @@ describe("CodexPlatform 1.1 user workspace", () => {
 
     const conversation = await screen.findByLabelText("Thread conversation");
     expect(within(conversation).getByText("优先核对权限边界")).toBeInTheDocument();
-    expect(within(conversation).getByText("You · Steer")).toBeInTheDocument();
+    expect(within(conversation).getByText("Steer")).toBeInTheDocument();
   });
 
   test("does not fabricate a Steer item locally before SSE or Thread replay confirms it", async () => {
@@ -1332,7 +1332,7 @@ describe("CodexPlatform 1.1 user workspace", () => {
     );
     const conversation = screen.getByLabelText("Thread conversation");
     expect(within(conversation).queryByText("优先核对权限边界")).not.toBeInTheDocument();
-    expect(within(conversation).queryByText("You · Steer")).not.toBeInTheDocument();
+    expect(within(conversation).queryByText("Steer")).not.toBeInTheDocument();
   });
 
   test("fails closed and offers retry when the Subagent list endpoint is missing", async () => {

@@ -34,6 +34,62 @@ function transcriptGroup(rows: TranscriptRow[]): TranscriptGroup {
 }
 
 describe("Transcript", () => {
+  test("renders the user prompt as a right-side bubble without a You label", () => {
+    const prompt: TranscriptRow = {
+      ...IDENTITY,
+      id: "user",
+      itemId: "user:turn-1",
+      kind: "user",
+      text: "修复运行时",
+    };
+    const group = transcriptGroup([prompt]);
+    group.prompt = prompt;
+    group.executionRows = [];
+
+    render(
+      <Transcript
+        groups={[group]}
+        onOpenBottom={vi.fn()}
+        onOpenSide={vi.fn()}
+        renderApproval={() => null}
+      />,
+    );
+
+    expect(screen.getByText("修复运行时").closest("article")).toHaveAttribute(
+      "data-message-side",
+      "right",
+    );
+    expect(screen.queryByText("You")).not.toBeInTheDocument();
+  });
+
+  test("renders Steer as the same right-side bubble with a subtle Steer label", () => {
+    const steer: TranscriptRow = {
+      ...IDENTITY,
+      id: "steer",
+      itemId: "steer-1",
+      kind: "user",
+      text: "优先验证交互",
+    };
+    const group = transcriptGroup([steer]);
+    group.prompt = steer;
+    group.executionRows = [];
+
+    render(
+      <Transcript
+        groups={[group]}
+        onOpenBottom={vi.fn()}
+        onOpenSide={vi.fn()}
+        renderApproval={() => null}
+      />,
+    );
+
+    const bubble = screen.getByText("优先验证交互").closest("article");
+    expect(bubble).toHaveAttribute("data-message-side", "right");
+    expect(bubble).toHaveAttribute("data-message-kind", "steer");
+    expect(screen.getByText("Steer")).toBeInTheDocument();
+    expect(screen.queryByText("You · Steer")).not.toBeInTheDocument();
+  });
+
   test("keeps the final answer visible while completed execution details are collapsed", () => {
     const prompt: TranscriptRow = {
       ...IDENTITY,

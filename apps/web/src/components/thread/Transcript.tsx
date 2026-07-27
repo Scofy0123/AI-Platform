@@ -103,16 +103,19 @@ function TranscriptRowView({
 }) {
   switch (row.kind) {
     case "user":
-      return (
-        <article
-          className={`v11-user-message${row.itemId.startsWith("user:") ? "" : " v11-steer-message"}`}
-        >
-          <div className="v11-message-label">
-            {row.itemId.startsWith("user:") ? "You" : "You · Steer"}
-          </div>
-          <SafeMarkdown content={row.text} />
-        </article>
-      );
+      {
+        const steer = !row.itemId.startsWith("user:");
+        return (
+          <article
+            className={`v11-user-message${steer ? " v11-steer-message" : ""}`}
+            data-message-side="right"
+            data-message-kind={steer ? "steer" : "prompt"}
+          >
+            {steer ? <div className="v11-message-label">Steer</div> : null}
+            <SafeMarkdown content={row.text} />
+          </article>
+        );
+      }
     case "assistant":
       return (
         <article className="codex-transcript-assistant">
