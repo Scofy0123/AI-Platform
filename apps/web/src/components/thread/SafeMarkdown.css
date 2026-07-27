@@ -1,0 +1,126 @@
+.safe-markdown > :first-child {
+  margin-top: 0;
+}
+
+.safe-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.safe-markdown p {
+  margin: 0;
+  padding-left: 0;
+  white-space: pre-wrap;
+}
+
+.codex-reasoning-summary .safe-markdown {
+  margin-top: 8px;
+  padding-left: 17px;
+  line-height: 1.6;
+}
+
+.codex-reasoning-summary .safe-markdown p {
+  margin: 0;
+  padding-left: 0;
+}
+
+.safe-markdown :where(p + p, p + ul, p + ol, ul + p, ol + p, pre + p, table + p) {
+  margin-top: 0.9em;
+}
+
+.safe-markdown h3,
+.safe-markdown h4,
+.safe-markdown h5,
+.safe-markdown h6 {
+  margin: 1.25em 0 0.55em;
+  color: #f0ecf3;
+  font-size: 1em;
+  line-height: 1.35;
+}
+
+.safe-markdown ul,
+.safe-markdown ol {
+  margin: 0.5em 0;
+  padding-left: 1.55em;
+}
+
+.safe-markdown li + li {
+  margin-top: 0.25em;
+}
+
+.safe-markdown blockquote {
+  margin: 0.8em 0;
+  padding-left: 0.9em;
+  border-left: 2px solid #756493;
+  color: #9f98a7;
+}
+
+.safe-markdown code {
+  padding: 0.08em 0.35em;
+  border: 1px solid #39353f;
+  border-radius: 5px;
+  color: #d8c9f6;
+  background: #242128;
+  font:
+    0.9em / 1.5 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+}
+
+.safe-markdown pre {
+  max-width: 100%;
+  margin: 0.8em 0;
+  padding: 12px 14px;
+  overflow-x: auto;
+  border: 1px solid #35313a;
+  border-radius: 9px;
+  background: #111014;
+}
+
+.safe-markdown pre code {
+  padding: 0;
+  border: 0;
+  color: #cbc5d0;
+  background: transparent;
+}
+
+.safe-markdown a {
+  color: #b59cff;
+  text-decoration-color: rgba(181, 156, 255, 0.45);
+  text-underline-offset: 2px;
+}
+
+.safe-markdown-inert-link {
+  color: inherit;
+  text-decoration: underline dotted #625c69;
+  text-underline-offset: 2px;
+}
+
+.safe-markdown-image-placeholder {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 7px;
+  border: 1px solid #38343c;
+  border-radius: 6px;
+  color: #817b87;
+  background: #201e23;
+  font-size: 0.85em;
+}
+
+.safe-markdown table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  margin: 0.9em 0;
+  overflow-x: auto;
+  font-size: 0.9em;
+}
+
+.safe-markdown th,
+.safe-markdown td {
+  padding: 7px 9px;
+  border: 1px solid #37333c;
+  white-space: normal;
+}

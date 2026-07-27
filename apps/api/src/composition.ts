@@ -82,7 +82,9 @@ export async function createApplication(
   });
   const leases = new SQLiteLeaseStore(database.sqlite);
   const accounts = new AccountAdminStore(database.sqlite);
-  const platformStore = new SQLitePlatformStore(database.sqlite);
+  const platformStore = new SQLitePlatformStore(database.sqlite, {
+    runtimeDataDir: config.storage.runtimeDataDir,
+  });
   seedPrimaryAccount(config, leases, accounts);
 
   const actors = new ActorRegistry();
@@ -131,7 +133,12 @@ export async function createApplication(
     dataDir: config.storage.runtimeDataDir,
   });
   service.recoverInterruptedTurns();
-  const app = buildApp({ auth, platform: service, webOrigin: config.server.webOrigin });
+  const app = buildApp({
+    auth,
+    platform: service,
+    webOrigin: config.server.webOrigin,
+    runtimeDataDir: config.storage.runtimeDataDir,
+  });
   const maintenance = setInterval(() => {
     void service.runMaintenance().catch(() => undefined);
   }, MAINTENANCE_INTERVAL_MS);
@@ -491,6 +498,7 @@ function createExecutionAdapter(
     supervisor: new CodexRuntimeSupervisor({ binaryPath: config.runtime.codexBinary }),
     actors,
     tools,
+    runtimeDataDir: config.storage.runtimeDataDir,
   });
 }
 

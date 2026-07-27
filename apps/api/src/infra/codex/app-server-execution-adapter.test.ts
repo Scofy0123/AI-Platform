@@ -12,6 +12,7 @@ import {
   type ManagedRuntimePort,
   type RuntimeSupervisorPort,
 } from "./app-server-execution-adapter.js";
+import type { Model } from "./generated/v2/Model.js";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse.js";
 
 const TEST_EXECUTION_CONTEXT: {
@@ -37,6 +38,90 @@ const TEST_EXECUTION_CONTEXT: {
 };
 
 describe("AppServerExecutionAdapter", () => {
+  test("maps the runtime model catalog to the public model option contract", async () => {
+    const rpc = new FakeRpc();
+    const runtime = {
+      ...runtimePort(),
+      listModels: vi.fn(
+        async (): Promise<Model[]> => [
+          {
+            id: "runtime-model-1",
+            model: "provider-model-1",
+            upgrade: null,
+            upgradeInfo: null,
+            availabilityNux: null,
+            displayName: "Runtime Model One",
+            description: "Runtime supplied model",
+            hidden: false,
+            supportedReasoningEfforts: [
+              { reasoningEffort: "low", description: "Fast" },
+              { reasoningEffort: "high", description: "Deep" },
+            ],
+            defaultReasoningEffort: "high",
+            inputModalities: ["text", "image"],
+            supportsPersonality: true,
+            additionalSpeedTiers: [],
+            serviceTiers: [],
+            defaultServiceTier: null,
+            isDefault: true,
+          },
+        ],
+      ),
+    };
+    const startAccount = vi.fn(async () => ({
+      accountId: "account-secret-id",
+      rpc,
+      runtime,
+    }));
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount,
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    const result = await adapter.listModels({
+      id: "account-secret-id",
+      alias: "Private Account Alias",
+      codexHome: "/private/codex-home",
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+      activeUsers: 0,
+      activeTurns: 0,
+      maxActiveUsers: 4,
+      weeklyRemaining: 90,
+      quotaUpdatedAt: "2026-07-27T00:00:00.000Z",
+      quotaResetsAt: "2026-08-03T00:00:00.000Z",
+      allowUnknownQuota: false,
+      healthScore: 100,
+    });
+    expect(result).toEqual([
+      {
+        id: "runtime-model-1",
+        model: "provider-model-1",
+        displayName: "Runtime Model One",
+        description: "Runtime supplied model",
+        hidden: false,
+        isDefault: true,
+        defaultReasoningEffort: "high",
+        supportedReasoningEfforts: [
+          { value: "low", description: "Fast" },
+          { value: "high", description: "Deep" },
+        ],
+        inputModalities: ["text", "image"],
+        supportsPersonality: true,
+      },
+    ]);
+    expect(startAccount).toHaveBeenCalledWith({
+      accountId: "account-secret-id",
+      codexHome: "/private/codex-home",
+    });
+    expect(JSON.stringify(result)).not.toContain("Private Account Alias");
+    expect(JSON.stringify(result)).not.toContain("/private/codex-home");
+  });
+
   test("fails closed when resume rejoins an active Turn and never starts another Turn", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();
@@ -1614,6 +1699,7 @@ function runtimePort(threadId = "thread-1", turnId = "turn-1"): ManagedRuntimePo
       loginId: "login-1",
       authUrl: "https://auth.example.test/codex",
     })),
+    listModels: vi.fn(async () => []),
     readWeeklyQuota: vi.fn(async () => ({
       status: "KNOWN" as const,
       limitId: "codex",

@@ -29,8 +29,50 @@ const task = {
   updatedAt: "2026-07-25T12:02:00.000Z",
 };
 
+const modelCatalog = {
+  models: [
+    {
+      id: "fake-codex-standard",
+      model: "fake-codex-standard",
+      displayName: "Fake Codex Standard",
+      description: "Deterministic standard model",
+      hidden: false,
+      isDefault: true,
+      defaultReasoningEffort: "medium",
+      supportedReasoningEfforts: [
+        { value: "low", description: "Fast" },
+        { value: "medium", description: "Balanced" },
+        { value: "high", description: "Deep" },
+      ],
+      inputModalities: ["text"],
+      supportsPersonality: false,
+    },
+    {
+      id: "fake-codex-deep",
+      model: "fake-codex-deep",
+      displayName: "Fake Codex Deep",
+      description: "Deterministic deep model",
+      hidden: false,
+      isDefault: false,
+      defaultReasoningEffort: "high",
+      supportedReasoningEfforts: [
+        { value: "medium", description: "Balanced" },
+        { value: "high", description: "Deep" },
+        { value: "xhigh", description: "Extended" },
+      ],
+      inputModalities: ["text"],
+      supportsPersonality: false,
+    },
+  ],
+  scope: "ELIGIBLE_ACCOUNT_INTERSECTION" as const,
+  accountCount: 1,
+  observedAt: "2026-07-25T12:00:00.000Z",
+  stale: false,
+};
+
 const thread = {
   ...task,
+  archivedAt: null,
   currentTurn: {
     id: "turn-1",
     threadId: "thread-1",
@@ -96,6 +138,7 @@ function createApi(session: Session = adminSession) {
     listProjects: vi.fn().mockResolvedValue(projects),
     createProject: vi.fn().mockResolvedValue({ id: "project-created" }),
     listTasks: vi.fn().mockResolvedValue([task]),
+    listModels: vi.fn().mockResolvedValue(modelCatalog),
     getTask: vi.fn().mockResolvedValue({
       ...task,
       prompt: "读取飞书知识库并形成摘要",
@@ -106,6 +149,7 @@ function createApi(session: Session = adminSession) {
     startTurn: vi.fn().mockResolvedValue({ status: "RUNNING" }),
     taskAction: vi.fn().mockResolvedValue({ ok: true }),
     listThreads: vi.fn().mockResolvedValue([thread]),
+    listArchivedThreads: vi.fn().mockResolvedValue([]),
     getThread: vi.fn().mockResolvedValue(thread),
     getAdminThread: vi.fn().mockResolvedValue({
       ...thread,
@@ -116,6 +160,8 @@ function createApi(session: Session = adminSession) {
     createThread: vi.fn().mockResolvedValue({ ...thread, id: "thread-created" }),
     startThreadTurn: vi.fn().mockResolvedValue({ status: "RUNNING", turnId: "turn-created" }),
     threadAction: vi.fn().mockResolvedValue({ ok: true }),
+    archiveThread: vi.fn().mockResolvedValue({ ok: true }),
+    unarchiveThread: vi.fn().mockResolvedValue({ ok: true }),
     listSubagents: vi.fn().mockResolvedValue([
       {
         threadId: "agent-active",
@@ -282,6 +328,12 @@ function createApi(session: Session = adminSession) {
   };
 }
 
+async function openSidePanel() {
+  const toggle = await screen.findByRole("button", { name: "Toggle side panel" });
+  fireEvent.click(toggle);
+  return screen.findByRole("region", { name: "Side panel" });
+}
+
 afterEach(cleanup);
 
 describe("CodexPlatform 1.1 user workspace", () => {
@@ -325,42 +377,184 @@ describe("CodexPlatform 1.1 user workspace", () => {
       return () => undefined;
     });
 
+    const api = createApi();
     render(
-      <App
-        initialEntries={["/tasks/thread-1"]}
-        api={createApi()}
-        subscribeToTaskEvents={subscribe}
-      />,
+      <App initialEntries={["/tasks/thread-1"]} api={api} subscribeToTaskEvents={subscribe} />,
     );
 
     expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
     expect(screen.getByText("读取飞书知识库并形成摘要")).toBeInTheDocument();
     expect(screen.getByText("已完成知识库检索。")).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "Plan" })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "Outputs" })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "Subagents" })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "Sources" })).toBeInTheDocument();
-    expect(screen.getByText("Runtime default")).toBeInTheDocument();
-    expect(screen.getByText(/Model catalog not connected/)).toBeInTheDocument();
+    const sidePanel = await openSidePanel();
+    expect(within(sidePanel).getByRole("tab", { name: "Plan" })).toBeInTheDocument();
+    expect(within(sidePanel).getByRole("tab", { name: "Outputs" })).toBeInTheDocument();
+    expect(within(sidePanel).getByRole("tab", { name: "Subagents" })).toBeInTheDocument();
+    expect(within(sidePanel).getByRole("tab", { name: "Sources" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "Model and Effort: Fake Codex Standard · medium",
+      }),
+    ).toBeDisabled();
+    expect(api.listModels).toHaveBeenCalledWith("thread-1");
     expect(document.body).not.toHaveTextContent("SECRET SHARED ACCOUNT");
     expect(document.body).not.toHaveTextContent("RAW_CHAIN_OF_THOUGHT");
     expect(screen.queryByRole("button", { name: /attach/i })).not.toBeInTheDocument();
+  });
+
+  test("opens pinned summary, side panel and bottom panel as independent workspace surfaces", async () => {
+    const api = createApi();
+    api.getThread.mockResolvedValue({
+      ...thread,
+      items: [
+        {
+          id: "plan-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 1,
+          type: "PLAN_UPDATED",
+          timestamp: "2026-07-25T12:00:01.000Z",
+          payload: {
+            explanation: "先读取资料，再生成交付物",
+            plan: [{ step: "读取资料", status: "completed" }],
+          },
+        },
+        {
+          id: "command-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 2,
+          type: "COMMAND_OUTPUT",
+          timestamp: "2026-07-25T12:00:02.000Z",
+          payload: { itemId: "command-1", delta: "UAT_COMMAND_OK\n" },
+        },
+      ],
+    });
+
+    render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+
+    const pinnedToggle = await screen.findByRole("button", { name: "Toggle pinned summary" });
+    const sideToggle = screen.getByRole("button", { name: "Toggle side panel" });
+    const bottomToggle = screen.getByRole("button", { name: "Toggle bottom panel" });
+    expect(pinnedToggle).toHaveAttribute("aria-expanded", "false");
+    expect(sideToggle).toHaveAttribute("aria-expanded", "false");
+    expect(bottomToggle).toHaveAttribute("aria-expanded", "false");
+    expect(
+      within(screen.getByLabelText("Thread conversation")).queryByText("UAT_COMMAND_OK"),
+    ).toBeNull();
+
+    fireEvent.click(pinnedToggle);
+    const pinnedSummary = screen.getByLabelText("Pinned execution summary");
+    expect(pinnedSummary).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Side panel" })).not.toBeInTheDocument();
+
+    fireEvent.click(within(pinnedSummary).getByRole("button", { name: "Open pinned Outputs" }));
+    const sidePanel = screen.getByRole("region", { name: "Side panel" });
+    expect(sidePanel).toBeInTheDocument();
+    expect(within(sidePanel).getByRole("tab", { name: "Outputs" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByLabelText("Pinned execution summary")).toBeInTheDocument();
+
+    fireEvent.click(bottomToggle);
+    const bottomPanel = screen.getByRole("region", { name: "Bottom panel" });
+    expect(bottomPanel).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+    expect(within(bottomPanel).getByText("UAT_COMMAND_OK")).toBeInTheDocument();
+    expect(sidePanel).toBeInTheDocument();
+    expect(screen.getByLabelText("Pinned execution summary")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close side panel" }));
+    expect(screen.queryByRole("region", { name: "Side panel" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Bottom panel" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Pinned execution summary")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close pinned summary" }));
+    await waitFor(() => expect(pinnedToggle).toHaveFocus());
+  });
+
+  test("opens only the selected command when provider item ids repeat across Turns", async () => {
+    const api = createApi();
+    const completedTurn = {
+      ...thread.turns[0],
+      status: "COMPLETED" as const,
+      completedAt: "2026-07-25T12:01:00.000Z",
+    };
+    const latestTurn = {
+      ...completedTurn,
+      id: "turn-2",
+      prompt: "Second turn",
+      startedAt: "2026-07-25T12:02:00.000Z",
+      completedAt: "2026-07-25T12:03:00.000Z",
+    };
+    api.getThread.mockResolvedValue({
+      ...thread,
+      status: "COMPLETED",
+      currentTurn: latestTurn,
+      turns: [completedTurn, latestTurn],
+      items: [
+        {
+          id: "first-command-row",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 1,
+          type: "COMMAND_STARTED",
+          timestamp: "2026-07-25T12:00:01.000Z",
+          payload: { itemId: "provider-command-1", command: "printf first", cwd: "/workspace" },
+        },
+        {
+          id: "first-output-row",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 2,
+          type: "COMMAND_OUTPUT",
+          timestamp: "2026-07-25T12:00:02.000Z",
+          payload: { itemId: "provider-command-1", delta: "FIRST_TURN_ONLY" },
+        },
+        {
+          id: "second-command-row",
+          threadId: "thread-1",
+          turnId: "turn-2",
+          sequence: 3,
+          type: "COMMAND_STARTED",
+          timestamp: "2026-07-25T12:02:01.000Z",
+          payload: { itemId: "provider-command-1", command: "printf second", cwd: "/workspace" },
+        },
+        {
+          id: "second-output-row",
+          threadId: "thread-1",
+          turnId: "turn-2",
+          sequence: 4,
+          type: "COMMAND_OUTPUT",
+          timestamp: "2026-07-25T12:02:02.000Z",
+          payload: { itemId: "provider-command-1", delta: "SECOND_TURN_ONLY" },
+        },
+      ],
+    });
+
+    render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /^查看命令 .*printf first/ }));
+    const bottomPanel = screen.getByRole("region", { name: "Bottom panel" });
+    expect(bottomPanel).toHaveTextContent("FIRST_TURN_ONLY");
+    expect(bottomPanel).not.toHaveTextContent("SECOND_TURN_ONLY");
+    expect(bottomPanel.querySelectorAll(".terminal-session")).toHaveLength(1);
   });
 
   test("shows Active and Done subagents and opens independent subagent detail", async () => {
     const api = createApi();
     render(<App initialEntries={["/threads/thread-1"]} api={api} />);
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Subagents" }));
-    const panel = screen.getByRole("tabpanel", { name: "Subagents" });
-    expect(within(panel).getByRole("heading", { name: "Active" })).toBeInTheDocument();
-    expect(within(panel).getByRole("heading", { name: "Done" })).toBeInTheDocument();
-    expect(within(panel).getByText("文档检索")).toBeInTheDocument();
-    expect(within(panel).getByText("摘要整理")).toBeInTheDocument();
+    const sidePanel = await openSidePanel();
+    fireEvent.click(within(sidePanel).getByRole("tab", { name: "Subagents" }));
+    expect(within(sidePanel).getByRole("heading", { name: "Active" })).toBeInTheDocument();
+    expect(within(sidePanel).getByRole("heading", { name: "Done" })).toBeInTheDocument();
+    expect(within(sidePanel).getByText("文档检索")).toBeInTheDocument();
+    expect(within(sidePanel).getByText("摘要整理")).toBeInTheDocument();
 
-    fireEvent.click(within(panel).getByRole("button", { name: "Open 摘要整理 details" }));
-    expect(await screen.findByRole("heading", { name: "摘要整理" })).toBeInTheDocument();
-    expect(await screen.findByText("子任务详情正文")).toBeInTheDocument();
+    fireEvent.click(within(sidePanel).getByRole("button", { name: "Open 摘要整理 details" }));
+    expect(await within(sidePanel).findByRole("heading", { name: "摘要整理" })).toBeInTheDocument();
+    expect(await within(sidePanel).findByText("子任务详情正文")).toBeInTheDocument();
     expect(api.getSubagent).toHaveBeenCalledWith("agent-done");
   });
 
@@ -396,12 +590,206 @@ describe("CodexPlatform 1.1 user workspace", () => {
       />,
     );
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Subagents" }));
-    const done = screen.getByRole("heading", { name: "Done" }).closest("section");
+    const sidePanel = await openSidePanel();
+    fireEvent.click(within(sidePanel).getByRole("tab", { name: "Subagents" }));
+    const done = within(sidePanel).getByRole("heading", { name: "Done" }).closest("section");
 
     expect(done).not.toBeNull();
     expect(within(done as HTMLElement).getByText("文档检索")).toBeInTheDocument();
     expect(within(done as HTMLElement).getByText("飞书知识库检索完成")).toBeInTheDocument();
+  });
+
+  test("does not let a historical Active event downgrade an API-terminal Subagent", async () => {
+    const api = createApi();
+    const terminalAgent = (await api.listSubagents())[1];
+    api.listSubagents.mockResolvedValue([
+      {
+        ...terminalAgent,
+        threadId: "agent-terminal",
+        name: "终态核验",
+        status: "DONE",
+        completedAt: "2026-07-25T12:00:20.000Z",
+        resultSummary: "核验完成",
+      },
+    ]);
+    const subscribe = vi.fn((_threadId, onEvent) => {
+      onEvent({
+        taskId: "thread-1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "agent-terminal-active",
+        sequence: 11,
+        timestamp: "2026-07-25T12:00:05.000Z",
+        type: "SUBAGENT_ACTIVITY",
+        payload: {
+          itemId: "agent-terminal-active",
+          agentThreadId: "agent-terminal",
+          kind: "started",
+          name: "终态核验",
+          role: "worker",
+          model: null,
+          effort: "MEDIUM",
+          status: "ACTIVE",
+          resultSummary: "仍在执行",
+        },
+      });
+      return () => undefined;
+    });
+
+    render(
+      <App initialEntries={["/threads/thread-1"]} api={api} subscribeToTaskEvents={subscribe} />,
+    );
+
+    const sidePanel = await openSidePanel();
+    fireEvent.click(within(sidePanel).getByRole("tab", { name: "Subagents" }));
+    const active = within(sidePanel).getByRole("heading", { name: "Active" }).closest("section");
+    const done = within(sidePanel).getByRole("heading", { name: "Done" }).closest("section");
+
+    expect(active).not.toBeNull();
+    expect(done).not.toBeNull();
+    expect(within(active as HTMLElement).queryByText("终态核验")).not.toBeInTheDocument();
+    expect(within(done as HTMLElement).getByText("终态核验")).toBeInTheDocument();
+    expect(within(done as HTMLElement).getByText("核验完成")).toBeInTheDocument();
+  });
+
+  test("shows workspace files using workspace-relative paths", async () => {
+    const api = createApi();
+    api.getThread.mockResolvedValue({
+      ...thread,
+      items: [
+        {
+          id: "diff-workspace",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 1,
+          type: "DIFF_UPDATED",
+          timestamp: "2026-07-25T12:00:01.000Z",
+          payload: {
+            diff: [
+              "--- a/.data/real-runtime/workspaces/thread-1/uat-workspace.md",
+              "+++ b/.data/real-runtime/workspaces/thread-1/uat-workspace.md",
+              "+UAT_WORKSPACE_TURN_1",
+            ].join("\n"),
+          },
+        },
+      ],
+    });
+
+    render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "查看文件变更 1 file changed",
+      }),
+    );
+    const sidePanel = await screen.findByRole("region", { name: "Side panel" });
+    expect(sidePanel).toHaveTextContent("uat-workspace.md");
+    expect(sidePanel).not.toHaveTextContent(".data/real-runtime/workspaces/thread-1/");
+  });
+
+  test("shows one complete Tool detail with arguments, result, status and duration", async () => {
+    const api = createApi();
+    api.getThread.mockResolvedValue({
+      ...thread,
+      items: [
+        {
+          id: "tool-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 1,
+          type: "TOOL_STARTED",
+          timestamp: "2026-07-25T12:00:01.000Z",
+          payload: {
+            itemId: "tool-1",
+            tool: "business_read",
+            arguments: { id: "order-1" },
+          },
+        },
+        {
+          id: "tool-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 2,
+          type: "TOOL_COMPLETED",
+          timestamp: "2026-07-25T12:00:02.000Z",
+          payload: {
+            itemId: "tool-1",
+            tool: "business_read",
+            result: { id: "order-1", status: "PAID" },
+            durationMs: 17,
+          },
+        },
+      ],
+    });
+
+    render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /^查看工具 .*business_read/,
+      }),
+    );
+    const sidePanel = await screen.findByRole("region", { name: "Side panel" });
+    expect(within(sidePanel).getAllByText("business_read")).toHaveLength(1);
+    expect(within(sidePanel).getByText("Completed")).toBeInTheDocument();
+    expect(sidePanel).toHaveTextContent('"id": "order-1"');
+    expect(sidePanel).toHaveTextContent('"status": "PAID"');
+    expect(sidePanel).toHaveTextContent("17 ms");
+  });
+
+  test("does not show a stale queue banner once the Turn has completed", async () => {
+    const api = createApi();
+    api.getThread.mockResolvedValue({
+      ...thread,
+      status: "COMPLETED",
+      currentTurn: {
+        ...thread.currentTurn,
+        status: "COMPLETED",
+        completedAt: "2026-07-25T12:00:10.000Z",
+      },
+      turns: [
+        {
+          ...thread.turns[0],
+          status: "COMPLETED",
+          completedAt: "2026-07-25T12:00:10.000Z",
+        },
+      ],
+      queue: { position: 1, etaMs: 60_000, etaEstimated: true },
+      items: [
+        {
+          id: "queue-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 1,
+          type: "QUEUED",
+          timestamp: "2026-07-25T12:00:01.000Z",
+          payload: { position: 1, etaMs: 60_000, etaEstimated: true },
+        },
+        {
+          id: "turn-started-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 2,
+          type: "TURN_STARTED",
+          timestamp: "2026-07-25T12:00:02.000Z",
+          payload: { status: "inProgress" },
+        },
+        {
+          id: "turn-completed-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 3,
+          type: "TURN_COMPLETED",
+          timestamp: "2026-07-25T12:00:10.000Z",
+          payload: { status: "completed" },
+        },
+      ],
+    });
+
+    render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+
+    expect(await screen.findByText("本轮已完成")).toBeInTheDocument();
+    expect(screen.queryByText("队列第 1 位")).not.toBeInTheDocument();
   });
 
   test("renders observable command, Tool, Diff and approval evidence in Subagent detail", async () => {
@@ -419,12 +807,21 @@ describe("CodexPlatform 1.1 user workspace", () => {
           payload: { itemId: "agent-command", command: "pwd", cwd: "/workspace" },
         },
         {
-          id: "agent-tool",
+          id: "agent-command-output",
           threadId: "agent-done",
           turnId: "agent-turn",
           sequence: 2,
-          type: "TOOL_STARTED",
+          type: "COMMAND_OUTPUT",
           timestamp: "2026-07-25T12:00:02.000Z",
+          payload: { itemId: "agent-command", delta: "SUBAGENT_RAW_OUTPUT\n" },
+        },
+        {
+          id: "agent-tool",
+          threadId: "agent-done",
+          turnId: "agent-turn",
+          sequence: 3,
+          type: "TOOL_STARTED",
+          timestamp: "2026-07-25T12:00:03.000Z",
           payload: {
             itemId: "agent-tool",
             tool: "feishu_doc_read",
@@ -435,18 +832,18 @@ describe("CodexPlatform 1.1 user workspace", () => {
           id: "agent-diff",
           threadId: "agent-done",
           turnId: "agent-turn",
-          sequence: 3,
+          sequence: 4,
           type: "DIFF_UPDATED",
-          timestamp: "2026-07-25T12:00:03.000Z",
+          timestamp: "2026-07-25T12:00:04.000Z",
           payload: { diff: "+++ b/report.md\n+summary" },
         },
         {
           id: "agent-approval",
           threadId: "agent-done",
           turnId: "agent-turn",
-          sequence: 4,
+          sequence: 5,
           type: "APPROVAL_REQUESTED",
-          timestamp: "2026-07-25T12:00:04.000Z",
+          timestamp: "2026-07-25T12:00:05.000Z",
           payload: {
             approvalId: "approval-agent",
             itemId: "agent-approval",
@@ -461,15 +858,38 @@ describe("CodexPlatform 1.1 user workspace", () => {
     });
     render(<App initialEntries={["/threads/thread-1"]} api={api} />);
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Subagents" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Open 摘要整理 details" }));
+    const sidePanel = await openSidePanel();
+    fireEvent.click(within(sidePanel).getByRole("tab", { name: "Subagents" }));
+    fireEvent.click(
+      await within(sidePanel).findByRole("button", { name: "Open 摘要整理 details" }),
+    );
 
-    expect(await screen.findByRole("heading", { name: "运行命令" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "调用企业工具" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "文件变更" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "等待审批" })).toBeInTheDocument();
-    expect(screen.getByText("来自子 Agent")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "允许一次" })).toBeDisabled();
+    const command = await within(sidePanel).findByRole("button", {
+      name: /^查看命令 .*pwd/,
+    });
+    expect(
+      within(sidePanel).getByRole("button", { name: /^查看工具 .*feishu_doc_read/ }),
+    ).toBeVisible();
+    expect(
+      within(sidePanel).getByRole("button", { name: "查看文件变更 1 file changed" }),
+    ).toBeVisible();
+    expect(within(sidePanel).getByRole("heading", { name: "等待审批" })).toBeInTheDocument();
+    expect(within(sidePanel).getByText("来自子 Agent")).toBeInTheDocument();
+    expect(within(sidePanel).getByRole("button", { name: "允许一次" })).toBeDisabled();
+    expect(within(sidePanel).queryByText("SUBAGENT_RAW_OUTPUT")).not.toBeInTheDocument();
+
+    fireEvent.click(command);
+    const bottomPanel = await screen.findByRole("region", { name: "Bottom panel" });
+    expect(bottomPanel).toHaveTextContent("SUBAGENT_RAW_OUTPUT");
+    expect(within(bottomPanel).getByRole("tab", { name: "Terminal" })).toBeVisible();
+    const bottomToggle = screen.getByRole("button", { name: "Toggle bottom panel" });
+    expect(bottomToggle).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close bottom panel" }));
+    fireEvent.click(bottomToggle);
+    expect(screen.getByRole("region", { name: "Bottom panel" })).toHaveTextContent(
+      "SUBAGENT_RAW_OUTPUT",
+    );
   });
 
   test("shows a recoverable Subagent-detail error instead of an endless loading state", async () => {
@@ -477,11 +897,14 @@ describe("CodexPlatform 1.1 user workspace", () => {
     api.getSubagent.mockRejectedValue(new Error("SUBAGENT_DETAIL_UNAVAILABLE"));
     render(<App initialEntries={["/threads/thread-1"]} api={api} />);
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Subagents" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Open 摘要整理 details" }));
+    const sidePanel = await openSidePanel();
+    fireEvent.click(within(sidePanel).getByRole("tab", { name: "Subagents" }));
+    fireEvent.click(
+      await within(sidePanel).findByRole("button", { name: "Open 摘要整理 details" }),
+    );
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取子 Agent 详情");
-    expect(screen.queryByText("Loading subagent")).not.toBeInTheDocument();
+    expect(await within(sidePanel).findByRole("alert")).toHaveTextContent("无法读取子 Agent 详情");
+    expect(within(sidePanel).queryByText("Loading subagent")).not.toBeInTheDocument();
   });
 
   test("keeps the administrator console in a separate shell", async () => {
@@ -525,6 +948,68 @@ describe("CodexPlatform 1.1 user workspace", () => {
     expect(screen.queryByRole("navigation", { name: "Codex workspace" })).not.toBeInTheDocument();
   });
 
+  test("uses the Runtime default model and resets Effort when the model changes", async () => {
+    const api = createApi();
+    render(<App initialEntries={["/threads/new"]} api={api} />);
+
+    const picker = await screen.findByRole("button", {
+      name: "Model and Effort: Fake Codex Standard · medium",
+    });
+    fireEvent.click(picker);
+    fireEvent.click(screen.getByRole("option", { name: /Fake Codex Deep/ }));
+
+    expect(
+      screen.getByRole("button", {
+        name: "Model and Effort: Fake Codex Deep · high",
+      }),
+    ).toBeInTheDocument();
+  });
+
+  test("submits both the selected Runtime model and its supported Effort", async () => {
+    const api = createApi();
+    render(<App initialEntries={["/threads/new?project=project-1"]} api={api} />);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Model and Effort: Fake Codex Standard · medium",
+      }),
+    );
+    fireEvent.click(screen.getByRole("option", { name: /Fake Codex Deep/ }));
+    fireEvent.click(
+      screen.getByRole("radio", {
+        name: "xhigh",
+      }),
+    );
+    fireEvent.change(screen.getByLabelText("Message Codex"), {
+      target: { value: "整理知识库" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(api.startThreadTurn).toHaveBeenCalledWith("thread-created", "整理知识库", {
+        model: "fake-codex-deep",
+        reasoningEffort: "xhigh",
+        permissionMode: "DEFAULT",
+      }),
+    );
+  });
+
+  test("shows a stale Runtime catalog and fails closed when the catalog is unavailable", async () => {
+    const staleApi = createApi();
+    staleApi.listModels.mockResolvedValue({ ...modelCatalog, stale: true });
+    const first = render(<App initialEntries={["/threads/new"]} api={staleApi} />);
+
+    expect(await screen.findByText("模型目录可能已过期")).toBeInTheDocument();
+    first.unmount();
+
+    const unavailableApi = createApi();
+    unavailableApi.listModels.mockRejectedValue(new Error("MODEL_CATALOG_UNAVAILABLE"));
+    render(<App initialEntries={["/threads/new"]} api={unavailableApi} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取 Runtime 模型目录");
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+  });
+
   test("passes only policy-allowed Turn configuration and gives an explicit project priority", async () => {
     const api = createApi();
     const settings = await api.getMySettings();
@@ -534,14 +1019,17 @@ describe("CodexPlatform 1.1 user workspace", () => {
     });
     render(<App initialEntries={["/threads/new?project=project-1"]} api={api} />);
 
-    const effort = await screen.findByLabelText("Turn reasoning effort");
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Model and Effort: Fake Codex Standard · medium",
+      }),
+    );
     const permission = screen.getByLabelText("Turn permission mode");
-    await within(effort).findByRole("option", { name: "HIGH" });
-    expect(within(effort).queryByRole("option", { name: "ULTRA" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("radio", { name: "ultra" })).not.toBeInTheDocument();
     expect(
       within(permission).queryByRole("option", { name: "FULL_ACCESS" }),
     ).not.toBeInTheDocument();
-    fireEvent.change(effort, { target: { value: "HIGH" } });
+    fireEvent.click(screen.getByRole("radio", { name: "high" }));
     fireEvent.change(permission, { target: { value: "READ_ONLY" } });
     fireEvent.change(screen.getByLabelText("Message Codex"), {
       target: { value: "整理知识库" },
@@ -552,11 +1040,16 @@ describe("CodexPlatform 1.1 user workspace", () => {
       expect(api.createThread).toHaveBeenCalledWith({
         projectId: "project-1",
         title: "整理知识库",
-        config: { reasoningEffort: "HIGH", permissionMode: "READ_ONLY" },
+        config: {
+          model: "fake-codex-standard",
+          reasoningEffort: "high",
+          permissionMode: "READ_ONLY",
+        },
       }),
     );
     expect(api.startThreadTurn).toHaveBeenCalledWith("thread-created", "整理知识库", {
-      reasoningEffort: "HIGH",
+      model: "fake-codex-standard",
+      reasoningEffort: "high",
       permissionMode: "READ_ONLY",
     });
   });
@@ -598,26 +1091,42 @@ describe("CodexPlatform 1.1 user workspace", () => {
     expect(composer).toHaveValue("继续处理未完成部分");
   });
 
-  test("disables Continue while a resume request is pending", async () => {
+  test("requires an explicit Composer follow-up instead of sending a synthetic Continue prompt", async () => {
     const api = createApi();
     api.getThread.mockResolvedValue({ ...thread, status: "COMPLETED" });
-    api.startThreadTurn.mockImplementation(() => new Promise(() => undefined));
     render(<App initialEntries={["/threads/thread-1"]} api={api} />);
 
-    const resume = await screen.findByRole("button", { name: "继续" });
-    fireEvent.click(resume);
-
-    await waitFor(() => expect(resume).toBeDisabled());
+    expect(await screen.findByLabelText("Message Codex")).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "继续" })).not.toBeInTheDocument();
+    expect(api.startThreadTurn).not.toHaveBeenCalled();
   });
 
   test("passes the selected Turn configuration to a continuous follow-up", async () => {
     const api = createApi();
-    api.getThread.mockResolvedValue({ ...thread, status: "COMPLETED" });
+    api.getThread.mockResolvedValue({
+      ...thread,
+      status: "COMPLETED",
+      currentTurn: {
+        ...thread.currentTurn,
+        status: "COMPLETED",
+        completedAt: "2026-07-25T12:05:00.000Z",
+      },
+      turns: [
+        {
+          ...thread.turns[0],
+          status: "COMPLETED",
+          completedAt: "2026-07-25T12:05:00.000Z",
+        },
+      ],
+    });
     render(<App initialEntries={["/threads/thread-1"]} api={api} />);
 
-    fireEvent.change(await screen.findByLabelText("Turn reasoning effort"), {
-      target: { value: "HIGH" },
-    });
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Model and Effort: Fake Codex Standard · medium",
+      }),
+    );
+    fireEvent.click(screen.getByRole("radio", { name: "high" }));
     fireEvent.change(screen.getByLabelText("Turn permission mode"), {
       target: { value: "WORKSPACE_WRITE" },
     });
@@ -628,7 +1137,8 @@ describe("CodexPlatform 1.1 user workspace", () => {
 
     await waitFor(() =>
       expect(api.startThreadTurn).toHaveBeenCalledWith("thread-1", "继续完善交付物", {
-        reasoningEffort: "HIGH",
+        model: "fake-codex-standard",
+        reasoningEffort: "high",
         permissionMode: "WORKSPACE_WRITE",
       }),
     );
@@ -637,7 +1147,11 @@ describe("CodexPlatform 1.1 user workspace", () => {
   test("locks Turn configuration while a running Turn can only accept Steer input", async () => {
     render(<App initialEntries={["/threads/thread-1"]} api={createApi()} />);
 
-    expect(await screen.findByLabelText("Turn reasoning effort")).toBeDisabled();
+    expect(
+      await screen.findByRole("button", {
+        name: "Model and Effort: Fake Codex Standard · medium",
+      }),
+    ).toBeDisabled();
     expect(screen.getByLabelText("Turn permission mode")).toBeDisabled();
     expect(screen.getByText(/Steer 沿用当前 Turn 的执行设置/)).toBeInTheDocument();
   });
@@ -653,7 +1167,11 @@ describe("CodexPlatform 1.1 user workspace", () => {
     });
     render(<App initialEntries={["/threads/thread-1"]} api={api} />);
 
-    expect(await screen.findByLabelText("Turn reasoning effort")).toBeDisabled();
+    expect(
+      await screen.findByRole("button", {
+        name: "Model and Effort: Fake Codex Standard · medium",
+      }),
+    ).toBeDisabled();
     expect(screen.getByLabelText("Turn permission mode")).toBeDisabled();
     expect(screen.getByLabelText("Message Codex")).toBeDisabled();
     expect(screen.getByText(/正在排队，暂不能提交新的 Turn/)).toBeInTheDocument();
@@ -708,14 +1226,132 @@ describe("CodexPlatform 1.1 user workspace", () => {
     const { listSubagents: _listSubagents, ...api } = createApi();
     render(<App initialEntries={["/threads/thread-1"]} api={api} />);
 
-    fireEvent.click(await screen.findByRole("tab", { name: "Subagents" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取子 Agent 列表");
-    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    const sidePanel = await openSidePanel();
+    fireEvent.click(within(sidePanel).getByRole("tab", { name: "Subagents" }));
+    expect(await within(sidePanel).findByRole("alert")).toHaveTextContent("无法读取子 Agent 列表");
+    expect(within(sidePanel).getByRole("button", { name: "重试" })).toBeInTheDocument();
+  });
+});
+
+describe("CodexPlatform 1.1 Thread archive", () => {
+  test("archives a completed Thread, refreshes history and opens Archived settings", async () => {
+    const api = createApi();
+    const completedThread = {
+      ...thread,
+      status: "COMPLETED" as const,
+      currentTurn: {
+        ...thread.currentTurn,
+        status: "COMPLETED" as const,
+        completedAt: "2026-07-25T12:00:10.000Z",
+      },
+      turns: [
+        {
+          ...thread.turns[0],
+          status: "COMPLETED" as const,
+          completedAt: "2026-07-25T12:00:10.000Z",
+        },
+      ],
+    };
+    api.getThread.mockResolvedValue(completedThread);
+    api.listThreads.mockResolvedValueOnce([completedThread]).mockResolvedValue([]);
+
+    render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Thread" }));
+
+    await waitFor(() => expect(api.archiveThread).toHaveBeenCalledWith("thread-1"));
+    expect(await screen.findByRole("heading", { name: "Archived" })).toBeInTheDocument();
+    expect(screen.getByText(/仅整理 CodexPlatform 中的历史记录/)).toBeInTheDocument();
+    await waitFor(() => expect(api.listThreads.mock.calls.length).toBeGreaterThanOrEqual(2));
+  });
+
+  test.each(["RUNNING", "QUEUED", "WAITING_APPROVAL"] as const)(
+    "does not offer Archive while a Thread is %s",
+    async (status) => {
+      const api = createApi();
+      api.getThread.mockResolvedValue({
+        ...thread,
+        status,
+        currentTurn: {
+          ...thread.currentTurn,
+          status,
+        },
+        turns: [
+          {
+            ...thread.turns[0],
+            status,
+          },
+        ],
+        queue: status === "QUEUED" ? { position: 1, etaMs: 60_000, etaEstimated: true } : null,
+      });
+
+      render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+
+      await screen.findByRole("heading", { name: "梳理客户成功周报" });
+      expect(screen.queryByRole("button", { name: "Archive Thread" })).not.toBeInTheDocument();
+    },
+  );
+
+  test("keeps the completed Thread open and reports an Archive failure", async () => {
+    const api = createApi();
+    api.getThread.mockResolvedValue({
+      ...thread,
+      status: "FAILED",
+      currentTurn: {
+        ...thread.currentTurn,
+        status: "FAILED",
+        completedAt: "2026-07-25T12:00:10.000Z",
+      },
+      turns: [
+        {
+          ...thread.turns[0],
+          status: "FAILED",
+          completedAt: "2026-07-25T12:00:10.000Z",
+        },
+      ],
+    });
+    api.archiveThread.mockRejectedValue(new Error("ARCHIVE_FAILED"));
+
+    render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Archive Thread" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("ARCHIVE_FAILED");
+    expect(screen.getByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
+  });
+
+  test("uses server archivedAt to make a direct Thread URL read-only", async () => {
+    const api = createApi();
+    api.getThread.mockResolvedValue({
+      ...thread,
+      archivedAt: "2026-07-25T12:05:00.000Z",
+      status: "COMPLETED",
+      currentTurn: {
+        ...thread.currentTurn,
+        status: "COMPLETED",
+        completedAt: "2026-07-25T12:00:10.000Z",
+      },
+      turns: [
+        {
+          ...thread.turns[0],
+          status: "COMPLETED",
+          completedAt: "2026-07-25T12:00:10.000Z",
+        },
+      ],
+    });
+
+    render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+
+    expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "继续" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Message Codex")).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Archive Thread" })).not.toBeInTheDocument();
+    expect(screen.getByText(/服务端标记为平台归档/)).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "返回 Archived" })).not.toBeInTheDocument();
   });
 });
 
 describe("CodexPlatform 1.1 personal settings", () => {
-  test("contains only the approved personal sections and reports unavailable catalogs honestly", async () => {
+  test("contains only the approved personal sections and uses the Runtime model catalog", async () => {
     render(<App initialEntries={["/settings/execution"]} api={createApi()} />);
 
     expect(await screen.findByRole("heading", { name: "Execution" })).toBeInTheDocument();
@@ -733,8 +1369,11 @@ describe("CodexPlatform 1.1 personal settings", () => {
       expect(within(navigation).getByRole("link", { name: label })).toBeInTheDocument();
     }
     expect(within(navigation).getAllByRole("link")).toHaveLength(8);
-    expect(await screen.findByText("Runtime default")).toBeInTheDocument();
-    expect(await screen.findByText(/Model catalog not connected in 1.1A/)).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", {
+        name: "Model and Effort: Fake Codex Standard · medium",
+      }),
+    ).toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/config\.toml|CODEX_HOME|password|cookie|token/i);
   });
 
@@ -742,13 +1381,21 @@ describe("CodexPlatform 1.1 personal settings", () => {
     const api = createApi();
     render(<App initialEntries={["/settings/execution"]} api={api} />);
 
-    const effort = await screen.findByLabelText("Reasoning effort");
-    fireEvent.change(effort, { target: { value: "HIGH" } });
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Model and Effort: Fake Codex Standard · medium",
+      }),
+    );
+    fireEvent.click(screen.getByRole("option", { name: /Fake Codex Deep/ }));
+    fireEvent.click(screen.getByRole("radio", { name: "xhigh" }));
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     await waitFor(() =>
       expect(api.patchMySettings).toHaveBeenCalledWith({
-        execution: expect.objectContaining({ reasoningEffort: "HIGH" }),
+        execution: expect.objectContaining({
+          model: "fake-codex-deep",
+          reasoningEffort: "xhigh",
+        }),
       }),
     );
   });
@@ -758,6 +1405,9 @@ describe("CodexPlatform 1.1 personal settings", () => {
     api.patchMySettings.mockRejectedValue(new Error("SETTINGS_POLICY_REJECTED"));
     render(<App initialEntries={["/settings/execution"]} api={api} />);
 
+    await screen.findByRole("button", {
+      name: "Model and Effort: Fake Codex Standard · medium",
+    });
     fireEvent.click(await screen.findByRole("button", { name: "Save settings" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("SETTINGS_POLICY_REJECTED");
@@ -783,6 +1433,106 @@ describe("CodexPlatform 1.1 personal settings", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("无法读取个人设置");
     expect(screen.queryByRole("button", { name: "Save settings" })).not.toBeInTheDocument();
+  });
+
+  test("lists archived Threads as platform organization records with view and Unarchive actions", async () => {
+    const api = createApi();
+    api.listArchivedThreads.mockResolvedValue([
+      {
+        ...thread,
+        id: "archived-thread",
+        title: "已归档客户周报",
+        status: "COMPLETED",
+        archivedAt: "2026-07-25T12:05:00.000Z",
+      },
+    ]);
+
+    render(<App initialEntries={["/settings/archived"]} api={api} />);
+
+    expect(await screen.findByText("已归档客户周报")).toBeInTheDocument();
+    expect(screen.getByText(/仅整理 CodexPlatform 中的历史记录/)).toBeInTheDocument();
+    expect(screen.getByText(/不会改变 Codex App Server Thread/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "查看 已归档客户周报" })).toHaveAttribute(
+      "href",
+      "/threads/archived-thread?archived=1",
+    );
+    expect(screen.getByRole("button", { name: "Unarchive 已归档客户周报" })).toBeInTheDocument();
+  });
+
+  test("Unarchives a Thread, invalidates lists and returns to the Thread", async () => {
+    const api = createApi();
+    api.listArchivedThreads.mockResolvedValue([
+      {
+        ...thread,
+        id: "archived-thread",
+        title: "已归档客户周报",
+        status: "COMPLETED",
+        archivedAt: "2026-07-25T12:05:00.000Z",
+      },
+    ]);
+    api.getThread.mockResolvedValue({
+      ...thread,
+      id: "archived-thread",
+      title: "已归档客户周报",
+      status: "COMPLETED",
+    });
+
+    render(<App initialEntries={["/settings/archived"]} api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Unarchive 已归档客户周报" }));
+
+    await waitFor(() => expect(api.unarchiveThread).toHaveBeenCalledWith("archived-thread"));
+    expect(await screen.findByRole("heading", { name: "已归档客户周报" })).toBeInTheDocument();
+    await waitFor(() => expect(api.listThreads.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(api.listArchivedThreads.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("fails closed when the archived Thread list cannot be read", async () => {
+    const api = createApi();
+    api.listArchivedThreads.mockRejectedValue(new Error("ARCHIVE_READ_FAILED"));
+
+    render(<App initialEntries={["/settings/archived"]} api={api} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法读取归档 Thread");
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Unarchive/ })).not.toBeInTheDocument();
+  });
+
+  test("shows a real loading state while archived Threads are unresolved", async () => {
+    const api = createApi();
+    api.listArchivedThreads.mockReturnValue(new Promise(() => undefined));
+
+    render(<App initialEntries={["/settings/archived"]} api={api} />);
+
+    expect(await screen.findByText("Loading archived Threads")).toBeInTheDocument();
+    expect(screen.queryByText("No archived chats")).not.toBeInTheDocument();
+  });
+
+  test("shows an explicit empty state when the user has no archived Threads", async () => {
+    render(<App initialEntries={["/settings/archived"]} api={createApi()} />);
+
+    expect(await screen.findByText("No archived chats")).toBeInTheDocument();
+    expect(screen.getByText("Archived Threads will appear here.")).toBeInTheDocument();
+  });
+
+  test("keeps an archived Thread visible when Unarchive fails", async () => {
+    const api = createApi();
+    api.listArchivedThreads.mockResolvedValue([
+      {
+        ...thread,
+        id: "archived-thread",
+        title: "已归档客户周报",
+        status: "FAILED",
+        archivedAt: "2026-07-25T12:05:00.000Z",
+      },
+    ]);
+    api.unarchiveThread.mockRejectedValue(new Error("UNARCHIVE_FAILED"));
+
+    render(<App initialEntries={["/settings/archived"]} api={api} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Unarchive 已归档客户周报" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("UNARCHIVE_FAILED");
+    expect(screen.getByText("已归档客户周报")).toBeInTheDocument();
   });
 
   test("stores the personal default project in General settings", async () => {

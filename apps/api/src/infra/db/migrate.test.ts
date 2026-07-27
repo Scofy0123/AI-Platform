@@ -93,6 +93,40 @@ describe("migrateDatabase", () => {
     ).toEqual({ name: "thread_token_usage" });
   });
 
+  test("adds nullable local archive state to legacy tasks without changing existing rows", () => {
+    const database = new Database(":memory:");
+    databases.push(database);
+    database.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        queue_ticket INTEGER,
+        account_id TEXT,
+        account_alias TEXT,
+        lease_id TEXT,
+        thread_id TEXT,
+        current_turn_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO tasks (
+        id, project_id, owner_id, title, status, created_at, updated_at
+      ) VALUES ('task-1', 'project-1', 'user-1', 'Existing thread', 'COMPLETED', 1, 2);
+    `);
+
+    migrateDatabase(database);
+    migrateDatabase(database);
+
+    const columns = database.pragma("table_info(tasks)") as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toContain("archived_at");
+    expect(database.prepare("SELECT id, archived_at FROM tasks").all()).toEqual([
+      { id: "task-1", archived_at: null },
+    ]);
+  });
+
   test("adds nullable required account affinity to legacy queue entries idempotently", () => {
     const database = new Database(":memory:");
     databases.push(database);

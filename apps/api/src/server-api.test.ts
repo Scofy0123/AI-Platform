@@ -1,12 +1,32 @@
 import { EventEmitter } from "node:events";
-import type { Bootstrap, Thread, UserSettingsView } from "@codexplatform/contracts";
+import type {
+  Bootstrap,
+  ModelCatalog,
+  ModelOption,
+  Thread,
+  UserSettingsView,
+} from "@codexplatform/contracts";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   ActiveTurnResumeConflictError,
   InvalidThreadResumeResponseError,
+  ModelCatalogUnavailableError,
 } from "./domain/platform-service.js";
 import { buildApp, streamTaskEvents, subscribeWithReplay } from "./server.js";
 import type { AuthApi, PlatformApi } from "./web-api.js";
+
+const STANDARD_MODEL: ModelOption = {
+  id: "fake-codex-standard",
+  model: "fake-codex-standard",
+  displayName: "Fake Codex Standard",
+  description: "Deterministic test model",
+  hidden: false,
+  isDefault: true,
+  defaultReasoningEffort: "medium",
+  supportedReasoningEfforts: [{ value: "medium", description: "Balanced" }],
+  inputModalities: ["text"],
+  supportsPersonality: false,
+};
 
 describe("CodexPlatform HTTP API", () => {
   const apps: Array<ReturnType<typeof buildApp>> = [];
@@ -180,6 +200,97 @@ describe("CodexPlatform HTTP API", () => {
     expect(unsubscribe).toHaveBeenCalledOnce();
   });
 
+  test("projects nested reasoning envelopes safely across Thread REST and SSE replay", async () => {
+    const rawReasoningCanary = "RAW_REASONING_CANARY_HTTP_f8c2";
+    const event = {
+      taskId: "thread-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "tool-1",
+      sequence: 1,
+      timestamp: "2026-07-21T12:00:00.000Z",
+      type: "TOOL_COMPLETED",
+      payload: {
+        itemId: "tool-1",
+        tool: "business_read",
+        result: {
+          reasoning: {
+            summary: "Readable execution summary.",
+            content: [{ type: "reasoning_text", text: rawReasoningCanary }],
+            reasoningTextDelta: rawReasoningCanary,
+            encrypted_content: rawReasoningCanary,
+          },
+        },
+        durationMs: 17,
+      },
+    } as const;
+    const { auth, platform } = services();
+    platform.getThread.mockResolvedValueOnce({
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Safe Thread",
+      status: "COMPLETED",
+      updatedAt: "2026-07-21T12:00:00.000Z",
+      archivedAt: null,
+      currentTurn: null,
+      turns: [],
+      queue: null,
+      items: [
+        {
+          id: "tool-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 1,
+          type: event.type,
+          timestamp: event.timestamp,
+          payload: event.payload,
+        },
+      ],
+    } as never);
+    platform.listThreadEvents.mockResolvedValueOnce([event] as never);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const threadResponse = await app.inject({
+      method: "GET",
+      url: "/api/threads/thread-1",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const eventResponse = await app.inject({
+      method: "GET",
+      url: "/api/threads/thread-1/events",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { accept: "application/json" },
+    });
+
+    const raw = Object.assign(new EventEmitter(), {
+      destroyed: false,
+      writableEnded: false,
+      writeHead: vi.fn(),
+      write: vi.fn((_chunk: string) => true),
+      end: vi.fn(),
+      destroy: vi.fn(),
+    });
+    const unsubscribe = vi.fn();
+    await streamTaskEvents({ hijack: vi.fn(), raw } as never, {
+      afterSequence: 0,
+      loadReplay: async () => [event] as never,
+      subscribe: () => unsubscribe,
+      sessionExpiresAt: new Date(Date.now() + 60_000),
+      isSessionValid: () => true,
+      hideAccountAlias: true,
+    });
+    const sseReplay = raw.write.mock.calls.map(([chunk]) => String(chunk)).join("");
+    raw.emit("close");
+
+    const serialized = [threadResponse.body, eventResponse.body, sseReplay].join("\n");
+    expect(threadResponse.statusCode).toBe(200);
+    expect(eventResponse.statusCode).toBe(200);
+    expect(serialized).toContain("Readable execution summary.");
+    expect(serialized).not.toContain(rawReasoningCanary);
+    expect(serialized).not.toMatch(/reasoningTextDelta|encrypted_content/);
+  });
+
   test("requires a session and CSRF token for writes", async () => {
     const { auth, platform } = services();
     const app = buildApp({ auth, platform });
@@ -209,6 +320,54 @@ describe("CodexPlatform HTTP API", () => {
     });
     expect(created.statusCode).toBe(201);
     expect(platform.createProject).toHaveBeenCalledWith("user-1", { name: "Platform" });
+  });
+
+  test("returns the current user's public model catalog without account metadata", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const anonymous = await app.inject({ method: "GET", url: "/api/models" });
+    expect(anonymous.statusCode).toBe(401);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/models?threadId=thread-1",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(platform.listModels).toHaveBeenCalledWith("user-1", "thread-1");
+    expect(response.json()).toMatchObject({
+      scope: "SINGLE_ACCOUNT",
+      accountCount: 1,
+      models: [expect.objectContaining({ model: "fake-codex-standard" })],
+    });
+    expect(response.body).not.toMatch(/accountId|accountAlias|codexHome|Codex A/i);
+  });
+
+  test("fails model catalog reads with 503 instead of inventing a fallback model", async () => {
+    const { auth, platform } = services();
+    platform.listModels.mockRejectedValueOnce(
+      new ModelCatalogUnavailableError(
+        "Runtime said /private/codex-home/account-1 and Codex A are unavailable",
+      ),
+    );
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/models",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: "MODEL_CATALOG_UNAVAILABLE",
+      message: "Runtime model catalog is unavailable",
+    });
+    expect(response.body).not.toMatch(/private|account-1|Codex A/i);
   });
 
   test("replays task events after Last-Event-ID without exposing another user's task", async () => {
@@ -700,6 +859,93 @@ describe("CodexPlatform HTTP API", () => {
     });
   });
 
+  test("exposes owner-scoped local Thread archive routes with CSRF protection", async () => {
+    const { auth, platform } = services();
+    platform.listArchivedThreads.mockResolvedValueOnce([
+      {
+        id: "thread-archived",
+        projectId: "project-1",
+        title: "Archived",
+        status: "COMPLETED",
+        updatedAt: "2026-07-21T12:00:00.000Z",
+        archivedAt: "2026-07-21T12:00:00.000Z",
+        currentTurn: null,
+        turns: [],
+        queue: null,
+        items: [],
+      },
+    ]);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const archived = await app.inject({
+      method: "GET",
+      url: "/api/threads/archived",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const archiveWithoutCsrf = await app.inject({
+      method: "POST",
+      url: "/api/threads/thread-1/archive",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const archive = await app.inject({
+      method: "POST",
+      url: "/api/threads/thread-1/archive",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+    });
+    const unarchive = await app.inject({
+      method: "POST",
+      url: "/api/threads/thread-1/unarchive",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+    });
+
+    expect(archived.statusCode).toBe(200);
+    expect(archived.json()).toEqual([
+      expect.objectContaining({ id: "thread-archived", title: "Archived" }),
+    ]);
+    expect(archiveWithoutCsrf.statusCode).toBe(403);
+    expect(archive.statusCode).toBe(200);
+    expect(archive.json()).toEqual({ ok: true });
+    expect(unarchive.statusCode).toBe(200);
+    expect(unarchive.json()).toEqual({ ok: true });
+    expect(platform.listArchivedThreads).toHaveBeenCalledWith("user-1");
+    expect(platform.archiveThread).toHaveBeenCalledWith("thread-1", "user-1");
+    expect(platform.unarchiveThread).toHaveBeenCalledWith("thread-1", "user-1");
+  });
+
+  test("returns conflict when an active Thread cannot be archived", async () => {
+    const { auth, platform } = services();
+    platform.archiveThread.mockRejectedValueOnce(
+      new Error("Thread has active work and cannot be archived"),
+    );
+    platform.startThreadTurn.mockRejectedValueOnce(new Error("Thread is archived"));
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const archive = await app.inject({
+      method: "POST",
+      url: "/api/threads/thread-1/archive",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+    });
+    const start = await app.inject({
+      method: "POST",
+      url: "/api/threads/thread-1/turns",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "Bypass archived state" },
+    });
+
+    expect(archive.statusCode).toBe(409);
+    expect(archive.json()).toEqual({
+      error: "Thread has active work and cannot be archived",
+    });
+    expect(start.statusCode).toBe(409);
+    expect(start.json()).toEqual({ error: "Thread is archived" });
+  });
+
   test("returns 400 when a default Settings project is unknown or not owned", async () => {
     const { auth, platform } = services();
     platform.patchMySettings.mockRejectedValueOnce(new Error("Invalid default project"));
@@ -768,6 +1014,86 @@ describe("CodexPlatform HTTP API", () => {
     expect(response.body).not.toMatch(
       /raw secret|raw content|ciphertext|reasoningTextDelta|encrypted_content|Codex A/,
     );
+  });
+
+  test("redacts configured runtime paths from Thread REST and SSE replay", async () => {
+    const runtimeDataDir = "/private/var/runtime/CODEX_HOME_SENTINEL_HTTP_71c4";
+    const accountHome = `${runtimeDataDir}/codex-accounts/codex-private`;
+    const workspaceDir = `${runtimeDataDir}/workspaces/thread-1`;
+    const commandEvent = {
+      taskId: "thread-1",
+      threadId: "runtime-thread-1",
+      turnId: "turn-1",
+      itemId: "command-1",
+      sequence: 1,
+      timestamp: "2026-07-21T12:00:00.000Z",
+      type: "COMMAND_COMPLETED" as const,
+      payload: {
+        itemId: "command-1",
+        command: `CODEX_HOME=${accountHome} node ${workspaceDir}/script.js packages/app/src/index.ts`,
+        aggregatedOutput: `failed in ${runtimeDataDir}`,
+        exitCode: 1,
+        durationMs: 5,
+      },
+    };
+    const { auth, platform } = services();
+    platform.getThread.mockResolvedValueOnce({
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Runtime path safety",
+      status: "RUNNING",
+      updatedAt: "2026-07-21T12:00:00.000Z",
+      archivedAt: null,
+      currentTurn: null,
+      turns: [],
+      queue: null,
+      items: [
+        {
+          id: "command-1",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          sequence: 1,
+          type: "COMMAND_COMPLETED",
+          timestamp: "2026-07-21T12:00:00.000Z",
+          payload: commandEvent.payload,
+        },
+      ],
+    } as never);
+    const app = buildApp({ auth, platform, runtimeDataDir });
+    apps.push(app);
+
+    const thread = await app.inject({
+      method: "GET",
+      url: "/api/threads/thread-1",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    const raw = Object.assign(new EventEmitter(), {
+      destroyed: false,
+      writableEnded: false,
+      writeHead: vi.fn(),
+      write: vi.fn(() => true),
+      end: vi.fn(),
+      destroy: vi.fn(),
+    });
+    const unsubscribe = vi.fn();
+    await streamTaskEvents({ hijack: vi.fn(), raw } as never, {
+      afterSequence: 0,
+      loadReplay: async () => [commandEvent],
+      subscribe: () => unsubscribe,
+      sessionExpiresAt: new Date(Date.now() + 60_000),
+      isSessionValid: () => true,
+      runtimeDataDir,
+    });
+    raw.emit("close");
+
+    const serialized = `${thread.body}\n${raw.write.mock.calls.flat().join("\n")}`;
+    expect(thread.statusCode).toBe(200);
+    expect(serialized).not.toContain(runtimeDataDir);
+    expect(serialized).not.toContain("CODEX_HOME_SENTINEL_HTTP_71c4");
+    expect(serialized).toContain("[RUNTIME_DATA]");
+    expect(serialized).toContain("packages/app/src/index.ts");
+    expect(unsubscribe).toHaveBeenCalledOnce();
   });
 
   test("serves personal projections and keeps every new admin endpoint admin-only", async () => {
@@ -897,6 +1223,15 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
         },
       }),
     ),
+    listModels: vi.fn(
+      async (): Promise<ModelCatalog> => ({
+        models: [STANDARD_MODEL],
+        scope: "SINGLE_ACCOUNT",
+        accountCount: 1,
+        observedAt: "2026-07-21T12:00:00.000Z",
+        stale: false,
+      }),
+    ),
     createProject: vi.fn(async () => ({ id: "project-1" })),
     listProjects: vi.fn(async () => []),
     createTask: vi.fn(async () => ({ id: "task-1" })),
@@ -917,18 +1252,23 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       title: "New thread",
       status: "READY" as const,
       updatedAt: "2026-07-21T12:00:00.000Z",
+      archivedAt: null,
       currentTurn: null,
       turns: [],
       queue: null,
       items: [],
     })),
     listThreads: vi.fn(async () => []),
+    listArchivedThreads: vi.fn(async (): Promise<Thread[]> => []),
+    archiveThread: vi.fn(async () => ({ ok: true as const })),
+    unarchiveThread: vi.fn(async () => ({ ok: true as const })),
     getThread: vi.fn(async () => ({
       id: "thread-1",
       projectId: "project-1",
       title: "Build it",
       status: "RUNNING" as const,
       updatedAt: "2026-07-21T12:00:00.000Z",
+      archivedAt: null,
       currentTurn: null,
       turns: [],
       queue: null,
@@ -940,6 +1280,7 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       title: "Member Thread",
       status: "COMPLETED" as const,
       updatedAt: "2026-07-21T12:00:00.000Z",
+      archivedAt: null,
       currentTurn: null,
       turns: [],
       queue: null,

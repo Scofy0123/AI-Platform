@@ -2,6 +2,61 @@ import { describe, expect, test, vi } from "vitest";
 import { FakeExecutionAdapter } from "./fake-execution-adapter.js";
 
 describe("FakeExecutionAdapter", () => {
+  test("publishes a deterministic fake-only model catalog", async () => {
+    const adapter = new FakeExecutionAdapter();
+
+    await expect(
+      adapter.listModels({
+        id: "account-1",
+        alias: "Fake Codex",
+        codexHome: "/tmp/fake",
+        status: "AVAILABLE",
+        authStatus: "AUTHENTICATED",
+        activeUsers: 0,
+        activeTurns: 0,
+        maxActiveUsers: 4,
+        weeklyRemaining: 90,
+        quotaUpdatedAt: "2026-07-27T00:00:00.000Z",
+        quotaResetsAt: "2026-08-03T00:00:00.000Z",
+        allowUnknownQuota: false,
+        healthScore: 100,
+      }),
+    ).resolves.toEqual([
+      {
+        id: "fake-codex-standard",
+        model: "fake-codex-standard",
+        displayName: "Fake Standard",
+        description: "Deterministic local model fixture for standard test flows.",
+        hidden: false,
+        isDefault: true,
+        defaultReasoningEffort: "medium",
+        supportedReasoningEfforts: [
+          { value: "low", description: "Fast fixture response." },
+          { value: "medium", description: "Balanced fixture response." },
+          { value: "high", description: "Detailed fixture response." },
+        ],
+        inputModalities: ["text"],
+        supportsPersonality: true,
+      },
+      {
+        id: "fake-codex-deep",
+        model: "fake-codex-deep",
+        displayName: "Fake Deep",
+        description: "Deterministic local model fixture for deeper test flows.",
+        hidden: false,
+        isDefault: false,
+        defaultReasoningEffort: "high",
+        supportedReasoningEfforts: [
+          { value: "medium", description: "Balanced fixture response." },
+          { value: "high", description: "Detailed fixture response." },
+          { value: "xhigh", description: "Maximum-depth fixture response." },
+        ],
+        inputModalities: ["text"],
+        supportsPersonality: true,
+      },
+    ]);
+  });
+
   test("simulates the full visible Codex workflow for local UI and scheduler tests", async () => {
     const adapter = new FakeExecutionAdapter();
     const listener = vi.fn();

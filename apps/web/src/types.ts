@@ -1,6 +1,7 @@
 import type {
   Bootstrap,
   EffectiveConfigOverride,
+  ModelCatalog,
   SubagentThread,
   SubagentThreadDetail,
   TaskDetail as TaskDetailDto,
@@ -13,6 +14,8 @@ import type {
 
 export type {
   Bootstrap,
+  ModelCatalog,
+  ModelOption,
   SubagentThread,
   SubagentThreadDetail,
   TaskEvent,
@@ -163,6 +166,7 @@ export interface RuntimeHealth {
 export interface PlatformApi {
   getSession(): Promise<Session>;
   getBootstrap?(): Promise<Bootstrap>;
+  listModels?(threadId?: string): Promise<ModelCatalog>;
   listProjects(): Promise<ProjectSummary[]>;
   createProject(name: string): Promise<{ id: string }>;
   listTasks(): Promise<TaskSummary[]>;
@@ -172,6 +176,7 @@ export interface PlatformApi {
   taskAction(taskId: string, action: "interrupt" | "steer", input?: string): Promise<unknown>;
   decideApproval(approvalId: string, decision: "accept" | "decline"): Promise<unknown>;
   listThreads?(projectId?: string): Promise<Thread[]>;
+  listArchivedThreads?(): Promise<Thread[]>;
   getThread?(threadId: string): Promise<Thread>;
   getAdminThread?(threadId: string): Promise<Thread>;
   createThread?(input: {
@@ -185,6 +190,8 @@ export interface PlatformApi {
     config?: EffectiveConfigOverride,
   ): Promise<unknown>;
   threadAction?(threadId: string, action: "interrupt" | "steer", input?: string): Promise<unknown>;
+  archiveThread?(threadId: string): Promise<{ ok: true }>;
+  unarchiveThread?(threadId: string): Promise<{ ok: true }>;
   listSubagents?(threadId: string): Promise<SubagentThread[]>;
   getSubagent?(threadId: string): Promise<SubagentThreadDetail>;
   getMySettings?(): Promise<UserSettingsView>;

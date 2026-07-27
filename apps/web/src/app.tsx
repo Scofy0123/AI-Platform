@@ -1,4 +1,4 @@
-import type { TaskEvent } from "@codexplatform/contracts";
+import type { TaskEvent, Turn } from "@codexplatform/contracts";
 import {
   QueryClient,
   QueryClientProvider,
@@ -7,11 +7,13 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import {
+  type CSSProperties,
   createContext,
   type FormEvent,
   type ReactNode,
   useContext,
   useEffect,
+  useReducer,
   useRef,
   useState,
 } from "react";
@@ -28,14 +30,30 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import { ApiError, httpApi } from "./api.js";
+import { BottomPanel } from "./components/thread/BottomPanel.js";
+import {
+  ModelEffortPicker,
+  type ModelSelection,
+  resolveCatalogSelection,
+} from "./components/thread/ModelEffortPicker.js";
+import { PinnedExecutionSummary } from "./components/thread/PinnedExecutionSummary.js";
+import { SidePanel } from "./components/thread/SidePanel.js";
+import { Transcript } from "./components/thread/Transcript.js";
 import { subscribeTaskEvents } from "./event-stream.js";
 import { Icon } from "./icons.js";
 import {
   coalesceThreadEvents,
   isSafeConversationEvent,
   mergeThreadEvents,
+  projectToolDetails,
   threadItemToEvent,
 } from "./thread-events.js";
+import {
+  projectThreadPresentation,
+  type TerminalDetail,
+  type ThreadPresentation,
+  type TranscriptApprovalRow,
+} from "./thread-presentation.js";
 import type {
   AccountSummary,
   PlatformApi,
@@ -47,6 +65,12 @@ import type {
   UserSettingsPatch,
   UserSettingsView,
 } from "./types.js";
+import {
+  type BottomPanelTab,
+  createWorkspaceLayoutState,
+  reduceWorkspaceLayout,
+  type SidePanelTab,
+} from "./workspace-layout.js";
 
 interface AppProps {
   api?: PlatformApi;
@@ -328,23 +352,37 @@ function NewThreadPage() {
       return api.getMySettings();
     },
   });
+  const models = useQuery({
+    queryKey: ["models", "new-thread"],
+    queryFn: () => {
+      if (!api.listModels) throw new Error("Model catalog endpoint unavailable");
+      return api.listModels();
+    },
+  });
   const [prompt, setPrompt] = useState("");
   const [projectId, setProjectId] = useState(routeProjectId);
-  const [reasoningEffort, setReasoningEffort] = useState<string | null>(null);
+  const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
   const [permissionMode, setPermissionMode] = useState<
     "DEFAULT" | "READ_ONLY" | "WORKSPACE_WRITE" | null
   >(null);
   const [error, setError] = useState<string | null>(null);
-  const selectedReasoningEffort =
-    reasoningEffort ?? settings.data?.execution.reasoningEffort ?? "MEDIUM";
+  const selectedModel = resolveCatalogSelection(
+    models.data,
+    modelSelection?.model ?? settings.data?.execution.model,
+    modelSelection?.reasoningEffort ?? settings.data?.execution.reasoningEffort,
+  );
   const selectedPermissionMode =
     permissionMode ?? settings.data?.execution.permissionMode ?? "DEFAULT";
-  const turnConfig = {
-    reasoningEffort: selectedReasoningEffort,
-    permissionMode: selectedPermissionMode,
-  };
+  const turnConfig = selectedModel
+    ? {
+        model: selectedModel.model,
+        reasoningEffort: selectedModel.reasoningEffort,
+        permissionMode: selectedPermissionMode,
+      }
+    : null;
   const create = useMutation({
     mutationFn: async () => {
+      if (!turnConfig) throw new Error("Runtime 模型目录不可用");
       const targetProjectId =
         projectId ||
         routeProjectId ||
@@ -418,17 +456,14 @@ function NewThreadPage() {
               </option>
             ))}
           </select>
-          <select
-            aria-label="Turn reasoning effort"
-            value={selectedReasoningEffort}
-            onChange={(event) => setReasoningEffort(event.target.value)}
-          >
-            {(settings.data?.policy.allowedReasoningEfforts ?? ["MEDIUM"]).map((option) => (
-              <option value={option} key={option}>
-                {option}
-              </option>
-            ))}
-          </select>
+          <ModelEffortPicker
+            catalog={models.data ?? null}
+            value={selectedModel}
+            onChange={setModelSelection}
+            loading={models.isPending}
+            error={models.isError}
+            disabled={create.isPending}
+          />
           <select
             aria-label="Turn permission mode"
             value={selectedPermissionMode}
@@ -442,12 +477,18 @@ function NewThreadPage() {
               </option>
             ))}
           </select>
-          <RuntimeTruth />
           <button
             type="submit"
             className="v11-send-button"
             aria-label="Send message"
-            disabled={create.isPending || settings.isPending || settings.isError}
+            disabled={
+              create.isPending ||
+              settings.isPending ||
+              settings.isError ||
+              models.isPending ||
+              models.isError ||
+              !selectedModel
+            }
           >
             <Icon name="send" />
           </button>
@@ -470,10 +511,13 @@ interface ThreadView {
   title: string;
   status: TaskStatus;
   updatedAt: string;
+  archivedAt: string | null;
   prompt: string | null;
   currentTurnId: string | null;
   currentTurnStatus: string | null;
-  turns: Array<{ id: string; prompt: string; status?: string }>;
+  lastModel: string | null;
+  lastReasoningEffort: string | null;
+  turns: Turn[];
   queue: Thread["queue"];
   events: TaskEvent[];
 }
@@ -489,9 +533,12 @@ async function loadThread(api: PlatformApi, threadId: string): Promise<ThreadVie
     title: task.title,
     status: task.status,
     updatedAt: task.updatedAt,
+    archivedAt: null,
     prompt: task.prompt,
     currentTurnId: null,
     currentTurnStatus: null,
+    lastModel: null,
+    lastReasoningEffort: null,
     turns: [],
     queue: task.queue,
     events: task.events ?? [],
@@ -499,20 +546,20 @@ async function loadThread(api: PlatformApi, threadId: string): Promise<ThreadVie
 }
 
 function projectThreadView(thread: Thread): ThreadView {
+  const latestTurn = thread.currentTurn ?? thread.turns.at(-1) ?? null;
   return {
     id: thread.id,
     projectId: thread.projectId,
     title: thread.title,
     status: thread.status,
     updatedAt: thread.updatedAt,
+    archivedAt: thread.archivedAt,
     prompt: thread.currentTurn?.prompt ?? thread.turns.at(-1)?.prompt ?? null,
     currentTurnId: thread.currentTurn?.id ?? null,
     currentTurnStatus: thread.currentTurn?.status ?? null,
-    turns: thread.turns.map((turn) => ({
-      id: turn.id,
-      prompt: turn.prompt,
-      status: turn.status,
-    })),
+    lastModel: latestTurn?.configSnapshot.model ?? null,
+    lastReasoningEffort: latestTurn?.configSnapshot.reasoningEffort ?? null,
+    turns: thread.turns,
     queue: thread.queue,
     events: thread.items.map((item) => threadItemToEvent(thread.id, item)),
   };
@@ -520,13 +567,26 @@ function projectThreadView(thread: Thread): ThreadView {
 
 function ThreadPage() {
   const { threadId = "" } = useParams();
+  const [searchParams] = useSearchParams();
   const api = useApi();
   const subscriber = useContext(EventSubscriberContext);
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const openedFromArchived = searchParams.get("archived") === "1";
   const thread = useQuery({
     queryKey: ["thread", threadId],
     queryFn: () => loadThread(api, threadId),
     enabled: Boolean(threadId),
+  });
+  const presentationSubagents = useQuery({
+    queryKey: ["subagents", threadId],
+    queryFn: () => {
+      if (!api.listSubagents) throw new Error("Subagent list unavailable");
+      return api.listSubagents(threadId);
+    },
+    enabled: Boolean(threadId),
+    refetchInterval: (query) =>
+      query.state.data?.some((agent) => agent.status === "ACTIVE") ? 2_000 : false,
   });
   const settings = useQuery({
     queryKey: ["my-settings"],
@@ -535,24 +595,49 @@ function ThreadPage() {
       return api.getMySettings();
     },
   });
+  const models = useQuery({
+    queryKey: ["models", threadId],
+    queryFn: () => {
+      if (!api.listModels) throw new Error("Model catalog endpoint unavailable");
+      return api.listModels(threadId);
+    },
+    enabled: Boolean(threadId),
+  });
   const [events, setEvents] = useState<TaskEvent[]>([]);
   const eventsRef = useRef<TaskEvent[]>([]);
   const activeThreadIdRef = useRef(threadId);
+  const [workspaceLayout, dispatchWorkspaceLayout] = useReducer(
+    reduceWorkspaceLayout,
+    undefined,
+    createWorkspaceLayoutState,
+  );
+  const pinnedToggleRef = useRef<HTMLButtonElement>(null);
+  const sideToggleRef = useRef<HTMLButtonElement>(null);
+  const bottomToggleRef = useRef<HTMLButtonElement>(null);
+  const [bottomTerminalSource, setBottomTerminalSource] = useState<TerminalDetail[] | null>(null);
   const [connection, setConnection] = useState<"connected" | "reconnecting">("connected");
   const [message, setMessage] = useState("");
-  const [reasoningEffort, setReasoningEffort] = useState<string | null>(null);
+  const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
   const [permissionMode, setPermissionMode] = useState<
     "DEFAULT" | "READ_ONLY" | "WORKSPACE_WRITE" | null
   >(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
-  const selectedReasoningEffort =
-    reasoningEffort ?? settings.data?.execution.reasoningEffort ?? "MEDIUM";
+  const selectedModel = resolveCatalogSelection(
+    models.data,
+    modelSelection?.model ?? thread.data?.lastModel ?? settings.data?.execution.model,
+    modelSelection?.reasoningEffort ??
+      thread.data?.lastReasoningEffort ??
+      settings.data?.execution.reasoningEffort,
+  );
   const selectedPermissionMode =
     permissionMode ?? settings.data?.execution.permissionMode ?? "DEFAULT";
-  const turnConfig = {
-    reasoningEffort: selectedReasoningEffort,
-    permissionMode: selectedPermissionMode,
-  };
+  const turnConfig = selectedModel
+    ? {
+        model: selectedModel.model,
+        reasoningEffort: selectedModel.reasoningEffort,
+        permissionMode: selectedPermissionMode,
+      }
+    : null;
   const initialLastEventId =
     thread.data?.events.reduce((maximum, event) => Math.max(maximum, event.sequence), 0) ?? 0;
 
@@ -562,9 +647,11 @@ function ThreadPage() {
     eventsRef.current = [];
     setEvents([]);
     setMessage("");
-    setReasoningEffort(null);
+    setModelSelection(null);
     setPermissionMode(null);
     setRuntimeError(null);
+    setBottomTerminalSource(null);
+    dispatchWorkspaceLayout({ type: "RESET_THREAD" });
   }, [threadId]);
   useEffect(() => {
     if (!thread.data) return;
@@ -613,8 +700,25 @@ function ThreadPage() {
   });
   const start = useMutation({
     mutationFn: async (prompt: string) => {
+      if (!turnConfig) throw new Error("Runtime 模型目录不可用");
       if (api.startThreadTurn) return api.startThreadTurn(threadId, prompt, turnConfig);
       return api.startTurn(threadId, prompt);
+    },
+    onError: (cause) => setRuntimeError(runtimeErrorMessage(cause)),
+  });
+  const archive = useMutation({
+    mutationFn: () => {
+      if (!api.archiveThread) throw new Error("Thread archive endpoint unavailable");
+      return api.archiveThread(threadId);
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["threads"] }),
+        queryClient.invalidateQueries({ queryKey: ["archived-threads"] }),
+        queryClient.invalidateQueries({ queryKey: ["thread", threadId] }),
+        queryClient.invalidateQueries({ queryKey: ["projects"] }),
+      ]);
+      navigate("/settings/archived", { replace: true });
     },
     onError: (cause) => setRuntimeError(runtimeErrorMessage(cause)),
   });
@@ -623,29 +727,46 @@ function ThreadPage() {
 
   const mergedEvents = mergeThreadEvents(thread.data.events, events);
   const status = projectStatus(thread.data.status, mergedEvents, thread.data.currentTurnId);
-  const canSteer = status === "RUNNING" || status === "WAITING_APPROVAL";
+  const archived = thread.data.archivedAt !== null;
+  const canSteer = !archived && (status === "RUNNING" || status === "WAITING_APPROVAL");
   const canInterrupt = canSteer;
-  const configLocked = ["ALLOCATING", "QUEUED", "RUNNING", "WAITING_APPROVAL"].includes(
-    thread.data.currentTurnStatus ?? status,
-  );
+  const configLocked =
+    archived ||
+    ["ALLOCATING", "QUEUED", "RUNNING", "WAITING_APPROVAL"].includes(
+      thread.data.currentTurnStatus ?? status,
+    );
   const waitingForAllocation = ["ALLOCATING", "QUEUED"].includes(
     thread.data.currentTurnStatus ?? status,
   );
-  const canStartTurn = [
-    "DRAFT",
-    "READY",
-    "COMPLETED",
-    "FAILED",
-    "INTERRUPTED",
-    "NEEDS_RECOVERY",
-  ].includes(status);
-  const canResume = ["COMPLETED", "FAILED", "INTERRUPTED", "NEEDS_RECOVERY"].includes(status);
-  const displayEvents = coalesceThreadEvents(mergedEvents).filter(isSafeConversationEvent);
+  const canStartTurn =
+    ["DRAFT", "READY", "COMPLETED", "FAILED", "INTERRUPTED", "NEEDS_RECOVERY"].includes(status) &&
+    !archived;
+  const canArchive =
+    ["COMPLETED", "FAILED", "INTERRUPTED", "NEEDS_RECOVERY"].includes(status) && !archived;
+  const projectedSubagents = mergeSubagents(
+    presentationSubagents.data ?? [],
+    projectEventSubagents(mergedEvents),
+  );
+  const presentation = projectThreadPresentation(
+    mergedEvents,
+    thread.data.turns,
+    projectedSubagents,
+  );
+  const visibleTerminals = bottomTerminalSource ?? presentation.bottom.terminals;
+  const availableBottomTabs: BottomPanelTab[] = [
+    visibleTerminals.length > 0 ? "terminal" : null,
+  ].filter((tab): tab is BottomPanelTab => tab !== null);
+  const defaultBottomTab = availableBottomTabs[0] ?? "terminal";
   const approvalDecisions = new Map(
     mergedEvents.flatMap((event) =>
       event.type === "APPROVAL_DECIDED"
         ? [[event.payload.approvalId, event.payload.decision] as const]
         : [],
+    ),
+  );
+  const approvalRequests = new Map(
+    mergedEvents.flatMap((event) =>
+      event.type === "APPROVAL_REQUESTED" ? [[event.payload.approvalId, event] as const] : [],
     ),
   );
   const closedTurnIds = new Set(
@@ -688,6 +809,49 @@ function ThreadPage() {
             <span className="live-dot" /> {connection === "connected" ? "Live" : "Reconnecting"}
           </span>
           <button
+            ref={pinnedToggleRef}
+            type="button"
+            aria-label="Toggle pinned summary"
+            aria-expanded={workspaceLayout.pinnedSummaryOpen}
+            aria-controls="thread-pinned-summary"
+            onClick={() => dispatchWorkspaceLayout({ type: "TOGGLE_PINNED" })}
+          >
+            <Icon name="grid" />
+          </button>
+          <button
+            ref={bottomToggleRef}
+            type="button"
+            aria-label="Toggle bottom panel"
+            aria-expanded={workspaceLayout.bottomPanel.open}
+            aria-controls="thread-bottom-panel"
+            disabled={availableBottomTabs.length === 0}
+            onClick={() => {
+              dispatchWorkspaceLayout(
+                workspaceLayout.bottomPanel.open
+                  ? { type: "CLOSE_BOTTOM" }
+                  : { type: "OPEN_BOTTOM", tab: defaultBottomTab },
+              );
+            }}
+          >
+            <Icon name="terminal" />
+          </button>
+          <button
+            ref={sideToggleRef}
+            type="button"
+            aria-label="Toggle side panel"
+            aria-expanded={workspaceLayout.sidePanel.open}
+            aria-controls="thread-side-panel"
+            onClick={() =>
+              dispatchWorkspaceLayout(
+                workspaceLayout.sidePanel.open
+                  ? { type: "CLOSE_SIDE" }
+                  : { type: "OPEN_SIDE", tab: workspaceLayout.sidePanel.tab },
+              )
+            }
+          >
+            <Icon name="project" />
+          </button>
+          <button
             type="button"
             onClick={() => {
               setRuntimeError(null);
@@ -697,130 +861,211 @@ function ThreadPage() {
           >
             <Icon name="pause" /> 停止
           </button>
-          <button
-            type="button"
-            onClick={() => {
-              setRuntimeError(null);
-              start.mutate("继续执行当前任务");
-            }}
-            disabled={
-              !canResume ||
-              start.isPending ||
-              action.isPending ||
-              settings.isPending ||
-              settings.isError
-            }
-          >
-            <Icon name="play" /> 继续
-          </button>
+          {canArchive ? (
+            <button
+              type="button"
+              aria-label="Archive Thread"
+              title="仅整理 CodexPlatform 历史记录，不改变 Codex App Server Thread"
+              onClick={() => {
+                setRuntimeError(null);
+                archive.mutate();
+              }}
+              disabled={archive.isPending || action.isPending || start.isPending}
+            >
+              <Icon name="audit" /> Archive
+            </button>
+          ) : null}
         </div>
       </header>
-      {thread.data.queue ? (
+      {archived ? (
+        <div className="v11-capability-note">
+          此 Thread 已被服务端标记为平台归档；归档仅整理 CodexPlatform 历史记录，不改变 Codex App
+          Server Thread。
+          {openedFromArchived ? (
+            <Link to="/settings/archived" aria-label="返回 Archived">
+              返回 Archived
+            </Link>
+          ) : null}
+        </div>
+      ) : null}
+      {thread.data.queue && status === "QUEUED" ? (
         <QueueBanner
           position={thread.data.queue.position}
           etaMs={thread.data.queue.etaMs}
           estimated={thread.data.queue.etaEstimated}
         />
       ) : null}
-      <div className="v11-thread-grid">
-        <section className="v11-conversation" aria-label="Thread conversation">
-          <Conversation
-            prompt={thread.data.prompt}
-            turns={thread.data.turns}
-            events={displayEvents}
-            api={api}
-            status={status}
-            approvalDecisions={approvalDecisions}
-            closedTurnIds={closedTurnIds}
-          />
-          <form className="v11-composer v11-thread-composer" onSubmit={send}>
-            <label className="sr-only" htmlFor="thread-message">
-              Message Codex
-            </label>
-            <textarea
-              id="thread-message"
-              value={message}
-              onChange={(event) => setMessage(event.target.value)}
-              rows={3}
-              placeholder={waitingForAllocation ? "等待运行资源…" : "Message Codex"}
-              disabled={waitingForAllocation}
-              onKeyDown={(event) => {
-                if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-                  event.preventDefault();
-                  event.currentTarget.form?.requestSubmit();
-                }
+      <div
+        className={`v11-thread-grid${workspaceLayout.sidePanel.open ? " side-open" : ""}`}
+        style={{ "--side-panel-width": `${workspaceLayout.sidePanel.width}px` } as CSSProperties}
+      >
+        <div className="thread-workspace-main">
+          <PinnedExecutionSummary
+            open={workspaceLayout.pinnedSummaryOpen}
+            onClose={() => dispatchWorkspaceLayout({ type: "TOGGLE_PINNED" })}
+            returnFocusRef={pinnedToggleRef}
+          >
+            <PinnedSummaryContent
+              presentation={presentation}
+              onOpenSide={(tab) => dispatchWorkspaceLayout({ type: "OPEN_SIDE", tab })}
+            />
+          </PinnedExecutionSummary>
+          <section className="v11-conversation" aria-label="Thread conversation">
+            <Transcript
+              groups={presentation.transcript.groups}
+              busy={["ALLOCATING", "RUNNING", "WAITING_APPROVAL"].includes(status)}
+              onOpenBottom={(tab, detailId) => {
+                setBottomTerminalSource(null);
+                dispatchWorkspaceLayout({ type: "OPEN_BOTTOM", tab, detailId });
+              }}
+              onOpenSide={(tab) => dispatchWorkspaceLayout({ type: "OPEN_SIDE", tab })}
+              onOpenSubagent={(id) =>
+                dispatchWorkspaceLayout({
+                  type: "OPEN_SIDE",
+                  tab: { kind: "subagent", id },
+                })
+              }
+              renderApproval={(row: TranscriptApprovalRow) => {
+                const approval = approvalRequests.get(row.approvalId);
+                if (!approval) return null;
+                return (
+                  <ApprovalEvent
+                    event={approval}
+                    api={api}
+                    locked={
+                      ["COMPLETED", "FAILED", "INTERRUPTED", "NEEDS_RECOVERY"].includes(status) ||
+                      (approval.turnId !== null && closedTurnIds.has(approval.turnId))
+                    }
+                    existingDecision={approvalDecisions.get(row.approvalId)}
+                  />
+                );
               }}
             />
-            <div className="v11-composer-toolbar">
-              <select
-                aria-label="Turn reasoning effort"
-                value={selectedReasoningEffort}
-                onChange={(event) => setReasoningEffort(event.target.value)}
-                disabled={configLocked || settings.isPending || settings.isError}
-              >
-                {(settings.data?.policy.allowedReasoningEfforts ?? ["MEDIUM"]).map((option) => (
-                  <option value={option} key={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-              <select
-                aria-label="Turn permission mode"
-                value={selectedPermissionMode}
-                onChange={(event) =>
-                  setPermissionMode(
-                    event.target.value as "DEFAULT" | "READ_ONLY" | "WORKSPACE_WRITE",
-                  )
+            <form className="v11-composer v11-thread-composer" onSubmit={send}>
+              <label className="sr-only" htmlFor="thread-message">
+                Message Codex
+              </label>
+              <textarea
+                id="thread-message"
+                value={message}
+                onChange={(event) => setMessage(event.target.value)}
+                rows={3}
+                placeholder={
+                  archived
+                    ? "Thread 已归档，请先 Unarchive"
+                    : waitingForAllocation
+                      ? "等待运行资源…"
+                      : "Message Codex"
                 }
-                disabled={configLocked || settings.isPending || settings.isError}
-              >
-                {(settings.data?.policy.allowedPermissionModes ?? ["DEFAULT"]).map((option) => (
-                  <option value={option} key={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-              <RuntimeTruth />
-              <span className="v11-capability-note">
-                {waitingForAllocation
-                  ? "正在排队，暂不能提交新的 Turn"
-                  : canSteer
-                    ? "Steer 沿用当前 Turn 的执行设置"
-                    : "Attachments unavailable in 1.1A"}
-              </span>
-              <button
-                className="v11-send-button"
-                type="submit"
-                aria-label="发送调整"
-                disabled={
-                  action.isPending ||
-                  start.isPending ||
-                  settings.isPending ||
-                  settings.isError ||
-                  waitingForAllocation ||
-                  (!canSteer && !canStartTurn) ||
-                  message.trim().length === 0
-                }
-              >
-                <Icon name="send" />
-              </button>
-            </div>
-          </form>
-          {settings.isError ? (
-            <div className="v11-runtime-error" role="alert">
-              <Icon name="activity" />
-              <span>无法读取个人执行配置，请刷新后重试。</span>
-            </div>
-          ) : null}
-          {runtimeError ? (
-            <div className="v11-runtime-error" role="alert">
-              <Icon name="activity" />
-              <span>{runtimeError}</span>
-            </div>
-          ) : null}
-          <Inspector events={displayEvents} />
-        </section>
-        <ContextRail threadId={threadId} events={mergedEvents} key={threadId} />
+                disabled={waitingForAllocation || archived}
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.form?.requestSubmit();
+                  }
+                }}
+              />
+              <div className="v11-composer-toolbar">
+                <ModelEffortPicker
+                  catalog={models.data ?? null}
+                  value={selectedModel}
+                  onChange={setModelSelection}
+                  loading={models.isPending}
+                  error={models.isError}
+                  disabled={configLocked || settings.isPending || settings.isError}
+                />
+                <select
+                  aria-label="Turn permission mode"
+                  value={selectedPermissionMode}
+                  onChange={(event) =>
+                    setPermissionMode(
+                      event.target.value as "DEFAULT" | "READ_ONLY" | "WORKSPACE_WRITE",
+                    )
+                  }
+                  disabled={configLocked || settings.isPending || settings.isError}
+                >
+                  {(settings.data?.policy.allowedPermissionModes ?? ["DEFAULT"]).map((option) => (
+                    <option value={option} key={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+                <span className="v11-capability-note">
+                  {waitingForAllocation
+                    ? "正在排队，暂不能提交新的 Turn"
+                    : canSteer
+                      ? "Steer 沿用当前 Turn 的执行设置"
+                      : "Attachments unavailable in 1.1A"}
+                </span>
+                <button
+                  className="v11-send-button"
+                  type="submit"
+                  aria-label="发送调整"
+                  disabled={
+                    action.isPending ||
+                    start.isPending ||
+                    settings.isPending ||
+                    settings.isError ||
+                    (!canSteer && (models.isPending || models.isError || !selectedModel)) ||
+                    waitingForAllocation ||
+                    (!canSteer && !canStartTurn) ||
+                    message.trim().length === 0
+                  }
+                >
+                  <Icon name="send" />
+                </button>
+              </div>
+            </form>
+            {settings.isError ? (
+              <div className="v11-runtime-error" role="alert">
+                <Icon name="activity" />
+                <span>无法读取个人执行配置，请刷新后重试。</span>
+              </div>
+            ) : null}
+            {runtimeError ? (
+              <div className="v11-runtime-error" role="alert">
+                <Icon name="activity" />
+                <span>{runtimeError}</span>
+              </div>
+            ) : null}
+          </section>
+          <BottomPanel
+            open={workspaceLayout.bottomPanel.open}
+            tab={workspaceLayout.bottomPanel.tab}
+            height={workspaceLayout.bottomPanel.height}
+            availableTabs={availableBottomTabs}
+            onSelect={(tab) => dispatchWorkspaceLayout({ type: "SELECT_BOTTOM_TAB", tab })}
+            onClose={() => dispatchWorkspaceLayout({ type: "CLOSE_BOTTOM" })}
+            returnFocusRef={bottomToggleRef}
+            renderContent={(_tab) => (
+              <TerminalPanel
+                terminals={visibleTerminals}
+                selectedDetailId={workspaceLayout.bottomPanel.detailId}
+              />
+            )}
+          />
+        </div>
+        <SidePanel
+          open={workspaceLayout.sidePanel.open}
+          tab={workspaceLayout.sidePanel.tab}
+          width={workspaceLayout.sidePanel.width}
+          onSelect={(tab) => dispatchWorkspaceLayout({ type: "SELECT_SIDE_TAB", tab })}
+          onClose={() => dispatchWorkspaceLayout({ type: "CLOSE_SIDE" })}
+          returnFocusRef={sideToggleRef}
+          renderContent={(tab) => (
+            <ThreadSideContent
+              threadId={threadId}
+              events={mergedEvents}
+              presentation={presentation}
+              tab={tab}
+              onSelect={(next) => dispatchWorkspaceLayout({ type: "SELECT_SIDE_TAB", tab: next })}
+              onOpenSubagentTerminal={(terminals, detailId) => {
+                setBottomTerminalSource(terminals);
+                dispatchWorkspaceLayout({ type: "OPEN_BOTTOM", tab: "terminal", detailId });
+              }}
+            />
+          )}
+        />
       </div>
     </div>
   );
@@ -1132,12 +1377,23 @@ function ApprovalEvent({
   );
 }
 
-type RailTab = "Plan" | "Outputs" | "Subagents" | "Sources";
-
-function ContextRail({ threadId, events }: { threadId: string; events: TaskEvent[] }) {
+function ThreadSideContent({
+  threadId,
+  events,
+  presentation,
+  tab,
+  onSelect,
+  onOpenSubagentTerminal,
+}: {
+  threadId: string;
+  events: TaskEvent[];
+  presentation: ThreadPresentation;
+  tab: SidePanelTab;
+  onSelect: (tab: SidePanelTab) => void;
+  onOpenSubagentTerminal: (terminals: TerminalDetail[], detailId: string) => void;
+}) {
   const api = useApi();
-  const [tab, setTab] = useState<RailTab>("Plan");
-  const [selectedSubagent, setSelectedSubagent] = useState<string | null>(null);
+  const selectedSubagent = tab.kind === "subagent" ? tab.id : null;
   const subagents = useQuery({
     queryKey: ["subagents", threadId],
     queryFn: () => {
@@ -1162,58 +1418,120 @@ function ContextRail({ threadId, events }: { threadId: string; events: TaskEvent
   const eventAgents = projectEventSubagents(events);
   const agents = mergeSubagents(subagents.data ?? [], eventAgents);
   return (
-    <aside className="v11-context-rail">
-      <div role="tablist" aria-label="Thread context">
-        {(["Plan", "Outputs", "Subagents", "Sources"] as const).map((name) => (
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === name}
-            onClick={() => {
-              setTab(name);
-              if (name !== "Subagents") setSelectedSubagent(null);
-            }}
-            key={name}
-          >
-            {name}
-          </button>
-        ))}
-      </div>
-      <div role="tabpanel" aria-label={tab} className="v11-rail-panel">
-        {tab === "Plan" ? <PlanPanel events={events} /> : null}
-        {tab === "Outputs" ? <OutputsPanel events={events} /> : null}
-        {tab === "Sources" ? <SourcesPanel events={events} /> : null}
-        {tab === "Subagents" ? (
-          selectedSubagent ? (
-            <SubagentDetail
-              detail={detail.data}
-              loading={detail.isPending}
-              error={detail.isError}
-              onBack={() => setSelectedSubagent(null)}
-              onRetry={() => void detail.refetch()}
-            />
-          ) : (
-            <SubagentPanel
-              agents={agents}
-              loading={subagents.isPending}
-              error={subagents.isError}
-              onOpen={setSelectedSubagent}
-              onRetry={() => void subagents.refetch()}
-            />
-          )
-        ) : null}
-      </div>
-    </aside>
+    <div className="v11-rail-panel">
+      {tab.kind === "plan" ? <PlanPanel plan={presentation.side.plan} /> : null}
+      {tab.kind === "outputs" ? <OutputsPanel outputs={presentation.side.outputs} /> : null}
+      {tab.kind === "sources" ? <SourcesPanel sources={presentation.side.sources} /> : null}
+      {tab.kind === "changes" ? (
+        <ChangesPanel changes={presentation.side.changes} detailId={tab.detailId} />
+      ) : null}
+      {tab.kind === "tool" ? (
+        <ToolDetailPanel tools={presentation.side.tools} detailId={tab.detailId} />
+      ) : null}
+      {tab.kind === "subagent" ? (
+        <SubagentDetail
+          key={selectedSubagent}
+          detail={detail.data}
+          loading={detail.isPending}
+          error={detail.isError}
+          onBack={() => onSelect({ kind: "subagents" })}
+          onRetry={() => void detail.refetch()}
+          onOpenTerminal={onOpenSubagentTerminal}
+        />
+      ) : null}
+      {tab.kind === "subagents" ? (
+        <SubagentPanel
+          agents={agents}
+          loading={subagents.isPending}
+          error={subagents.isError}
+          onOpen={(id) => onSelect({ kind: "subagent", id })}
+          onRetry={() => void subagents.refetch()}
+        />
+      ) : null}
+    </div>
   );
 }
 
-function PlanPanel({ events }: { events: TaskEvent[] }) {
-  const plan = [...events].reverse().find((event) => event.type === "PLAN_UPDATED");
-  if (plan?.type !== "PLAN_UPDATED") return <EmptyRail copy="No plan has been published yet." />;
-  const steps = plan.payload.plan.map((item, index) => readPlanStep(item, index));
+function PinnedSummaryContent({
+  presentation,
+  onOpenSide,
+}: {
+  presentation: ThreadPresentation;
+  onOpenSide: (tab: SidePanelTab) => void;
+}) {
+  const summary = presentation.pinned;
+  const activeAgents = summary?.subagents.filter((agent) => agent.status === "ACTIVE").length ?? 0;
+  return (
+    <div className="pinned-summary-sections">
+      <section>
+        <h3>Plan</h3>
+        <button
+          type="button"
+          aria-label="Open pinned Plan"
+          onClick={() => onOpenSide({ kind: "plan" })}
+        >
+          {summary?.plan
+            ? summary.plan.explanation || `${summary.plan.steps.length} steps`
+            : "No plan yet"}
+        </button>
+      </section>
+      <section>
+        <h3>Outputs</h3>
+        <button
+          type="button"
+          aria-label="Open pinned Outputs"
+          onClick={() => onOpenSide({ kind: "outputs" })}
+        >
+          {summary && summary.outputs.length > 0
+            ? `${summary.outputs.length} artifact${summary.outputs.length === 1 ? "" : "s"}`
+            : "None"}
+        </button>
+      </section>
+      <section>
+        <h3>Subagents</h3>
+        <button
+          type="button"
+          aria-label="Open pinned Subagents"
+          onClick={() => onOpenSide({ kind: "subagents" })}
+        >
+          {activeAgents > 0
+            ? `${activeAgents} Working`
+            : summary && summary.subagents.length > 0
+              ? "Done"
+              : "None"}
+        </button>
+      </section>
+      <section>
+        <h3>Sources</h3>
+        <button
+          type="button"
+          aria-label="Open pinned Sources"
+          onClick={() => onOpenSide({ kind: "sources" })}
+        >
+          {summary && summary.sources.length > 0
+            ? `${summary.sources.length} source${summary.sources.length === 1 ? "" : "s"}`
+            : "None"}
+        </button>
+      </section>
+      {summary?.reasoningSummary ? (
+        <section>
+          <h3>Current activity</h3>
+          <p>
+            {summary.activityCount} {summary.activityCount === 1 ? "activity" : "activities"} ·
+            execution summary available in Transcript
+          </p>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+function PlanPanel({ plan }: { plan: ThreadPresentation["side"]["plan"] }) {
+  if (!plan) return <EmptyRail copy="No plan has been published yet." />;
+  const steps = plan.steps.map((item, index) => readPlanStep(item, index));
   return (
     <div className="v11-rail-list">
-      <p>{plan.payload.explanation}</p>
+      <p>{plan.explanation}</p>
       {steps.map((step, index) => (
         <div key={step.label}>
           <span>{index + 1}</span> {step.label}
@@ -1223,39 +1541,94 @@ function PlanPanel({ events }: { events: TaskEvent[] }) {
   );
 }
 
-function OutputsPanel({ events }: { events: TaskEvent[] }) {
-  const outputs = coalesceThreadEvents(events).filter(
-    (event) => event.type === "AGENT_MESSAGE_DELTA" || event.type === "DIFF_UPDATED",
-  );
+function OutputsPanel({ outputs }: { outputs: ThreadPresentation["side"]["outputs"] }) {
   if (outputs.length === 0) return <EmptyRail copy="Outputs will appear as Codex produces them." />;
   return (
     <div className="v11-rail-list">
-      {outputs.map((event) => (
-        <article key={eventIdentity(event)}>
-          <strong>{event.type === "DIFF_UPDATED" ? "Change" : "Message"}</strong>
-          <p>
-            {event.type === "DIFF_UPDATED"
-              ? summarizeDiff(event.payload.diff)
-              : event.payload.delta}
-          </p>
+      {outputs.map((output) => (
+        <article key={output.id}>
+          <strong>{output.name}</strong>
+          <p>{output.mimeType ?? "Artifact"}</p>
+          {output.uri ? <a href={output.uri}>Open output</a> : null}
         </article>
       ))}
     </div>
   );
 }
 
-function SourcesPanel({ events }: { events: TaskEvent[] }) {
-  const tools = events.filter(
-    (event) => event.type === "TOOL_STARTED" || event.type === "TOOL_COMPLETED",
-  );
-  if (tools.length === 0)
+function SourcesPanel({ sources }: { sources: ThreadPresentation["side"]["sources"] }) {
+  if (sources.length === 0)
     return <EmptyRail copy="Enterprise sources used by tools will appear here." />;
   return (
     <div className="v11-rail-list">
-      {tools.map((event) => (
-        <article key={eventIdentity(event)}>
-          <Icon name="tool" /> <strong>{event.payload.tool}</strong>
-          <span>{event.type === "TOOL_COMPLETED" ? "Completed" : "In progress"}</span>
+      {sources.map((source) => (
+        <article key={source.id}>
+          <Icon name="tool" /> <strong>{source.title}</strong>
+          {source.uri ? <a href={source.uri}>Open source</a> : <span>Citation</span>}
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function ChangesPanel({
+  changes,
+  detailId,
+}: {
+  changes: ThreadPresentation["side"]["changes"];
+  detailId: string | null;
+}) {
+  const visible = detailId ? changes.filter((change) => change.id === detailId) : changes;
+  if (visible.length === 0) return <EmptyRail copy="No file changes are available." />;
+  return (
+    <div className="v11-rail-list">
+      {visible.map((change) => (
+        <article key={change.id}>
+          <strong>
+            {change.changedFiles} file{change.changedFiles === 1 ? "" : "s"} changed
+          </strong>
+          <DiffView diff={change.diff} />
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function ToolDetailPanel({
+  tools,
+  detailId,
+}: {
+  tools: ThreadPresentation["side"]["tools"];
+  detailId: string | null;
+}) {
+  const visible = detailId ? tools.filter((tool) => tool.id === detailId) : tools;
+  if (visible.length === 0) return <EmptyRail copy="No Tool details are available." />;
+  return (
+    <div className="v11-rail-list">
+      {visible.map((tool) => (
+        <article key={tool.id}>
+          <strong>{tool.tool}</strong>
+          <span>{tool.status.slice(0, 1).toUpperCase() + tool.status.slice(1)}</span>
+          <dl>
+            <div>
+              <dt>Arguments</dt>
+              <dd>
+                <pre>{formatInspectorValue(tool.arguments)}</pre>
+              </dd>
+            </div>
+            <div>
+              <dt>{tool.status === "failed" ? "Error" : "Result"}</dt>
+              <dd>
+                <pre>
+                  {formatInspectorValue(tool.status === "failed" ? tool.error : tool.result)}
+                </pre>
+              </dd>
+            </div>
+            <div>
+              <dt>Duration</dt>
+              <dd>{tool.durationMs === null ? "—" : `${tool.durationMs} ms`}</dd>
+            </div>
+          </dl>
         </article>
       ))}
     </div>
@@ -1336,14 +1709,20 @@ function SubagentDetail({
   error,
   onBack,
   onRetry,
+  onOpenTerminal,
 }: {
   detail: Awaited<ReturnType<NonNullable<PlatformApi["getSubagent"]>>> | undefined;
   loading: boolean;
   error: boolean;
   onBack: () => void;
   onRetry: () => void;
+  onOpenTerminal: (terminals: TerminalDetail[], detailId: string) => void;
 }) {
   const api = useApi();
+  const [selectedDetail, setSelectedDetail] = useState<{
+    kind: "changes" | "tool";
+    detailId: string;
+  } | null>(null);
   if (loading) return <FullPageState label="Loading subagent" />;
   if (error || !detail) {
     return (
@@ -1360,7 +1739,7 @@ function SubagentDetail({
   }
   const detailEvents = coalesceThreadEvents(
     detail.items.map((item) => threadItemToEvent(detail.threadId, item)),
-  ).filter(isSafeConversationEvent);
+  );
   const approvalDecisions = new Map(
     detailEvents.flatMap((event) =>
       event.type === "APPROVAL_DECIDED"
@@ -1368,6 +1747,12 @@ function SubagentDetail({
         : [],
     ),
   );
+  const approvalRequests = new Map(
+    detailEvents.flatMap((event) =>
+      event.type === "APPROVAL_REQUESTED" ? [[event.payload.approvalId, event] as const] : [],
+    ),
+  );
+  const presentation = projectThreadPresentation(detailEvents, [], []);
   return (
     <section className="v11-subagent-detail">
       <button type="button" onClick={onBack}>
@@ -1390,31 +1775,58 @@ function SubagentDetail({
         </div>
       </dl>
       <div className="v11-subagent-events">
-        {detailEvents.map((event) => (
-          <ConversationEvent
-            event={event}
-            api={api}
-            approvalsLocked
-            approvalDecision={
-              event.type === "APPROVAL_REQUESTED"
-                ? approvalDecisions.get(event.payload.approvalId)
-                : undefined
+        {selectedDetail ? (
+          <section>
+            <button type="button" onClick={() => setSelectedDetail(null)}>
+              Back to subagent activity
+            </button>
+            {selectedDetail.kind === "changes" ? (
+              <ChangesPanel
+                changes={presentation.side.changes}
+                detailId={selectedDetail.detailId}
+              />
+            ) : (
+              <ToolDetailPanel tools={presentation.side.tools} detailId={selectedDetail.detailId} />
+            )}
+          </section>
+        ) : (
+          <Transcript
+            groups={presentation.transcript.groups}
+            busy={detail.status === "ACTIVE"}
+            onOpenBottom={(_tab, detailId) =>
+              onOpenTerminal(presentation.bottom.terminals, detailId)
             }
-            key={eventIdentity(event)}
+            onOpenSide={(tab) => {
+              if ((tab.kind === "changes" || tab.kind === "tool") && tab.detailId) {
+                setSelectedDetail({ kind: tab.kind, detailId: tab.detailId });
+              }
+            }}
+            renderApproval={(row) => {
+              const approval = approvalRequests.get(row.approvalId);
+              if (!approval) return null;
+              return (
+                <ApprovalEvent
+                  event={approval}
+                  api={api}
+                  locked
+                  existingDecision={approvalDecisions.get(row.approvalId)}
+                />
+              );
+            }}
           />
-        ))}
+        )}
       </div>
     </section>
   );
 }
 
-function Inspector({ events }: { events: TaskEvent[] }) {
+function ReadOnlyInspector({ events }: { events: TaskEvent[] }) {
   const tabs = [
     events.some((event) => event.type.startsWith("COMMAND_")) ? "Terminal" : null,
     events.some((event) => event.type === "DIFF_UPDATED") ? "Changes" : null,
     events.some((event) => event.type === "DIFF_UPDATED") ? "Files" : null,
     events.some((event) => event.type.startsWith("TOOL_")) ? "Tool details" : null,
-  ].filter((item): item is string => Boolean(item));
+  ].filter((item): item is string => item !== null);
   const [open, setOpen] = useState<string | null>(null);
   if (tabs.length === 0) return null;
   return (
@@ -1436,11 +1848,52 @@ function Inspector({ events }: { events: TaskEvent[] }) {
   );
 }
 
-function InspectorContent({ tab, events }: { tab: string; events: TaskEvent[] }) {
+function TerminalPanel({
+  terminals,
+  selectedDetailId,
+}: {
+  terminals: TerminalDetail[];
+  selectedDetailId: string | null;
+}) {
+  const visible = selectedDetailId
+    ? terminals.filter((terminal) => terminal.id === selectedDetailId)
+    : terminals;
+  if (visible.length === 0) return <EmptyRail copy="No terminal output is available." />;
+  return (
+    <div className="terminal-session-list">
+      {visible.map((terminal) => (
+        <article className="terminal-session" key={terminal.id}>
+          <header>
+            <strong>{terminal.command ?? "Command"}</strong>
+            <span>
+              {terminal.status}
+              {terminal.exitCode === null ? "" : ` · exit ${terminal.exitCode}`}
+              {terminal.durationMs === null ? "" : ` · ${terminal.durationMs} ms`}
+            </span>
+          </header>
+          <pre>{terminal.output || "No output"}</pre>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function InspectorContent({
+  tab,
+  events,
+  selectedItemId = null,
+}: {
+  tab: string;
+  events: TaskEvent[];
+  selectedItemId?: string | null;
+}) {
+  const visibleEvents = selectedItemId
+    ? events.filter((event) => event.itemId === selectedItemId)
+    : events;
   if (tab === "Terminal") {
     return (
       <pre>
-        {events
+        {visibleEvents
           .flatMap((event) => (event.type === "COMMAND_OUTPUT" ? [event.payload.delta] : []))
           .join("")}
       </pre>
@@ -1449,7 +1902,7 @@ function InspectorContent({ tab, events }: { tab: string; events: TaskEvent[] })
   if (tab === "Changes") {
     return (
       <div>
-        {events.flatMap((event) =>
+        {visibleEvents.flatMap((event) =>
           event.type === "DIFF_UPDATED"
             ? [<DiffView diff={event.payload.diff} key={eventIdentity(event)} />]
             : [],
@@ -1459,7 +1912,7 @@ function InspectorContent({ tab, events }: { tab: string; events: TaskEvent[] })
   }
   if (tab === "Files") {
     const files = new Set(
-      events.flatMap((event) =>
+      visibleEvents.flatMap((event) =>
         event.type === "DIFF_UPDATED" ? extractDiffFiles(event.payload.diff) : [],
       ),
     );
@@ -1471,13 +1924,42 @@ function InspectorContent({ tab, events }: { tab: string; events: TaskEvent[] })
       </ul>
     );
   }
+  const tools = projectToolDetails(visibleEvents);
   return (
     <ul>
-      {events.flatMap((event) =>
-        event.type.startsWith("TOOL_") && "tool" in event.payload
-          ? [<li key={eventIdentity(event)}>{String(event.payload.tool)}</li>]
-          : [],
-      )}
+      {tools.map((tool) => (
+        <li key={toolDetailIdentity(tool)}>
+          <strong>{tool.tool}</strong>
+          <span>{toolStatusLabel(tool.status)}</span>
+          <dl>
+            <div>
+              <dt>Arguments</dt>
+              <dd>
+                <pre>{formatInspectorValue(tool.arguments)}</pre>
+              </dd>
+            </div>
+            {tool.status === "FAILED" ? (
+              <div>
+                <dt>Error</dt>
+                <dd>
+                  <pre>{formatInspectorValue(tool.error)}</pre>
+                </dd>
+              </div>
+            ) : (
+              <div>
+                <dt>Result</dt>
+                <dd>
+                  <pre>{formatInspectorValue(tool.result)}</pre>
+                </dd>
+              </div>
+            )}
+            <div>
+              <dt>Duration</dt>
+              <dd>{tool.durationMs === null ? "—" : `${tool.durationMs} ms`}</dd>
+            </div>
+          </dl>
+        </li>
+      ))}
     </ul>
   );
 }
@@ -1568,6 +2050,11 @@ function SettingsPage({ session }: { session: Session }) {
 }
 
 function SettingsSection({ section, session }: { section: string; session: Session }) {
+  if (section === "archived") return <ArchivedSettings />;
+  return <PersonalSettingsSection section={section} session={session} />;
+}
+
+function PersonalSettingsSection({ section, session }: { section: string; session: Session }) {
   const api = useApi();
   const settings = useQuery({
     queryKey: ["my-settings"],
@@ -1603,11 +2090,90 @@ function SettingsSection({ section, session }: { section: string; session: Sessi
       return <PluginsSettings />;
     case "usage":
       return <UsageSettings />;
-    case "archived":
-      return <EmptySettings title="No archived chats" copy="Archived Threads will appear here." />;
     default:
       return null;
   }
+}
+
+function ArchivedSettings() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const archived = useQuery({
+    queryKey: ["archived-threads"],
+    queryFn: () => {
+      if (!api.listArchivedThreads) throw new Error("Archived Thread endpoint unavailable");
+      return api.listArchivedThreads();
+    },
+  });
+  const unarchive = useMutation({
+    mutationFn: (threadId: string) => {
+      if (!api.unarchiveThread) throw new Error("Thread unarchive endpoint unavailable");
+      return api.unarchiveThread(threadId);
+    },
+    onSuccess: async (_result, threadId) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["archived-threads"] }),
+        queryClient.invalidateQueries({ queryKey: ["threads"] }),
+        queryClient.invalidateQueries({ queryKey: ["thread", threadId] }),
+        queryClient.invalidateQueries({ queryKey: ["projects"] }),
+      ]);
+      navigate(`/threads/${encodeURIComponent(threadId)}`);
+    },
+  });
+
+  return (
+    <section className="v11-archived-settings">
+      <p>
+        归档仅整理 CodexPlatform 中的历史记录，不会改变 Codex App Server Thread，也不会删除任务
+        事件或产物。
+      </p>
+      {archived.isPending ? <FullPageState label="Loading archived Threads" /> : null}
+      {archived.isError ? (
+        <div>
+          <InlineError copy="无法读取归档 Thread。为避免误操作，归档操作已暂停。" />
+          <button type="button" onClick={() => void archived.refetch()}>
+            重试
+          </button>
+        </div>
+      ) : null}
+      {archived.isSuccess && archived.data.length === 0 ? (
+        <EmptySettings title="No archived chats" copy="Archived Threads will appear here." />
+      ) : null}
+      {archived.isSuccess && archived.data.length > 0 ? (
+        <div className="v11-index-list">
+          {archived.data.map((thread) => (
+            <article key={thread.id}>
+              <Link
+                to={`/threads/${encodeURIComponent(thread.id)}?archived=1`}
+                aria-label={`查看 ${thread.title}`}
+              >
+                <strong>{thread.title}</strong>
+                <StatusBadge status={thread.status} />
+              </Link>
+              <button
+                type="button"
+                aria-label={`Unarchive ${thread.title}`}
+                disabled={unarchive.isPending}
+                onClick={() => unarchive.mutate(thread.id)}
+              >
+                Unarchive
+              </button>
+            </article>
+          ))}
+        </div>
+      ) : null}
+      {unarchive.isError ? (
+        <InlineError
+          copy={
+            unarchive.error instanceof Error
+              ? unarchive.error.message
+              : "Unarchive failed. Please retry."
+          }
+        />
+      ) : null}
+    </section>
+  );
 }
 
 function useSaveSettings() {
@@ -1712,29 +2278,33 @@ function ProfileSettings({ session }: { session: Session }) {
 }
 
 function ExecutionSettings({ value }: { value: UserSettingsView }) {
-  const [effort, setEffort] = useState(value.execution.reasoningEffort);
+  const api = useApi();
+  const models = useQuery({
+    queryKey: ["models", "settings"],
+    queryFn: () => {
+      if (!api.listModels) throw new Error("Model catalog endpoint unavailable");
+      return api.listModels();
+    },
+  });
+  const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
   const [permission, setPermission] = useState(value.execution.permissionMode);
   const save = useSaveSettings();
+  const selectedModel = resolveCatalogSelection(
+    models.data,
+    modelSelection?.model ?? value.execution.model,
+    modelSelection?.reasoningEffort ?? value.execution.reasoningEffort,
+  );
   return (
     <SettingsCard title="Execution defaults">
       <SettingRow label="Model">
-        <div>
-          <strong>Runtime default</strong>
-          <span>Model catalog not connected in 1.1A</span>
-        </div>
-      </SettingRow>
-      <SettingRow label="Reasoning effort">
-        <select
-          aria-label="Reasoning effort"
-          value={effort}
-          onChange={(event) => setEffort(event.target.value)}
-        >
-          {value.policy.allowedReasoningEfforts.map((option) => (
-            <option value={option} key={option}>
-              {option}
-            </option>
-          ))}
-        </select>
+        <ModelEffortPicker
+          catalog={models.data ?? null}
+          value={selectedModel}
+          onChange={setModelSelection}
+          loading={models.isPending}
+          error={models.isError}
+          disabled={save.isPending}
+        />
       </SettingRow>
       <SettingRow label="Permission mode">
         <select
@@ -1754,17 +2324,18 @@ function ExecutionSettings({ value }: { value: UserSettingsView }) {
       </SettingRow>
       <button
         type="button"
-        disabled={save.isPending}
-        onClick={() =>
+        disabled={save.isPending || models.isPending || models.isError || !selectedModel}
+        onClick={() => {
+          if (!selectedModel) return;
           save.mutate({
             execution: {
-              reasoningEffort: effort,
+              model: selectedModel.model,
+              reasoningEffort: selectedModel.reasoningEffort,
               permissionMode: permission,
-              approvalPreference: "ASK",
-              model: null,
+              approvalPreference: value.execution.approvalPreference,
             },
-          })
-        }
+          });
+        }}
       >
         Save settings
       </button>
@@ -2187,7 +2758,7 @@ function AdminThreadPage() {
           closedTurnIds={closedTurnIds}
           readOnly
         />
-        <Inspector events={events} />
+        <ReadOnlyInspector events={events} />
       </section>
     </section>
   );
@@ -2438,15 +3009,6 @@ function MutationNotice({
   return null;
 }
 
-function RuntimeTruth() {
-  return (
-    <div className="v11-runtime-truth">
-      <strong>Runtime default</strong>
-      <span>Model catalog not connected · 1.1A</span>
-    </div>
-  );
-}
-
 function runtimeErrorMessage(cause: unknown) {
   const message = cause instanceof Error ? cause.message : "请求失败，请稍后重试。";
   const code = cause instanceof ApiError ? cause.code : undefined;
@@ -2501,11 +3063,14 @@ function Avatar({ name }: { name: string }) {
 
 function DiffView({ diff }: { diff: string }) {
   const occurrences = new Map<string, number>();
-  const lines = diff.split("\n").map((line) => {
-    const occurrence = (occurrences.get(line) ?? 0) + 1;
-    occurrences.set(line, occurrence);
-    return { key: `${line}-${occurrence}`, line };
-  });
+  const lines = diff
+    .replace(/\.data\/real-runtime\/workspaces\/[^/]+\//g, "")
+    .split("\n")
+    .map((line) => {
+      const occurrence = (occurrences.get(line) ?? 0) + 1;
+      occurrences.set(line, occurrence);
+      return { key: `${line}-${occurrence}`, line };
+    });
   return (
     <pre className="diff-block">
       {lines.map(({ key, line }) => (
@@ -2562,15 +3127,16 @@ function projectStatus(
   events: TaskEvent[],
   currentTurnId: string | null,
 ): TaskStatus {
-  const latestQueue = [...events]
+  const projectedEvents = coalesceThreadEvents(events);
+  const latestQueue = [...projectedEvents]
     .reverse()
     .find((event) => event.type === "QUEUED" || event.type === "LEASE_ACQUIRED");
   if (latestQueue?.type === "QUEUED") return "QUEUED";
   const activeTurnId =
     latestQueue?.turnId ??
     currentTurnId ??
-    [...events].reverse().find((event) => event.type === "TURN_STARTED")?.turnId;
-  const relevant = [...events]
+    [...projectedEvents].reverse().find((event) => event.type === "TURN_STARTED")?.turnId;
+  const relevant = [...projectedEvents]
     .reverse()
     .find((event) => event.turnId === activeTurnId && isStatusEvent(event));
   if (!relevant) return base;
@@ -2644,6 +3210,9 @@ function mergeSubagents(base: SubagentThread[], updates: SubagentThread[]): Suba
   const agents = new Map(base.map((agent) => [agent.threadId, agent]));
   for (const update of updates) {
     const previous = agents.get(update.threadId);
+    if (previous && previous.status !== "ACTIVE" && update.status === "ACTIVE") {
+      continue;
+    }
     agents.set(
       update.threadId,
       previous
@@ -2666,6 +3235,31 @@ function mergeSubagents(base: SubagentThread[], updates: SubagentThread[]): Suba
 
 function eventIdentity(event: TaskEvent): string {
   return `${event.taskId}:${event.threadId ?? "none"}:${event.turnId ?? "none"}:${event.itemId ?? "none"}:${event.sequence}`;
+}
+
+function toolDetailIdentity(tool: {
+  taskId: string;
+  threadId: string | null;
+  turnId: string | null;
+  itemId: string;
+}): string {
+  return `${tool.taskId}:${tool.threadId ?? "none"}:${tool.turnId ?? "none"}:${tool.itemId}`;
+}
+
+function toolStatusLabel(status: "IN_PROGRESS" | "COMPLETED" | "FAILED"): string {
+  if (status === "COMPLETED") return "Completed";
+  if (status === "FAILED") return "Failed";
+  return "In progress";
+}
+
+function formatInspectorValue(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function approvalDecisionLabel(decision: string): string {
@@ -2694,18 +3288,14 @@ function readPlanStep(item: unknown, index: number): { label: string } {
   return { label: typeof item === "string" ? item : `Step ${index + 1}` };
 }
 
-function summarizeDiff(diff: string): string {
-  const additions = diff
-    .split("\n")
-    .filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
-  const removals = diff
-    .split("\n")
-    .filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
-  return `${additions} additions, ${removals} removals`;
-}
-
 function extractDiffFiles(diff: string): string[] {
-  return diff.split("\n").flatMap((line) => (line.startsWith("+++ b/") ? [line.slice(6)] : []));
+  return diff
+    .split("\n")
+    .flatMap((line) =>
+      line.startsWith("+++ b/")
+        ? [line.slice(6).replace(/^\.data\/real-runtime\/workspaces\/[^/]+\//, "")]
+        : [],
+    );
 }
 
 function formatElapsed(milliseconds: number): string {

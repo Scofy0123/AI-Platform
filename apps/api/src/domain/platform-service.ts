@@ -9,6 +9,10 @@ import {
   EffectiveConfigOverrideSchema,
   type EffectiveThreadConfigSnapshot,
   EffectiveThreadConfigSnapshotSchema,
+  type ModelCatalog,
+  ModelCatalogSchema,
+  type ModelOption,
+  ModelOptionSchema,
   PLATFORM_VERSION,
   type SubagentThread,
   type SubagentThreadDetail,
@@ -74,6 +78,34 @@ export class ApprovalTransportUnavailableError extends Error {
   }
 }
 
+export class ModelCatalogUnavailableError extends Error {
+  constructor(message = "Runtime model catalog is unavailable") {
+    super(message);
+    this.name = "ModelCatalogUnavailableError";
+  }
+}
+
+class NoRoutableModelAccountError extends ModelCatalogUnavailableError {
+  constructor() {
+    super("No routable Codex account has a model catalog");
+    this.name = "NoRoutableModelAccountError";
+  }
+}
+
+class AllocatedAccountIneligibleError extends Error {
+  constructor() {
+    super("Allocated Codex account is no longer eligible for Runtime start");
+    this.name = "AllocatedAccountIneligibleError";
+  }
+}
+
+export class AllocatedModelSelectionChangedError extends Error {
+  constructor(message = "Model availability changed after allocation; submit the Turn again") {
+    super(message);
+    this.name = "AllocatedModelSelectionChangedError";
+  }
+}
+
 export abstract class ThreadResumeSafetyError extends Error {
   abstract readonly code: string;
   readonly promptAccepted = false;
@@ -114,6 +146,7 @@ export class InvalidThreadResumeResponseError extends ThreadResumeSafetyError {
 }
 
 export interface TaskExecutionAdapter {
+  listModels(account: InternalAccount): Promise<ModelOption[]>;
   startTask(input: {
     accountId: string;
     codexHome: string;
@@ -169,6 +202,18 @@ type BufferedExecutionSignal =
   | { kind: "TASK_EVENT"; value: TaskEventDraft }
   | { kind: "APPROVAL"; value: ApprovalDraft };
 
+interface CachedAccountModelCatalog {
+  models: ModelOption[];
+  observedAt: Date;
+  expiresAt: Date;
+}
+
+interface AccountModelCatalogRead {
+  models: ModelOption[];
+  observedAt: Date;
+  stale: boolean;
+}
+
 const TERMINAL_STATUS_BY_EVENT = {
   TURN_COMPLETED: "COMPLETED",
   TURN_FAILED: "FAILED",
@@ -189,6 +234,14 @@ export class LocalPlatformService implements PlatformApi {
   private readonly eventBus = new EventEmitter();
   private readonly schedulerTurnByRuntimeTurn = new Map<string, string>();
   private readonly pendingStartSignalsByTask = new Map<string, BufferedExecutionSignal[]>();
+  private readonly quotaRefreshByAccount = new Map<string, Promise<void>>();
+  private readonly modelCatalogByAccount = new Map<string, CachedAccountModelCatalog>();
+  private readonly modelCatalogRefreshByAccount = new Map<
+    string,
+    Promise<CachedAccountModelCatalog>
+  >();
+  private readonly modelCatalogGenerationByAccount = new Map<string, number>();
+  private readonly modelCatalogCooldownUntilByAccount = new Map<string, Date>();
 
   constructor(private readonly options: LocalPlatformServiceOptions) {
     this.now = options.now ?? (() => new Date());
@@ -196,13 +249,16 @@ export class LocalPlatformService implements PlatformApi {
     options.execution.on("taskEvent", (event) => this.receiveTaskEvent(event));
     options.execution.on("approval", (approval) => this.receiveApproval(approval));
     options.execution.on("accountAuthenticated", ({ accountId }) => {
+      this.invalidateAccountModelCatalog(accountId);
       options.accounts.markAuthenticated(accountId, this.now());
       void this.refreshAccountQuota(accountId);
     });
     options.execution.on("accountAuthFailed", ({ accountId }) => {
+      this.invalidateAccountModelCatalog(accountId);
       options.accounts.markReauthenticationRequired(accountId);
     });
     options.execution.on("accountCrashed", ({ accountId, reason }) => {
+      this.invalidateAccountModelCatalog(accountId);
       const occurredAt = this.now();
       const recoveryReason = reason ?? "Codex App Server exited; recovery is required.";
       const recovered = options.store.recoverAccountRuntimeState(accountId, occurredAt);
@@ -248,6 +304,64 @@ export class LocalPlatformService implements PlatformApi {
     };
   }
 
+  async listModels(userId: string, threadId?: string): Promise<ModelCatalog> {
+    return this.readModelCatalogForUser(userId, threadId, true);
+  }
+
+  private async readModelCatalogForUser(
+    userId: string,
+    threadId: string | undefined,
+    allowStale: boolean,
+  ): Promise<ModelCatalog> {
+    this.options.store.getUserIdentity(userId);
+    let requiredAccountId: string | null = null;
+    if (threadId) {
+      const task = this.options.store.getTaskForUser(threadId, userId);
+      if (!task) throw new Error("Thread not found");
+      if (task.threadId && !task.accountId) {
+        throw new ModelCatalogUnavailableError("Thread runtime account binding is missing");
+      }
+      requiredAccountId = task.accountId;
+    }
+
+    const accountIds = this.options.leases.listModelRoutingAccountIdsForUser(
+      userId,
+      this.now(),
+      requiredAccountId,
+    );
+    if (accountIds.length === 0) {
+      throw new NoRoutableModelAccountError();
+    }
+
+    const catalogs = await Promise.all(
+      accountIds.map(async (accountId) => {
+        const account = this.options.accounts.getInternal(accountId);
+        if (!account) {
+          throw new ModelCatalogUnavailableError("Eligible Codex account is unavailable");
+        }
+        return this.readAccountModelCatalog(account, { allowStale });
+      }),
+    );
+    if (accountIds.some((accountId) => !this.isAccountModelRoutingEligible(userId, accountId))) {
+      throw new ModelCatalogUnavailableError();
+    }
+    const observedAt = new Date(
+      Math.min(...catalogs.map((catalog) => catalog.observedAt.getTime())),
+    ).toISOString();
+    const models =
+      catalogs.length === 1
+        ? (catalogs[0]?.models ?? [])
+        : intersectAccountModelCatalogs(catalogs.map((catalog) => catalog.models));
+
+    return ModelCatalogSchema.parse({
+      models,
+      scope: requiredAccountId ? "SINGLE_ACCOUNT" : "ELIGIBLE_ACCOUNT_INTERSECTION",
+      accountCount: accountIds.length,
+      observedAt,
+      stale: catalogs.some((catalog) => catalog.stale),
+    });
+  }
+
   async createTask(userId: string, input: { projectId: string; title: string }) {
     return this.options.store.createTask({
       ownerId: userId,
@@ -283,11 +397,22 @@ export class LocalPlatformService implements PlatformApi {
     userId: string,
     input: { projectId: string; title: string; config?: EffectiveConfigOverride },
   ) {
+    const threadConfig = input.config ? this.validateConfigOverride(input.config) : null;
+    if (threadConfig) {
+      const effectiveConfig = this.resolveEffectiveConfig(userId, threadConfig, null);
+      if (
+        effectiveConfig.model !== null ||
+        threadConfig.model !== undefined ||
+        threadConfig.reasoningEffort !== undefined
+      ) {
+        await this.resolveAndValidateModelSelection(userId, null, effectiveConfig);
+      }
+    }
     const task = this.options.store.createTask({
       ownerId: userId,
       projectId: input.projectId,
       title: input.title,
-      threadConfig: input.config ? this.validateConfigOverride(input.config) : null,
+      threadConfig,
       now: this.now(),
     });
     return (await this.getThread(task.id, userId)) as Thread;
@@ -299,6 +424,22 @@ export class LocalPlatformService implements PlatformApi {
         .listTasks(userId, projectId)
         .map((task) => this.projectThread(task, userId)),
     );
+  }
+
+  async listArchivedThreads(userId: string): Promise<Thread[]> {
+    return Promise.all(
+      this.options.store.listArchivedTasks(userId).map((task) => this.projectThread(task, userId)),
+    );
+  }
+
+  async archiveThread(threadId: string, userId: string): Promise<{ ok: true }> {
+    this.options.store.archiveThread({ threadId, ownerId: userId, now: this.now() });
+    return { ok: true };
+  }
+
+  async unarchiveThread(threadId: string, userId: string): Promise<{ ok: true }> {
+    this.options.store.unarchiveThread({ threadId, ownerId: userId, now: this.now() });
+    return { ok: true };
   }
 
   async getThread(threadId: string, userId: string): Promise<Thread | null> {
@@ -367,6 +508,16 @@ export class LocalPlatformService implements PlatformApi {
     ) {
       throw new Error("Invalid default project");
     }
+    if (patch.execution?.model !== undefined || patch.execution?.reasoningEffort !== undefined) {
+      const current = this.options.store.getUserSettings(userId, this.now());
+      const model =
+        patch.execution.model !== undefined ? patch.execution.model : current.execution.model;
+      await this.resolveAndValidateModelSelection(userId, null, {
+        ...this.resolveEffectiveConfig(userId, null, null),
+        model,
+        reasoningEffort: patch.execution.reasoningEffort ?? current.execution.reasoningEffort,
+      });
+    }
     return withSettingsPolicy(this.options.store.patchUserSettings(userId, patch, this.now()));
   }
 
@@ -395,17 +546,21 @@ export class LocalPlatformService implements PlatformApi {
     const safety = this.options.safety.authorize(userId);
     if (!safety.allowed) throw new Error(safety.reason ?? "Real Codex execution is not allowed");
 
+    await this.refreshStaleQuotas();
+    const configSnapshot = await this.resolveAndValidateModelSelection(
+      userId,
+      task,
+      this.resolveEffectiveConfig(
+        userId,
+        task.threadConfig,
+        turnConfig ? this.validateConfigOverride(turnConfig) : null,
+      ),
+      { allowUnresolvedDefault: true },
+    );
     for (const recoverableTurnId of this.options.store.listRecoverableTurnIds(taskId, userId)) {
       this.options.store.completeTurn(recoverableTurnId, "ABANDONED_FOR_RESUME", this.now());
       this.startPromotedTurns(this.options.leases.releaseTurn(recoverableTurnId, this.now()));
     }
-
-    await this.refreshStaleQuotas();
-    const configSnapshot = this.resolveEffectiveConfig(
-      userId,
-      task.threadConfig,
-      turnConfig ? this.validateConfigOverride(turnConfig) : null,
-    );
     const schedulerTurnId = randomUUID();
     this.options.store.createTurn({
       id: schedulerTurnId,
@@ -620,6 +775,7 @@ export class LocalPlatformService implements PlatformApi {
       actorUserId: adminUserId,
       now: this.now(),
     });
+    this.invalidateAccountModelCatalog(accountId);
     return this.options.accounts.list().find((account) => account.id === accountId) ?? null;
   }
 
@@ -705,6 +861,7 @@ export class LocalPlatformService implements PlatformApi {
       title: task.title,
       status: TaskStatusSchema.parse(task.status),
       updatedAt: task.updatedAt,
+      archivedAt: task.archivedAt,
       currentTurn: activeTurn ? projectTurn(task.id, activeTurn) : null,
       turns: turns.map((turn) => projectTurn(task.id, turn)),
       queue: queued
@@ -719,6 +876,7 @@ export class LocalPlatformService implements PlatformApi {
   }
 
   async runMaintenance(now = this.now()): Promise<void> {
+    this.recoverExpiredModelCatalogCooldowns(now);
     for (const schedulerTurnId of this.schedulerTurnByRuntimeTurn.values()) {
       this.options.leases.heartbeatTurn(schedulerTurnId, now);
     }
@@ -752,18 +910,170 @@ export class LocalPlatformService implements PlatformApi {
 
   async close(): Promise<void> {
     this.eventBus.removeAllListeners();
+    this.modelCatalogByAccount.clear();
+    this.modelCatalogRefreshByAccount.clear();
+    this.modelCatalogCooldownUntilByAccount.clear();
     await this.options.execution.close();
+  }
+
+  private async readAccountModelCatalog(
+    account: InternalAccount,
+    options: { allowStale: boolean; forceRefresh?: boolean },
+  ): Promise<AccountModelCatalogRead> {
+    const now = this.now();
+    const cached = this.modelCatalogByAccount.get(account.id);
+    if (!options.forceRefresh && cached && cached.expiresAt.getTime() > now.getTime()) {
+      return {
+        models: cloneModelOptions(cached.models),
+        observedAt: cached.observedAt,
+        stale: false,
+      };
+    }
+
+    let refresh = this.modelCatalogRefreshByAccount.get(account.id);
+    if (!refresh) {
+      const generation = this.modelCatalogGenerationByAccount.get(account.id) ?? 0;
+      let createdRefresh!: Promise<CachedAccountModelCatalog>;
+      createdRefresh = (async () => {
+        const models = (await this.options.execution.listModels(account)).map((model) =>
+          ModelOptionSchema.parse(model),
+        );
+        const observedAt = this.now();
+        if ((this.modelCatalogGenerationByAccount.get(account.id) ?? 0) !== generation) {
+          throw new Error("Runtime model catalog changed during refresh");
+        }
+        const entry = {
+          models: cloneModelOptions(models),
+          observedAt,
+          expiresAt: new Date(observedAt.getTime() + MODEL_CATALOG_TTL_MS),
+        } satisfies CachedAccountModelCatalog;
+        this.modelCatalogByAccount.set(account.id, entry);
+        return entry;
+      })().finally(() => {
+        if (this.modelCatalogRefreshByAccount.get(account.id) === createdRefresh) {
+          this.modelCatalogRefreshByAccount.delete(account.id);
+        }
+      });
+      refresh = createdRefresh;
+      this.modelCatalogRefreshByAccount.set(account.id, createdRefresh);
+    }
+
+    try {
+      const entry = await refresh;
+      return {
+        models: cloneModelOptions(entry.models),
+        observedAt: entry.observedAt,
+        stale: false,
+      };
+    } catch {
+      const previous = this.modelCatalogByAccount.get(account.id);
+      if (options.allowStale && previous) {
+        return {
+          models: cloneModelOptions(previous.models),
+          observedAt: previous.observedAt,
+          stale: true,
+        };
+      }
+      throw new ModelCatalogUnavailableError();
+    }
+  }
+
+  private invalidateAccountModelCatalog(accountId: string): void {
+    this.modelCatalogGenerationByAccount.set(
+      accountId,
+      (this.modelCatalogGenerationByAccount.get(accountId) ?? 0) + 1,
+    );
+    this.modelCatalogByAccount.delete(accountId);
+    this.modelCatalogRefreshByAccount.delete(accountId);
+  }
+
+  private isAccountModelRoutingEligible(userId: string, accountId: string): boolean {
+    return this.options.leases
+      .listModelRoutingAccountIdsForUser(userId, this.now(), accountId)
+      .includes(accountId);
+  }
+
+  private coolDownAccountAfterModelCatalogFailure(accountId: string, now: Date): void {
+    this.options.leases.updateAccount(accountId, { status: "COOLDOWN" });
+    this.invalidateAccountModelCatalog(accountId);
+    this.modelCatalogCooldownUntilByAccount.set(
+      accountId,
+      new Date(now.getTime() + MODEL_CATALOG_FAILURE_COOLDOWN_MS),
+    );
+  }
+
+  private recoverExpiredModelCatalogCooldowns(now: Date): void {
+    for (const [accountId, cooldownUntil] of this.modelCatalogCooldownUntilByAccount) {
+      if (cooldownUntil.getTime() > now.getTime()) continue;
+      this.modelCatalogCooldownUntilByAccount.delete(accountId);
+      const account = this.options.accounts.getInternal(accountId);
+      if (account?.status !== "COOLDOWN" || account.authStatus !== "AUTHENTICATED") {
+        continue;
+      }
+      this.invalidateAccountModelCatalog(accountId);
+      this.options.leases.updateAccount(accountId, { status: "AVAILABLE" });
+    }
+  }
+
+  private async resolveAndValidateModelSelection(
+    userId: string,
+    task: TaskRecord | null,
+    config: EffectiveThreadConfigSnapshot,
+    options: { allowUnresolvedDefault?: boolean } = {},
+  ): Promise<EffectiveThreadConfigSnapshot> {
+    let catalog: ModelCatalog;
+    try {
+      catalog = await this.readModelCatalogForUser(userId, task?.id, false);
+    } catch (error) {
+      if (
+        error instanceof NoRoutableModelAccountError &&
+        config.model === null &&
+        options.allowUnresolvedDefault
+      ) {
+        return config;
+      }
+      throw error;
+    }
+    const selectedModel =
+      config.model ??
+      catalog.models.find((model) => model.isDefault)?.model ??
+      catalog.models[0]?.model;
+    if (!selectedModel) throw new ModelCatalogUnavailableError();
+    validateModelAgainstCatalog(catalog.models, selectedModel, config.reasoningEffort);
+    return EffectiveThreadConfigSnapshotSchema.parse({
+      ...config,
+      model: selectedModel,
+    });
+  }
+
+  private async resolveAllocatedAccountModel(
+    account: InternalAccount,
+    config: EffectiveThreadConfigSnapshot,
+  ): Promise<EffectiveThreadConfigSnapshot> {
+    const catalog = await this.readAccountModelCatalog(account, {
+      allowStale: false,
+      forceRefresh: true,
+    });
+    const selectedModel =
+      config.model ??
+      catalog.models.find((model) => model.isDefault)?.model ??
+      catalog.models[0]?.model;
+    if (!selectedModel) throw new ModelCatalogUnavailableError();
+    validateModelAgainstCatalog(catalog.models, selectedModel, config.reasoningEffort);
+    return EffectiveThreadConfigSnapshotSchema.parse({
+      ...config,
+      model: selectedModel,
+    });
   }
 
   private validateSettingsPatch(patch: UserSettingsPatch): void {
     const execution = patch.execution;
     if (!execution) return;
-    if (execution.model !== undefined && execution.model !== null) {
-      throw new Error("Model selection is unavailable until the runtime model catalog is loaded");
-    }
     if (
       execution.reasoningEffort !== undefined &&
-      !SETTINGS_POLICY.allowedReasoningEfforts.includes(execution.reasoningEffort)
+      !SETTINGS_POLICY.allowedReasoningEfforts.some(
+        (effort) => effort.toLowerCase() === execution.reasoningEffort?.toLowerCase(),
+      )
     ) {
       throw new Error("Reasoning effort is not allowed by organization policy");
     }
@@ -847,6 +1157,7 @@ export class LocalPlatformService implements PlatformApi {
   private requireTask(taskId: string, userId: string) {
     const task = this.options.store.getTaskForUser(taskId, userId);
     if (!task) throw new Error("Task not found");
+    if (task.archivedAt) throw new Error("Thread is archived");
     return task;
   }
 
@@ -1179,6 +1490,39 @@ export class LocalPlatformService implements PlatformApi {
     }
     this.pendingStartSignalsByTask.set(queuedTurn.taskId, pendingSignals);
 
+    let effectiveConfig: EffectiveThreadConfigSnapshot;
+    try {
+      effectiveConfig = await this.resolveAllocatedAccountModel(account, queuedTurn.configSnapshot);
+      if (!this.isAccountModelRoutingEligible(queuedTurn.ownerId, account.id)) {
+        throw new AllocatedAccountIneligibleError();
+      }
+      if (effectiveConfig.model !== queuedTurn.configSnapshot.model) {
+        this.options.store.updateTurnConfigSnapshot(allocation.turnId, effectiveConfig);
+      }
+    } catch (error) {
+      const accountBecameIneligible =
+        error instanceof AllocatedAccountIneligibleError ||
+        !this.isAccountModelRoutingEligible(queuedTurn.ownerId, account.id);
+      if (error instanceof ModelCatalogUnavailableError && !accountBecameIneligible) {
+        this.coolDownAccountAfterModelCatalogFailure(account.id, this.now());
+      }
+      this.pendingStartSignalsByTask.delete(queuedTurn.taskId);
+      this.rejectAllocatedTurnBeforeRuntime(
+        allocation,
+        accountBecameIneligible
+          ? "The allocated Codex account became unavailable before execution."
+          : error instanceof ModelCatalogUnavailableError
+            ? "Runtime model catalog became unavailable before execution."
+            : "The selected model or Effort became unavailable before execution.",
+      );
+      if (error instanceof ModelCatalogUnavailableError && !accountBecameIneligible) throw error;
+      throw new AllocatedModelSelectionChangedError(
+        accountBecameIneligible
+          ? "Allocated Codex account became unavailable; submit the Turn again"
+          : undefined,
+      );
+    }
+
     try {
       await mkdir(cwd, { recursive: true, mode: 0o700 });
       const started = await this.options.execution.startTask({
@@ -1189,7 +1533,7 @@ export class LocalPlatformService implements PlatformApi {
         cwd,
         prompt: queuedTurn.prompt,
         existingThreadId: task.threadId,
-        effectiveConfig: queuedTurn.configSnapshot,
+        effectiveConfig,
         actorContext: this.actorContextFor(queuedTurn.ownerId),
       });
       this.schedulerTurnByRuntimeTurn.set(
@@ -1243,6 +1587,28 @@ export class LocalPlatformService implements PlatformApi {
     }
   }
 
+  private rejectAllocatedTurnBeforeRuntime(allocation: LeasedTurn, message: string): void {
+    const failedAt = this.now();
+    const turn = this.options.store.getTurn(allocation.turnId);
+    if (turn) {
+      const durationMs = this.options.store.completeTurn(allocation.turnId, "FAILED", failedAt);
+      if (durationMs !== null) this.options.leases.recordTurnDuration(durationMs, failedAt);
+      this.options.store.setTaskInactive(turn.taskId, "FAILED", failedAt);
+      const event = this.options.store.appendTaskEvent({
+        taskId: turn.taskId,
+        threadId: this.options.store.getTaskForUser(turn.taskId, turn.ownerId)?.threadId ?? null,
+        turnId: allocation.turnId,
+        type: "TURN_FAILED",
+        payload: { status: "failed", error: message },
+        now: failedAt,
+      });
+      this.publish(event);
+    }
+    this.startPromotedTurns(
+      this.options.leases.releaseTurnBeforeRuntime(allocation.turnId, failedAt),
+    );
+  }
+
   private startPromotedTurns(promoted: LeasedTurn[]): void {
     for (const turn of promoted) {
       void this.startAllocatedTurn(turn).catch(() => undefined);
@@ -1290,29 +1656,128 @@ export class LocalPlatformService implements PlatformApi {
     await Promise.all(stale.map((account) => this.refreshAccountQuota(account.id, observedAt)));
   }
 
-  private async refreshAccountQuota(accountId: string, observedAt = this.now()): Promise<void> {
+  private refreshAccountQuota(accountId: string, observedAt = this.now()): Promise<void> {
+    const inFlight = this.quotaRefreshByAccount.get(accountId);
+    if (inFlight) return inFlight;
+
     const account = this.options.accounts.getInternal(accountId);
-    if (!account) return;
-    try {
-      const quota = await this.options.execution.refreshWeeklyQuota(account);
-      this.options.accounts.updateWeeklyQuota(accountId, {
-        remainingPercent: quota.status === "KNOWN" ? quota.remainingPercent : null,
-        resetsAt:
-          quota.status === "KNOWN" && quota.resetsAt !== null
-            ? normalizeResetTimestamp(quota.resetsAt)
-            : null,
-        observedAt,
-      });
-    } catch {
-      this.options.accounts.setState(accountId, "QUARANTINED");
-    }
+    if (!account) return Promise.resolve();
+
+    let refresh!: Promise<void>;
+    refresh = (async () => {
+      try {
+        const quota = await this.options.execution.refreshWeeklyQuota(account);
+        this.options.accounts.updateWeeklyQuota(accountId, {
+          remainingPercent: quota.status === "KNOWN" ? quota.remainingPercent : null,
+          resetsAt:
+            quota.status === "KNOWN" && quota.resetsAt !== null
+              ? normalizeResetTimestamp(quota.resetsAt)
+              : null,
+          observedAt,
+        });
+      } catch {
+        // A stale quota already fails account eligibility. Transient network
+        // failures must not be promoted to an account/authentication failure.
+      } finally {
+        if (this.quotaRefreshByAccount.get(accountId) === refresh) {
+          this.quotaRefreshByAccount.delete(accountId);
+        }
+      }
+    })();
+    this.quotaRefreshByAccount.set(accountId, refresh);
+    return refresh;
+  }
+}
+
+const MODEL_CATALOG_TTL_MS = 60_000;
+const MODEL_CATALOG_FAILURE_COOLDOWN_MS = 30_000;
+
+function cloneModelOptions(models: ModelOption[]): ModelOption[] {
+  return models.map((model) => ({
+    ...model,
+    supportedReasoningEfforts: model.supportedReasoningEfforts.map((effort) => ({ ...effort })),
+    inputModalities: [...model.inputModalities],
+  }));
+}
+
+function intersectAccountModelCatalogs(catalogs: ModelOption[][]): ModelOption[] {
+  const [base, ...rest] = catalogs;
+  if (!base) return [];
+
+  const intersection: ModelOption[] = [];
+  for (const baseModel of base) {
+    const accountModels = [
+      baseModel,
+      ...rest.map((models) => models.find((model) => model.model === baseModel.model)),
+    ];
+    if (accountModels.some((model) => !model)) continue;
+    const models = accountModels as ModelOption[];
+    const supportedReasoningEfforts = baseModel.supportedReasoningEfforts.filter((effort) =>
+      models.every((model) =>
+        model.supportedReasoningEfforts.some(
+          (candidate) => candidate.value.toLowerCase() === effort.value.toLowerCase(),
+        ),
+      ),
+    );
+    if (supportedReasoningEfforts.length === 0) continue;
+
+    const commonDefault = models.every(
+      (model) =>
+        model.defaultReasoningEffort.toLowerCase() ===
+        baseModel.defaultReasoningEffort.toLowerCase(),
+    )
+      ? supportedReasoningEfforts.find(
+          (effort) => effort.value.toLowerCase() === baseModel.defaultReasoningEffort.toLowerCase(),
+        )?.value
+      : undefined;
+    const defaultReasoningEffort =
+      commonDefault ??
+      supportedReasoningEfforts.find(
+        (effort) => effort.value.toLowerCase() === baseModel.defaultReasoningEffort.toLowerCase(),
+      )?.value ??
+      supportedReasoningEfforts[0]?.value;
+    if (!defaultReasoningEffort) continue;
+
+    intersection.push(
+      ModelOptionSchema.parse({
+        ...baseModel,
+        isDefault: models.every((model) => model.isDefault),
+        defaultReasoningEffort,
+        supportedReasoningEfforts,
+        inputModalities: baseModel.inputModalities.filter((modality) =>
+          models.every((model) => model.inputModalities.includes(modality)),
+        ),
+        supportsPersonality: models.every((model) => model.supportsPersonality),
+      }),
+    );
+  }
+  if (!intersection.some((model) => model.isDefault) && intersection[0]) {
+    intersection[0] = ModelOptionSchema.parse({ ...intersection[0], isDefault: true });
+  }
+  return intersection;
+}
+
+function validateModelAgainstCatalog(
+  models: ModelOption[],
+  selectedModel: string,
+  selectedEffort: string,
+): void {
+  const model = models.find((candidate) => candidate.model === selectedModel);
+  if (!model) throw new Error("Unsupported model selection");
+  if (
+    !model.supportedReasoningEfforts.some(
+      (effort) => effort.value.toLowerCase() === selectedEffort.toLowerCase(),
+    )
+  ) {
+    throw new Error(
+      "Unsupported configuration: Reasoning effort is not supported by the selected model",
+    );
   }
 }
 
 const SETTINGS_POLICY = {
-  // 1.1A does not yet expose model/list. Until that catalog is wired, a
-  // non-null model override is rejected rather than silently accepting an
-  // unverified model id.
+  // Model choices are runtime-owned and returned by GET /api/models, so this
+  // organization-policy field stays null instead of duplicating that catalog.
   allowedModels: null,
   allowedReasoningEfforts: ["LOW", "MEDIUM", "HIGH", "XHIGH", "ULTRA"] as readonly string[],
   allowedPermissionModes: [

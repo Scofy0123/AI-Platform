@@ -44,11 +44,18 @@ test("Codex workspace completes two Turns in the same Thread with distinct Item 
   const threadId = new URL(threadUrl).pathname.split("/").at(-1);
   expect(threadId).toBeTruthy();
   await expect(page.getByRole("heading", { name: firstPrompt })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "执行计划" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "运行命令" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "调用企业工具" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "文件变更" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "任务完成" })).toBeVisible();
+  const conversation = page.getByLabel("Thread conversation");
+  await expect(conversation.getByText("已更新计划", { exact: true })).toBeVisible();
+  await expect(
+    conversation.getByRole("button", { name: /^查看命令 .*printf fake-codexplatform/ }),
+  ).toBeVisible();
+  await expect(
+    conversation.getByRole("button", { name: /^查看工具 .*demo_business_get/ }),
+  ).toBeVisible();
+  await expect(
+    conversation.getByRole("button", { name: "查看文件变更 0 files changed" }),
+  ).toBeVisible();
+  await expect(conversation.getByRole("status").filter({ hasText: "本轮已完成" })).toBeVisible();
   await expect(page.getByText(`Fake Runtime completed: ${firstPrompt}`)).toBeVisible();
 
   const secondPrompt = "第二轮继续验证同一 Thread";
@@ -57,9 +64,7 @@ test("Codex workspace completes two Turns in the same Thread with distinct Item 
   await expect(page).toHaveURL(threadUrl);
   await expect(page.getByText(secondPrompt, { exact: true })).toBeVisible();
   await expect(page.getByText(`Fake Runtime completed: ${secondPrompt}`)).toBeVisible();
-  await expect(
-    page.getByLabel("Thread conversation").getByText(firstPrompt, { exact: true }),
-  ).toBeVisible();
+  await expect(conversation.getByText(firstPrompt, { exact: true })).toBeVisible();
 
   const response = await page.request.get(`/api/threads/${threadId}`);
   expect(response.status()).toBe(200);
@@ -99,6 +104,94 @@ test("Codex workspace completes two Turns in the same Thread with distinct Item 
   if (process.env.CODEXPLATFORM_CAPTURE_UAT === "1") {
     await page.screenshot({ path: testInfo.outputPath("thread-workspace.png") });
   }
+});
+
+test("new Thread submits the selected Runtime model and its linked Effort", async ({ page }) => {
+  await page.goto("/threads/new");
+
+  const picker = page.getByRole("button", { name: /Model and Effort:/ });
+  await expect(picker).toContainText("Fake Standard");
+  await expect(picker).toContainText("medium");
+  await picker.click();
+  await page.getByRole("option", { name: /Fake Deep/ }).click();
+  await expect(picker).toContainText("Fake Deep");
+  await expect(picker).toContainText("high");
+  await page.getByText("xhigh", { exact: true }).click();
+  await expect(picker).toContainText("xhigh");
+
+  await page.getByLabel("Message Codex").fill("E2E selected model and Effort");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(page).toHaveURL(/\/threads\/(?!new$)[^/]+$/);
+  await expect(
+    page.getByText("Fake Runtime completed: E2E selected model and Effort"),
+  ).toBeVisible();
+
+  const threadId = new URL(page.url()).pathname.split("/").at(-1);
+  expect(threadId).toBeTruthy();
+  const response = await page.request.get(`/api/threads/${threadId}`);
+  expect(response.status()).toBe(200);
+  const thread = (await response.json()) as {
+    turns: Array<{ model: string | null; effort: string | null }>;
+  };
+  expect(thread.turns).toEqual([
+    expect.objectContaining({
+      model: "fake-codex-deep",
+      effort: "xhigh",
+    }),
+  ]);
+});
+
+test("Pinned, Side, and Bottom surfaces coexist while command output stays out of Transcript", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 1_000 });
+  await page.goto("/threads/new");
+  await page.getByLabel("Message Codex").fill("E2E independent workspace surfaces");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(
+    page.getByText("Fake Runtime completed: E2E independent workspace surfaces"),
+  ).toBeVisible();
+
+  const conversation = page.getByLabel("Thread conversation");
+  const rawCommandOutput = "fake-codexplatform";
+  await expect(conversation.getByText(rawCommandOutput, { exact: true })).toHaveCount(0);
+  await expect(conversation).not.toContainText(e2eCanaries.rawReasoning);
+  const initialConversationBox = await conversation.boundingBox();
+  expect(initialConversationBox).not.toBeNull();
+
+  await page.getByRole("button", { name: "Toggle pinned summary" }).click();
+  const pinned = page.getByRole("complementary", { name: "Pinned execution summary" });
+  await expect(pinned).toBeVisible();
+  const pinnedConversationBox = await conversation.boundingBox();
+  expect(pinnedConversationBox?.width).toBeCloseTo(initialConversationBox?.width ?? 0, 0);
+
+  await page.getByRole("button", { name: "Toggle side panel" }).click();
+  const side = page.getByRole("region", { name: "Side panel" });
+  await expect(side).toBeVisible();
+  const sideConversationBox = await conversation.boundingBox();
+  expect(sideConversationBox?.width ?? 0).toBeLessThan(initialConversationBox?.width ?? 0);
+
+  await page.getByRole("button", { name: "Toggle bottom panel" }).click();
+  const bottom = page.getByRole("region", { name: "Bottom panel" });
+  await expect(bottom).toBeVisible();
+  await expect(bottom.getByRole("tab", { name: "Terminal" })).toBeVisible();
+  await expect(bottom.getByRole("tab", { name: /Changes|Files|Tool details/ })).toHaveCount(0);
+  await expect(side).toBeVisible();
+  await expect(pinned).toBeVisible();
+  await expect(bottom).toContainText(rawCommandOutput);
+
+  await page.getByRole("button", { name: "Close pinned summary" }).click();
+  await expect(pinned).toHaveCount(0);
+  await expect(side).toBeVisible();
+  await expect(bottom).toBeVisible();
+  await expect(conversation.getByText(rawCommandOutput, { exact: true })).toHaveCount(0);
+
+  await conversation.getByRole("button", { name: /^查看工具 .*demo_business_get/ }).click();
+  await expect(side).toContainText("demo_business_get");
+  await expect(side).toContainText("Arguments");
+  await conversation.getByRole("button", { name: "查看文件变更 0 files changed" }).click();
+  await expect(side).toContainText("0 files changed");
+  await expect(bottom.getByRole("tab", { name: "Terminal" })).toBeVisible();
 });
 
 test("Settings confirms persistence before reload", async ({ page }) => {
@@ -211,20 +304,22 @@ test("seeded Subagents render Active and Done summaries with inspectable details
 }) => {
   await page.goto(`/threads/${seededFixture.threadId}`);
   await expect(page.getByRole("heading", { name: "E2E seeded private Thread" })).toBeVisible();
-  await page.getByRole("tab", { name: "Subagents" }).click();
+  await page.getByRole("button", { name: "Toggle side panel" }).click();
+  const side = page.getByRole("region", { name: "Side panel" });
+  await side.getByRole("tab", { name: "Subagents" }).click();
 
-  const active = page.getByRole("heading", { name: "Active" }).locator("..");
-  const done = page.getByRole("heading", { name: "Done" }).locator("..");
+  const active = side.getByRole("heading", { name: "Active" }).locator("..");
+  const done = side.getByRole("heading", { name: "Done" }).locator("..");
   await expect(active).toContainText("E2E active researcher");
   await expect(active).toContainText("Inspecting current evidence");
   await expect(done).toContainText("E2E completed reviewer");
   await expect(done).toContainText("Review completed without findings");
 
-  await page.getByRole("button", { name: "Open E2E completed reviewer details" }).click();
-  await expect(page.getByRole("heading", { name: "E2E completed reviewer" })).toBeVisible();
-  await expect(page.getByText("Review completed without findings", { exact: true })).toBeVisible();
-  await expect(page.getByText("DONE", { exact: true })).toBeVisible();
-  await expect(page.getByText("Subagent visible detail canary", { exact: true })).toBeVisible();
+  await side.getByRole("button", { name: "Open E2E completed reviewer details" }).click();
+  await expect(side.getByRole("heading", { name: "E2E completed reviewer" })).toBeVisible();
+  await expect(side.getByText("Review completed without findings", { exact: true })).toBeVisible();
+  await expect(side.getByText("DONE", { exact: true })).toBeVisible();
+  await expect(side.getByText("Subagent visible detail canary", { exact: true })).toBeVisible();
 });
 
 test("MEMBER has no admin affordance and cannot access admin or another user's Thread tree", async ({

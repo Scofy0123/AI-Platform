@@ -2,6 +2,79 @@ import { describe, expect, test } from "vitest";
 import { CodexEventNormalizer } from "./event-normalizer.js";
 
 describe("CodexEventNormalizer", () => {
+  test("redacts only known runtime paths from commands, cwd, approvals, and errors", () => {
+    const runtimeDataDir = "/private/var/folders/runtime/CODEX_HOME_SENTINEL_NORMALIZER_9f83";
+    const codexHome = `${runtimeDataDir}/codex-accounts/codex-private`;
+    const workspaceDir = `${runtimeDataDir}/workspaces/task-1`;
+    const normalizer = new CodexEventNormalizer({
+      taskId: "task-1",
+      runtimeDataDir,
+      codexHome,
+      workspaceDir,
+    });
+
+    const events = [
+      normalizer.normalizeNotification({
+        method: "item/started",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: {
+            type: "commandExecution",
+            id: "cmd-1",
+            command: `CODEX_HOME=${codexHome} node ${workspaceDir}/script.js packages/app/src/index.ts`,
+            cwd: workspaceDir,
+          },
+        },
+      }),
+      normalizer.normalizeNotification({
+        method: "item/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: {
+            type: "commandExecution",
+            id: "cmd-1",
+            command: `cat ${codexHome}/auth.json`,
+            aggregatedOutput: `failed under ${runtimeDataDir}`,
+            exitCode: 1,
+            durationMs: 5,
+          },
+        },
+      }),
+      normalizer.normalizeNotification({
+        method: "turn/completed",
+        params: {
+          threadId: "thread-1",
+          turn: {
+            id: "turn-1",
+            status: "failed",
+            error: { message: `cannot read ${codexHome}/auth.json` },
+          },
+        },
+      }),
+    ].flat();
+    const approval = normalizer.normalizeServerRequest({
+      id: "approval-1",
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "cmd-2",
+        command: `ls ${codexHome}`,
+        cwd: workspaceDir,
+        reason: `inspect ${runtimeDataDir}`,
+      },
+    });
+    const serialized = JSON.stringify({ events, approval });
+
+    expect(serialized).not.toContain(runtimeDataDir);
+    expect(serialized).not.toContain("CODEX_HOME_SENTINEL_NORMALIZER_9f83");
+    expect(serialized).toContain("[CODEX_HOME]");
+    expect(serialized).toContain("[WORKSPACE]");
+    expect(serialized).toContain("packages/app/src/index.ts");
+  });
+
   test("normalizes the user-visible Codex lifecycle and never emits raw reasoning content", () => {
     const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
     const messages = [
@@ -68,6 +141,7 @@ describe("CodexEventNormalizer", () => {
           command: "pnpm test",
           cwd: "/repo",
           status: "completed",
+          aggregatedOutput: "PASS\n",
           exitCode: 0,
           durationMs: 42,
         },
@@ -84,6 +158,7 @@ describe("CodexEventNormalizer", () => {
           namespace: null,
           tool: "feishu_doc_read",
           arguments: { url: "https://example.test" },
+          contentItems: [{ type: "inputText", text: '{"title":"UAT result"}' }],
           success: true,
           durationMs: 25,
         },
@@ -107,10 +182,132 @@ describe("CodexEventNormalizer", () => {
       },
     });
 
-    expect(command).toEqual([expect.objectContaining({ type: "COMMAND_COMPLETED" })]);
-    expect(tool).toEqual([expect.objectContaining({ type: "TOOL_COMPLETED" })]);
+    expect(command).toEqual([
+      expect.objectContaining({
+        type: "COMMAND_COMPLETED",
+        payload: {
+          itemId: "cmd-1",
+          command: "pnpm test",
+          aggregatedOutput: "PASS\n",
+          exitCode: 0,
+          durationMs: 42,
+        },
+      }),
+    ]);
+    expect(tool).toEqual([
+      expect.objectContaining({
+        type: "TOOL_COMPLETED",
+        payload: {
+          itemId: "tool-1",
+          tool: "feishu_doc_read",
+          result: [{ type: "inputText", text: '{"title":"UAT result"}' }],
+          durationMs: 25,
+        },
+      }),
+    ]);
     expect(approval).toEqual(expect.objectContaining({ type: "APPROVAL_REQUESTED" }));
     expect(failure).toEqual([expect.objectContaining({ type: "TURN_FAILED" })]);
+  });
+
+  test("normalizes the official MCP result field without exposing unrelated item fields", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    const tool = normalizer.normalizeNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "mcpToolCall",
+          id: "tool-1",
+          server: "enterprise",
+          tool: "business_read",
+          status: "completed",
+          arguments: { id: "order-1" },
+          result: {
+            content: [{ type: "text", text: "PAID" }],
+            structuredContent: { id: "order-1", status: "PAID" },
+            _meta: null,
+          },
+          durationMs: 17,
+          privateTransportState: "must-not-leak",
+        },
+      },
+    });
+
+    expect(tool).toEqual([
+      expect.objectContaining({
+        type: "TOOL_COMPLETED",
+        payload: {
+          itemId: "tool-1",
+          tool: "business_read",
+          result: {
+            content: [{ type: "text", text: "PAID" }],
+            structuredContent: { id: "order-1", status: "PAID" },
+            _meta: null,
+          },
+          durationMs: 17,
+        },
+      }),
+    ]);
+    expect(JSON.stringify(tool)).not.toContain("privateTransportState");
+  });
+
+  test("normalizes a completed Tool without an official result as null", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    const tool = normalizer.normalizeNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "dynamicToolCall",
+          id: "tool-1",
+          tool: "empty_tool",
+          status: "completed",
+          success: true,
+          contentItems: null,
+          durationMs: 3,
+        },
+      },
+    });
+
+    expect(tool).toEqual([
+      expect.objectContaining({
+        type: "TOOL_COMPLETED",
+        payload: expect.objectContaining({ result: null }),
+      }),
+    ]);
+  });
+
+  test("normalizes a missing command output snapshot as null", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    const command = normalizer.normalizeNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "commandExecution",
+          id: "cmd-1",
+          command: "true",
+          cwd: "/repo",
+          status: "completed",
+          aggregatedOutput: null,
+          exitCode: 0,
+          durationMs: 1,
+        },
+      },
+    });
+
+    expect(command).toEqual([
+      expect.objectContaining({
+        type: "COMMAND_COMPLETED",
+        payload: expect.objectContaining({ aggregatedOutput: null }),
+      }),
+    ]);
   });
 
   test("only exposes reasoning summaries and drops every raw reasoning field", () => {
@@ -317,5 +514,113 @@ describe("CodexEventNormalizer", () => {
         },
       }),
     ]);
+  });
+
+  test("normalizes model reroutes without retaining provider-specific or sensitive fields", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    const events = normalizer.normalizeNotification({
+      method: "model/rerouted",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        fromModel: "requested-model",
+        toModel: "actual-model",
+        reason: "highRiskCyberActivity",
+        providerTraceId: "provider-secret",
+        reasoningTextDelta: "private reasoning",
+        content: "private content",
+        encrypted_content: "ciphertext",
+      },
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        threadId: "thread-1",
+        turnId: "turn-1",
+        type: "MODEL_REROUTED",
+        payload: {
+          fromModel: "requested-model",
+          toModel: "actual-model",
+          reason: "SAFETY_POLICY",
+        },
+      }),
+    ]);
+    expect(JSON.stringify(events)).not.toMatch(
+      /highRiskCyberActivity|provider-secret|private reasoning|private content|ciphertext|encrypted_content/,
+    );
+  });
+
+  test("normalizes runtime warnings through an explicit field allowlist", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    const events = normalizer.normalizeNotification({
+      method: "warning",
+      params: {
+        threadId: "thread-1",
+        message: "The selected capability is temporarily unavailable.",
+        providerPayload: { retryAfter: 30 },
+        reasoningTextDelta: "private reasoning",
+        encrypted_content: "ciphertext",
+      },
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        threadId: "thread-1",
+        turnId: null,
+        type: "RUNTIME_WARNING",
+        payload: { message: "The selected capability is temporarily unavailable." },
+      }),
+    ]);
+    expect(JSON.stringify(events)).not.toMatch(
+      /providerPayload|retryAfter|private reasoning|ciphertext|encrypted_content/,
+    );
+  });
+
+  test("normalizes context compaction as an observable lifecycle event only", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    const events = normalizer.normalizeNotification({
+      method: "thread/compacted",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        rawProviderPayload: { discardedTokens: 12_345 },
+        content: "private content",
+        encrypted_content: "ciphertext",
+      },
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        threadId: "thread-1",
+        turnId: "turn-1",
+        type: "CONTEXT_COMPACTED",
+        payload: { status: "completed" },
+      }),
+    ]);
+    expect(JSON.stringify(events)).not.toMatch(
+      /rawProviderPayload|discardedTokens|private content|ciphertext|encrypted_content/,
+    );
+  });
+
+  test("drops malformed model reroutes and runtime notices instead of inventing display data", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    expect(
+      [
+        {
+          method: "model/rerouted",
+          params: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            fromModel: "requested-model",
+          },
+        },
+        { method: "warning", params: { threadId: "thread-1", message: "" } },
+        { method: "thread/compacted", params: { threadId: "thread-1" } },
+      ].flatMap((message) => normalizer.normalizeNotification(message)),
+    ).toEqual([]);
   });
 });

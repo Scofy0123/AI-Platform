@@ -92,6 +92,28 @@ describe("SQLiteLeaseStore", () => {
     });
   });
 
+  test("projects the same eligible account set used for model-catalog routing", () => {
+    store.addAccount(account("quota-high", { weeklyRemaining: 80, maxActiveUsers: 1 }));
+    store.addAccount(account("quota-low", { weeklyRemaining: 20 }));
+
+    expect(store.listEligibleAccountIdsForUser("user-1", NOW)).toEqual(["quota-high", "quota-low"]);
+    expect(store.acquireTurn(request("user-1", "task-1", "turn-1"))).toMatchObject({
+      kind: "LEASED",
+      accountId: "quota-high",
+    });
+
+    expect(store.listEligibleAccountIdsForUser("user-1", NOW)).toEqual(["quota-high"]);
+    expect(store.listEligibleAccountIdsForUser("user-2", NOW)).toEqual(["quota-low"]);
+    expect(store.listEligibleAccountIdsForUser("user-1", NOW, "quota-low")).toEqual([]);
+    expect(store.listModelRoutingAccountIdsForUser("user-2", NOW)).toEqual([
+      "quota-high",
+      "quota-low",
+    ]);
+    expect(store.listModelRoutingAccountIdsForUser("user-1", NOW, "quota-low")).toEqual([
+      "quota-low",
+    ]);
+  });
+
   test("selects the account required by an existing Thread instead of a higher-quota account", () => {
     store.addAccount(account("thread-account", { weeklyRemaining: 10 }));
     store.addAccount(account("higher-quota-account", { weeklyRemaining: 90 }));
