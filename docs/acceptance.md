@@ -36,6 +36,19 @@ pnpm verify
 - 本次没有启动第二个 App Server，因此没有重复执行 `REAL_CODEX_E2E=1`；这避免两个进程争用同一
   `CODEX_HOME`。Real Smoke 与凭证隔离探针仍按下表保持“未执行”。
 
+### 2026-07-27 Real HTTPS 传输回归
+
+- 复现任务 `3b21f413-77cc-46c0-8dfb-6833ca711184` 的 Turn 用时 124.4 秒；事件明确记录
+  `Falling back from WebSockets to HTTPS transport. request timed out`，首个模型输出在约 110 秒后出现。
+- Runtime 改为 HTTPS-only Provider 后，最终配置回归任务
+  `e1d5f48e-3734-4d0e-9481-fff24562d199` 使用 GPT-5.6-Sol 正常返回
+  `REAL_HTTPS_COMPACTION_OK`；Turn 用时 8.25 秒，首个文本约 7.2 秒出现。
+- 最终 Provider ID 为 `codexplatform_openai_https`，名称保持官方精确值 `OpenAI`，避免关闭长 Turn
+  所需的 OpenAI 远端上下文压缩判定。
+- 回归任务事件包含 Lease、Turn、Agent Delta、Token Usage 和完成事件，不包含 WebSocket 回退；
+  浏览器 DOM 显示真实模型、完成状态和最终回复。
+- 该回归证明当前单操作者真实链路的 transport 修复，不替代完整 `REAL_CODEX_E2E=1`、
+  凭证隔离探针或真实多人门禁。
 关键生命周期回归可单独运行：
 
 ```bash
@@ -358,6 +371,7 @@ unset FEISHU_E2E_USER_ACCESS_TOKEN
 | 独立管理后台与成员拒绝 | fake + 自动测试 | 2026-07-27 | Codex | 自动通过 | Playwright |
 | 用户侧账号别名 / raw reasoning 脱敏 | 自动测试 | 2026-07-27 | Codex | 自动通过 | API / SSE / DOM canary |
 | Runtime / `CODEX_HOME` 路径持久化与回放脱敏 | 自动测试 + real 页面复读 | 2026-07-27 | Codex | 通过 | store / API / SSE 哨兵 + 真实 DOM |
+| Real Codex HTTPS-only 首包与完成 | real / 单 operator | 2026-07-27 | Codex | 通过 | 真实 DOM + SQLite 事件时间戳 |
 | Output / Source URI 与本机路径安全 | 自动测试 | 2026-07-27 | Codex | 自动通过 | projection 测试 |
 | Token 不进入 SQLite / 日志 / 异常 | 自动测试 | 2026-07-27 | Codex | 自动通过 | secret canary 测试 |
 | 1.1A Real 非 operator 拒绝 | real gate + 自动测试 | 2026-07-27 | Codex | 自动通过 | composition / safety gate 测试 |

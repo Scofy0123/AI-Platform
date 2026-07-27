@@ -230,10 +230,16 @@ sequenceDiagram
 - `@openai/codex@0.144.6`
 - `app-server --stdio --strict-config`
 - `cli_auth_credentials_store="file"`
+- 平台到 App Server 使用 stdio JSONL；App Server 到 OpenAI 使用内部
+  `codexplatform_openai_https` Provider，复用 ChatGPT 登录认证并设置
+  `supports_websockets=false`，避免当前网络先等待 Responses WebSocket 超时后才回退 HTTPS；Provider
+  ID 保持平台隔离，但名称保持官方 `OpenAI`，保留 Codex 的 OpenAI 专属远端压缩判定
 - `approvalPolicy: on-request`
 - `sandbox: workspace-write`
 
 使用 `thread/start/resume` 和 `turn/start/steer/interrupt`。协议类型锁定在仓库中，通过 `pnpm codex:verify-protocol` 检查漂移。
+HTTPS-only Provider 是当前固定 Codex 版本下的显式传输适配，不改变模型、账号或额度身份；Codex
+未来提供正式 transport 配置后再替换，替换前仍须通过模型目录、认证、额度和真实 Turn 合约回归。
 
 ### active Turn fail closed
 
