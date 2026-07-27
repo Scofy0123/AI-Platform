@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   thread_id TEXT,
   current_turn_id TEXT,
   thread_config_json TEXT,
+  archived_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -313,6 +314,11 @@ export function migrateDatabase(sqlite: Database.Database): void {
   ensureColumn(sqlite, "codex_accounts", "quota_resets_at", "INTEGER");
   ensureColumn(sqlite, "task_events", "item_id", "TEXT");
   ensureColumn(sqlite, "tasks", "thread_config_json", "TEXT");
+  ensureColumn(sqlite, "tasks", "archived_at", "INTEGER");
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS tasks_owner_archived_updated_idx
+       ON tasks(owner_id, archived_at, updated_at DESC)`,
+  );
   ensureColumn(sqlite, "turns", "config_snapshot_json", "TEXT");
   ensureColumn(sqlite, "queue_entries", "required_account_id", "TEXT");
   backfillQueuedThreadAccountAffinity(sqlite);
@@ -447,6 +453,7 @@ function ensureColumn(
     | "required_account_id"
     | "item_id"
     | "thread_config_json"
+    | "archived_at"
     | "config_snapshot_json",
   definition: "TEXT" | "INTEGER",
 ): void {

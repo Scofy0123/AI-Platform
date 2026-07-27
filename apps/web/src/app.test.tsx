@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { App } from "./app.js";
 import type { TaskEvent, Thread } from "./types.js";
@@ -38,6 +38,30 @@ function createApi() {
         subagents: true,
         reasoningSummaries: true,
       },
+    }),
+    listModels: vi.fn().mockResolvedValue({
+      models: [
+        {
+          id: "fake-codex-standard",
+          model: "fake-codex-standard",
+          displayName: "Fake Codex Standard",
+          description: "Deterministic standard model",
+          hidden: false,
+          isDefault: true,
+          defaultReasoningEffort: "medium",
+          supportedReasoningEfforts: [
+            { value: "low", description: "Fast" },
+            { value: "medium", description: "Balanced" },
+            { value: "high", description: "Deep" },
+          ],
+          inputModalities: ["text"],
+          supportsPersonality: false,
+        },
+      ],
+      scope: "ELIGIBLE_ACCOUNT_INTERSECTION" as const,
+      accountCount: 1,
+      observedAt: "2026-07-21T12:00:00.000Z",
+      stale: false,
     }),
     listProjects: vi.fn().mockResolvedValue(projects),
     createProject: vi.fn().mockResolvedValue({ id: "project-created" }),
@@ -131,7 +155,7 @@ describe("CodexPlatform workspace", () => {
     expect(screen.getByRole("navigation", { name: "Codex workspace" })).toBeInTheDocument();
   });
 
-  test("renders the full Codex task timeline and task controls", async () => {
+  test("renders the full Codex Transcript with details in independent workspace surfaces", async () => {
     const events: TaskEvent[] = [
       {
         taskId: "task-1",
@@ -152,7 +176,13 @@ describe("CodexPlatform workspace", () => {
         sequence: 2,
         timestamp: "2026-07-21T12:00:02.000Z",
         type: "COMMAND_COMPLETED",
-        payload: { itemId: "cmd-1", command: "pnpm test", exitCode: 0, durationMs: 820 },
+        payload: {
+          itemId: "cmd-1",
+          command: "pnpm test",
+          aggregatedOutput: null,
+          exitCode: 0,
+          durationMs: 820,
+        },
       },
       {
         taskId: "task-1",
@@ -161,7 +191,7 @@ describe("CodexPlatform workspace", () => {
         sequence: 3,
         timestamp: "2026-07-21T12:00:03.000Z",
         type: "TOOL_COMPLETED",
-        payload: { itemId: "tool-1", tool: "feishu_doc_read", durationMs: 128 },
+        payload: { itemId: "tool-1", tool: "feishu_doc_read", result: null, durationMs: 128 },
       },
       {
         taskId: "task-1",
@@ -229,6 +259,7 @@ describe("CodexPlatform workspace", () => {
         title: "梳理客户成功周报",
         status: "RUNNING",
         updatedAt: "2026-07-21T12:02:00.000Z",
+        archivedAt: null,
         currentTurn: turn,
         turns: [turn],
         queue: null,
@@ -248,22 +279,47 @@ describe("CodexPlatform workspace", () => {
     );
 
     expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
-    expect(await screen.findByText("执行计划")).toBeInTheDocument();
-    expect(await screen.findByText("pnpm test")).toBeInTheDocument();
-    expect(await screen.findByText("feishu_doc_read")).toBeInTheDocument();
-    expect(await screen.findByText("文件变更")).toBeInTheDocument();
-    expect(await screen.findByText("等待审批")).toBeInTheDocument();
-    expect(screen.getAllByText(/队列第 2 位/).length).toBeGreaterThan(0);
+    const conversation = screen.getByRole("region", { name: "Thread conversation" });
+    expect(within(conversation).getByText("已更新计划")).toBeInTheDocument();
+    expect(within(conversation).getByText("先读取资料，再整理结论")).toBeInTheDocument();
+    const commandActivity = within(conversation).getByRole("button", {
+      name: /^查看命令 .*pnpm test/,
+    });
+    const toolActivity = within(conversation).getByRole("button", {
+      name: /^查看工具 .*feishu_doc_read/,
+    });
+    const diffActivity = within(conversation).getByRole("button", {
+      name: /查看文件变更/,
+    });
+    expect(within(conversation).getByRole("heading", { name: "等待审批" })).toBeInTheDocument();
+    expect(within(conversation).getByText("Queued at position 2")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "继续" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "继续" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "发送调整" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle side panel" }));
+    const sidePanel = screen.getByRole("region", { name: "Side panel" });
+    expect(within(sidePanel).getByText("搜索知识库")).toBeInTheDocument();
+
+    fireEvent.click(commandActivity);
+    expect(screen.getByRole("region", { name: "Bottom panel" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+
+    fireEvent.click(toolActivity);
+    expect(within(sidePanel).getByText("feishu_doc_read")).toBeInTheDocument();
+    expect(within(sidePanel).getByText("Completed")).toBeInTheDocument();
+
+    fireEvent.click(diffActivity);
+    expect(within(sidePanel).getByText("0 files changed")).toBeInTheDocument();
+    expect(sidePanel).toHaveTextContent("本周完成 8 项客户跟进");
+
     fireEvent.click(screen.getByRole("button", { name: "允许一次" }));
     await waitFor(() =>
       expect(runtimeApi.decideApproval).toHaveBeenCalledWith("approval-platform-1", "accept"),
     );
   });
 
-  test("coalesces streamed Codex message deltas into one timeline card", async () => {
+  test("coalesces streamed Codex message deltas into one continuous Transcript response", async () => {
     const api = createApi();
     const subscribe = vi.fn((_taskId, onEvent) => {
       for (const [index, delta] of ["U", "AT", "_BASIC", "_OK"].entries()) {
@@ -282,8 +338,10 @@ describe("CodexPlatform workspace", () => {
 
     render(<App initialEntries={["/tasks/task-1"]} api={api} subscribeToTaskEvents={subscribe} />);
 
-    expect(await screen.findByText("UAT_BASIC_OK")).toBeInTheDocument();
-    expect(screen.getAllByRole("heading", { name: "Codex" })).toHaveLength(1);
+    const response = await screen.findByText("UAT_BASIC_OK");
+    expect(response).toBeInTheDocument();
+    expect(response.closest(".codex-transcript-assistant")).toBeInTheDocument();
+    expect(screen.getAllByText("UAT_BASIC_OK")).toHaveLength(1);
   });
 
   test("keeps streamed Codex messages separate across item and Turn boundaries", async () => {
@@ -313,13 +371,14 @@ describe("CodexPlatform workspace", () => {
 
     render(<App initialEntries={["/tasks/task-1"]} api={api} subscribeToTaskEvents={subscribe} />);
 
-    expect(await screen.findByText("First message")).toBeInTheDocument();
-    expect(screen.getByText("Second message")).toBeInTheDocument();
-    expect(screen.getByText("Third message")).toBeInTheDocument();
-    expect(screen.getAllByRole("heading", { name: "Codex" })).toHaveLength(3);
+    const conversation = await screen.findByRole("region", { name: "Thread conversation" });
+    expect(within(conversation).getByText("First message")).toBeInTheDocument();
+    expect(within(conversation).getByText("Second message")).toBeInTheDocument();
+    expect(within(conversation).getByText("Third message")).toBeInTheDocument();
+    expect(conversation.querySelectorAll(".codex-transcript-assistant")).toHaveLength(3);
   });
 
-  test("coalesces streamed reasoning and command output by item", async () => {
+  test("coalesces reasoning in the Transcript and keeps full command output in Bottom Panel", async () => {
     const api = createApi();
     const subscribe = vi.fn((_taskId, onEvent) => {
       onEvent({
@@ -346,8 +405,8 @@ describe("CodexPlatform workspace", () => {
         turnId: "turn-1",
         sequence: 3,
         timestamp: "2026-07-21T12:00:03.000Z",
-        type: "COMMAND_OUTPUT",
-        payload: { itemId: "command-1", delta: "line 1\n" },
+        type: "COMMAND_STARTED",
+        payload: { itemId: "command-1", command: "printf first", cwd: "/workspace" },
       });
       onEvent({
         taskId: "task-1",
@@ -356,19 +415,60 @@ describe("CodexPlatform workspace", () => {
         sequence: 4,
         timestamp: "2026-07-21T12:00:04.000Z",
         type: "COMMAND_OUTPUT",
+        payload: { itemId: "command-1", delta: "line 1\n" },
+      });
+      onEvent({
+        taskId: "task-1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        sequence: 5,
+        timestamp: "2026-07-21T12:00:05.000Z",
+        type: "COMMAND_OUTPUT",
         payload: { itemId: "command-1", delta: "line 2" },
+      });
+      onEvent({
+        taskId: "task-1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        sequence: 6,
+        timestamp: "2026-07-21T12:00:06.000Z",
+        type: "COMMAND_STARTED",
+        payload: { itemId: "command-2", command: "printf second", cwd: "/workspace" },
+      });
+      onEvent({
+        taskId: "task-1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        sequence: 7,
+        timestamp: "2026-07-21T12:00:07.000Z",
+        type: "COMMAND_OUTPUT",
+        payload: { itemId: "command-2", delta: "line 3" },
       });
       return () => undefined;
     });
 
-    const view = render(
-      <App initialEntries={["/tasks/task-1"]} api={api} subscribeToTaskEvents={subscribe} />,
-    );
+    render(<App initialEntries={["/tasks/task-1"]} api={api} subscribeToTaskEvents={subscribe} />);
 
-    expect(await screen.findByText("Inspect context")).toBeInTheDocument();
-    expect(screen.getAllByRole("heading", { name: "执行摘要" })).toHaveLength(1);
-    expect(view.container.querySelectorAll(".command-output")).toHaveLength(1);
-    expect(view.container.querySelector(".command-output")).toHaveTextContent("line 1 line 2");
+    const conversation = await screen.findByRole("region", { name: "Thread conversation" });
+    expect(within(conversation).getByText("Inspect context")).toBeInTheDocument();
+    expect(within(conversation).getByText("执行思路")).toBeInTheDocument();
+    expect(within(conversation).queryByText(/line 1/)).not.toBeInTheDocument();
+    expect(within(conversation).queryByText(/line 2/)).not.toBeInTheDocument();
+    expect(within(conversation).queryByText(/line 3/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle bottom panel" }));
+    const bottomPanel = screen.getByRole("region", { name: "Bottom panel" });
+    expect(bottomPanel).toHaveTextContent("line 1");
+    expect(bottomPanel).toHaveTextContent("line 2");
+    expect(bottomPanel).toHaveTextContent("line 3");
+    const sessions = bottomPanel.querySelectorAll(".terminal-session");
+    expect(sessions).toHaveLength(2);
+    expect(sessions[0]).toHaveTextContent("printf first");
+    expect(sessions[0]).toHaveTextContent("line 1 line 2");
+    expect(sessions[0]).not.toHaveTextContent("line 3");
+    expect(sessions[1]).toHaveTextContent("printf second");
+    expect(sessions[1]).toHaveTextContent("line 3");
+    expect(sessions[1]).not.toHaveTextContent("line 1");
   });
 
   test("refreshes task status after a terminal SSE event", async () => {
@@ -399,8 +499,7 @@ describe("CodexPlatform workspace", () => {
     render(<App initialEntries={["/tasks/task-1"]} api={api} subscribeToTaskEvents={subscribe} />);
 
     expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole("button", { name: "继续" })).toBeEnabled());
-    expect(screen.getAllByText("已完成").length).toBeGreaterThan(0);
+    await waitFor(() => expect(screen.getAllByText("已完成").length).toBeGreaterThan(0));
   });
 
   test("does not project an old Turn terminal over the currently running Turn", async () => {
@@ -443,7 +542,7 @@ describe("CodexPlatform workspace", () => {
 
     expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: "停止" })).toBeEnabled());
-    expect(screen.getByRole("button", { name: "继续" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "继续" })).not.toBeInTheDocument();
     expect(screen.getAllByText("执行中").length).toBeGreaterThan(0);
   });
 
@@ -487,7 +586,7 @@ describe("CodexPlatform workspace", () => {
 
     expect(await screen.findByRole("heading", { name: "梳理客户成功周报" })).toBeInTheDocument();
     await waitFor(() => expect(screen.getAllByText("排队中").length).toBeGreaterThan(0));
-    expect(screen.getAllByText("队列第 1 位").length).toBeGreaterThan(0);
+    expect(screen.getByText("Queued at position 1")).toHaveAttribute("role", "status");
   });
 
   test.each(["COMPLETED", "FAILED", "INTERRUPTED", "NEEDS_RECOVERY"] as const)(

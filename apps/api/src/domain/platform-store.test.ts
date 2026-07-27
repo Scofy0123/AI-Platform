@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { createDatabase, type PlatformDatabase } from "../infra/db/database.js";
 import { migrateDatabase } from "../infra/db/migrate.js";
+import { SQLiteLeaseStore } from "./lease-store.js";
 import { SQLitePlatformStore } from "./platform-store.js";
 
 const NOW = new Date("2026-07-21T12:00:00.000Z");
@@ -35,6 +36,136 @@ describe("SQLitePlatformStore", () => {
     expect(store.getTaskForUser(task.id, "user-1")).toMatchObject({ title: "Build scheduler" });
     expect(store.listProjects("user-2")).toEqual([]);
     expect(store.getTaskForUser(task.id, "user-2")).toBeNull();
+  });
+
+  test("separates active and archived Thread lists by owner and project", () => {
+    const firstProject = store.createProject({
+      ownerId: "user-1",
+      name: "First",
+      now: NOW,
+    });
+    const secondProject = store.createProject({
+      ownerId: "user-1",
+      name: "Second",
+      now: NOW,
+    });
+    const visible = store.createTask({
+      ownerId: "user-1",
+      projectId: firstProject.id,
+      title: "Visible",
+      now: NOW,
+    });
+    const archived = store.createTask({
+      ownerId: "user-1",
+      projectId: firstProject.id,
+      title: "Archived",
+      now: NOW,
+    });
+    store.setTaskInactive(archived.id, "COMPLETED", NOW);
+    store.archiveThread({
+      threadId: archived.id,
+      ownerId: "user-1",
+      now: new Date(NOW.getTime() + 1),
+    });
+    const otherProject = store.createTask({
+      ownerId: "user-1",
+      projectId: secondProject.id,
+      title: "Other project",
+      now: NOW,
+    });
+
+    const visibleThreads = store.listTasks("user-1");
+    expect(visibleThreads).toHaveLength(2);
+    expect(visibleThreads).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: otherProject.id, archivedAt: null }),
+        expect.objectContaining({ id: visible.id, archivedAt: null }),
+      ]),
+    );
+    expect(store.listTasks("user-1", firstProject.id)).toEqual([
+      expect.objectContaining({ id: visible.id }),
+    ]);
+    expect(store.listArchivedTasks("user-1")).toEqual([
+      expect.objectContaining({
+        id: archived.id,
+        archivedAt: new Date(NOW.getTime() + 1).toISOString(),
+      }),
+    ]);
+    expect(store.listArchivedTasks("user-2")).toEqual([]);
+  });
+
+  test("archives and unarchives an owned inactive Thread atomically with audit", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Archive", now: NOW });
+    const thread = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Finished",
+      now: NOW,
+    });
+    store.setTaskInactive(thread.id, "COMPLETED", NOW);
+    const archivedAt = new Date(NOW.getTime() + 10);
+    const unarchivedAt = new Date(NOW.getTime() + 20);
+
+    expect(
+      store.archiveThread({ threadId: thread.id, ownerId: "user-1", now: archivedAt }),
+    ).toMatchObject({ id: thread.id, archivedAt: archivedAt.toISOString() });
+    expect(store.getTaskForUser(thread.id, "user-1")).toMatchObject({
+      archivedAt: archivedAt.toISOString(),
+    });
+    expect(
+      store.unarchiveThread({ threadId: thread.id, ownerId: "user-1", now: unarchivedAt }),
+    ).toMatchObject({ id: thread.id, archivedAt: null });
+
+    expect(
+      database.sqlite
+        .prepare(
+          `SELECT actor_user_id, task_id, action, outcome, summary
+           FROM audit_events
+           WHERE task_id = ?
+           ORDER BY created_at`,
+        )
+        .all(thread.id),
+    ).toEqual([
+      {
+        actor_user_id: "user-1",
+        task_id: thread.id,
+        action: "THREAD_ARCHIVED",
+        outcome: "SUCCESS",
+        summary: "Thread archived in CodexPlatform",
+      },
+      {
+        actor_user_id: "user-1",
+        task_id: thread.id,
+        action: "THREAD_UNARCHIVED",
+        outcome: "SUCCESS",
+        summary: "Thread unarchived in CodexPlatform",
+      },
+    ]);
+  });
+
+  test("fails closed when another owner archives a Thread or the Thread has active work", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Archive", now: NOW });
+    const thread = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Running",
+      now: NOW,
+    });
+
+    expect(() => store.archiveThread({ threadId: thread.id, ownerId: "user-2", now: NOW })).toThrow(
+      "Thread not found",
+    );
+
+    for (const status of ["QUEUED", "RUNNING", "WAITING_APPROVAL"]) {
+      database.sqlite.prepare("UPDATE tasks SET status = ? WHERE id = ?").run(status, thread.id);
+      expect(() =>
+        store.archiveThread({ threadId: thread.id, ownerId: "user-1", now: NOW }),
+      ).toThrow("Thread has active work and cannot be archived");
+    }
+
+    expect(database.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events").get()).toEqual({
+      count: 0,
+    });
   });
 
   test("appends monotonically sequenced events and replays from Last-Event-ID", () => {
@@ -139,6 +270,203 @@ describe("SQLitePlatformStore", () => {
     expect(JSON.stringify(persisted)).not.toMatch(
       /raw secret|raw content|ciphertext|reasoningTextDelta|encrypted_content/,
     );
+  });
+
+  test("persists only the readable summary from nested reasoning envelopes", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Keep nested reasoning private",
+      now: NOW,
+    });
+    const rawReasoningCanary = "RAW_REASONING_CANARY_STORE_7d3b";
+
+    store.appendTaskEvent({
+      taskId: task.id,
+      threadId: "runtime-thread-1",
+      turnId: "runtime-turn-1",
+      type: "TOOL_COMPLETED",
+      payload: {
+        itemId: "tool-1",
+        tool: "business_read",
+        result: {
+          reasoning: {
+            summary: "Readable execution summary.",
+            content: [{ type: "reasoning_text", text: rawReasoningCanary }],
+            reasoningTextDelta: rawReasoningCanary,
+            encrypted_content: rawReasoningCanary,
+          },
+        },
+        durationMs: 17,
+      },
+      now: NOW,
+    });
+
+    const events = store.listTaskEvents(task.id, "user-1", 0);
+    expect(events).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          result: {
+            reasoning: {
+              summary: "Readable execution summary.",
+            },
+          },
+        }),
+      }),
+    ]);
+    const persisted = database.sqlite
+      .prepare("SELECT payload_json FROM task_events WHERE task_id = ?")
+      .get(task.id);
+    expect(JSON.stringify({ events, persisted })).toContain("Readable execution summary.");
+    expect(JSON.stringify({ events, persisted })).not.toContain(rawReasoningCanary);
+  });
+
+  test("persists and replays the final command output snapshot", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Replay command output",
+      now: NOW,
+    });
+
+    store.appendTaskEvent({
+      taskId: task.id,
+      threadId: "runtime-thread-1",
+      turnId: "runtime-turn-1",
+      type: "COMMAND_COMPLETED",
+      payload: {
+        itemId: "command-1",
+        command: "printf '01\\n02\\n'",
+        aggregatedOutput: "01\n02\n",
+        exitCode: 0,
+        durationMs: 12,
+      },
+      now: NOW,
+    });
+
+    expect(store.listTaskEvents(task.id, "user-1", 0)).toEqual([
+      expect.objectContaining({
+        type: "COMMAND_COMPLETED",
+        payload: expect.objectContaining({ aggregatedOutput: "01\n02\n" }),
+      }),
+    ]);
+  });
+
+  test("never persists or replays account-home and managed-workspace absolute paths", () => {
+    const runtimeDataDir = "/private/var/runtime/CODEX_HOME_SENTINEL_STORE_d42a";
+    const codexHome = `${runtimeDataDir}/codex-accounts/codex-private`;
+    const leases = new SQLiteLeaseStore(database.sqlite);
+    leases.addAccount({
+      id: "codex-private",
+      alias: "Codex private",
+      codexHome,
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+      maxActiveUsers: 4,
+      weeklyRemaining: 90,
+      quotaUpdatedAt: NOW,
+      allowUnknownQuota: false,
+      healthScore: 100,
+    });
+    const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Redact runtime paths",
+      now: NOW,
+    });
+    const workspaceDir = `${runtimeDataDir}/workspaces/${task.id}`;
+    store.bindTaskRuntime(task.id, {
+      accountId: "codex-private",
+      accountAlias: "Codex private",
+      leaseId: "lease-private",
+      threadId: "runtime-thread-1",
+      now: NOW,
+    });
+
+    store.appendTaskEvent({
+      taskId: task.id,
+      threadId: "runtime-thread-1",
+      turnId: "runtime-turn-1",
+      type: "COMMAND_COMPLETED",
+      payload: {
+        itemId: "command-private",
+        command: `CODEX_HOME=${codexHome} node ${workspaceDir}/script.js packages/app/src/index.ts`,
+        aggregatedOutput: `failed while reading ${codexHome}/auth.json`,
+        exitCode: 1,
+        durationMs: 12,
+      },
+      now: NOW,
+    });
+    store.appendTaskEvent({
+      taskId: task.id,
+      threadId: "runtime-thread-1",
+      turnId: "runtime-turn-1",
+      type: "TURN_FAILED",
+      payload: {
+        status: "failed",
+        error: `runtime failure in ${runtimeDataDir}; source packages/app/src/index.ts`,
+      },
+      now: new Date(NOW.getTime() + 1),
+    });
+
+    const persisted = database.sqlite
+      .prepare("SELECT payload_json FROM task_events WHERE task_id = ? ORDER BY sequence")
+      .all(task.id);
+    const replay = store.listTaskEvents(task.id, "user-1", 0);
+    const serialized = JSON.stringify({ persisted, replay });
+
+    expect(serialized).not.toContain(runtimeDataDir);
+    expect(serialized).not.toContain("CODEX_HOME_SENTINEL_STORE_d42a");
+    expect(serialized).toContain("[CODEX_HOME]");
+    expect(serialized).toContain("[WORKSPACE]");
+    expect(serialized).toContain("packages/app/src/index.ts");
+  });
+
+  test("replays Tool results to the Thread owner through the existing safe payload projection", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Replay Tool result",
+      now: NOW,
+    });
+
+    store.appendTaskEvent({
+      taskId: task.id,
+      threadId: "runtime-thread-1",
+      turnId: "runtime-turn-1",
+      type: "TOOL_COMPLETED",
+      payload: {
+        itemId: "tool-1",
+        tool: "business_read",
+        result: {
+          status: "PAID",
+          nested: {
+            encrypted_content: "ciphertext",
+            reasoningTextDelta: "private reasoning",
+          },
+        },
+        durationMs: 17,
+      },
+      now: NOW,
+    });
+
+    const ownerEvents = store.listTaskEvents(task.id, "user-1", 0);
+    expect(ownerEvents).toEqual([
+      expect.objectContaining({
+        type: "TOOL_COMPLETED",
+        payload: {
+          itemId: "tool-1",
+          tool: "business_read",
+          result: { status: "PAID", nested: {} },
+          durationMs: 17,
+        },
+      }),
+    ]);
+    expect(store.listTaskEvents(task.id, "user-2", 0)).toBeNull();
   });
 
   test("isolates personal settings by Feishu user and never stores shared account config", () => {
@@ -329,6 +657,41 @@ describe("SQLitePlatformStore", () => {
         now: NOW,
       }),
     ).toThrow("Task not found");
+  });
+
+  test("finalizes a deferred model snapshot only before Runtime start", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Deferred model", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Queued work",
+      now: NOW,
+    });
+    store.createTurn({
+      id: "turn-deferred-model",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Run later",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    const finalized = {
+      model: "fake-codex-standard",
+      reasoningEffort: "MEDIUM",
+      permissionMode: "DEFAULT" as const,
+      approvalMode: "ASK" as const,
+      personality: "PRAGMATIC" as const,
+      instructions: "",
+      sourceVersion: "org-policy-1.1a-v1",
+    };
+
+    store.updateTurnConfigSnapshot("turn-deferred-model", finalized);
+    expect(store.getTurn("turn-deferred-model")?.configSnapshot).toEqual(finalized);
+
+    store.bindTurnRuntime("turn-deferred-model", "runtime-turn", NOW);
+    expect(() => store.updateTurnConfigSnapshot("turn-deferred-model", finalized)).toThrow(
+      "before Runtime start",
+    );
   });
 
   test("atomically rejects a second active Turn for the same task", () => {

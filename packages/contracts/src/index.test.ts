@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   BootstrapSchema,
+  ModelCatalogSchema,
   PLATFORM_VERSION,
   ProductModeSchema,
   ReasoningPresentationSchema,
@@ -71,6 +72,115 @@ describe("shared contracts scaffold", () => {
     ).toThrow();
   });
 
+  test("defines provider-neutral model-routing and runtime notice events", () => {
+    expect(TASK_EVENT_TYPES).toEqual(
+      expect.arrayContaining(["MODEL_REROUTED", "RUNTIME_WARNING", "CONTEXT_COMPACTED"]),
+    );
+  });
+
+  test("accepts a strict runtime model catalog with ordered provider effort strings", () => {
+    const catalog = ModelCatalogSchema.parse({
+      models: [
+        {
+          id: "gpt-5.6-codex",
+          model: "gpt-5.6-codex",
+          displayName: "5.6 Sol",
+          description: "Coding model",
+          hidden: false,
+          isDefault: true,
+          defaultReasoningEffort: "high",
+          supportedReasoningEfforts: [
+            { value: "high", description: "Deep work" },
+            { value: "ultra", description: "Maximum delegation" },
+          ],
+          inputModalities: ["text", "provider-future-modality"],
+          supportsPersonality: true,
+        },
+      ],
+      scope: "SINGLE_ACCOUNT",
+      accountCount: 1,
+      observedAt: "2026-07-27T04:00:00.000Z",
+      stale: false,
+    });
+
+    expect(catalog.models[0]?.supportedReasoningEfforts.map((item) => item.value)).toEqual([
+      "high",
+      "ultra",
+    ]);
+    expect(catalog.models[0]?.inputModalities).toEqual(["text", "provider-future-modality"]);
+    expect(JSON.stringify(catalog)).not.toMatch(/accountId|accountAlias|codexHome/i);
+  });
+
+  test("rejects invalid or credential-bearing runtime model catalogs", () => {
+    const validCatalog = {
+      models: [
+        {
+          id: "fake-codex-standard",
+          model: "fake-codex-standard",
+          displayName: "Fake Codex Standard",
+          description: "Deterministic test model",
+          hidden: false,
+          isDefault: true,
+          defaultReasoningEffort: "medium",
+          supportedReasoningEfforts: [{ value: "medium", description: "" }],
+          inputModalities: ["text"],
+          supportsPersonality: false,
+        },
+      ],
+      scope: "ELIGIBLE_ACCOUNT_INTERSECTION",
+      accountCount: 2,
+      observedAt: "2026-07-27T04:00:00.000Z",
+      stale: true,
+    } as const;
+
+    expect(ModelCatalogSchema.parse(validCatalog).scope).toBe("ELIGIBLE_ACCOUNT_INTERSECTION");
+    expect(() => ModelCatalogSchema.parse({ ...validCatalog, accountCount: 0 })).toThrow();
+    expect(() => ModelCatalogSchema.parse({ ...validCatalog, observedAt: "yesterday" })).toThrow();
+    expect(() =>
+      ModelCatalogSchema.parse({
+        ...validCatalog,
+        models: [{ ...validCatalog.models[0], defaultReasoningEffort: "high" }],
+      }),
+    ).toThrow();
+    expect(() =>
+      ModelCatalogSchema.parse({
+        ...validCatalog,
+        models: [
+          {
+            ...validCatalog.models[0],
+            supportedReasoningEfforts: [
+              { value: "medium", description: "First" },
+              { value: "medium", description: "Duplicate" },
+            ],
+          },
+        ],
+      }),
+    ).toThrow();
+    expect(() =>
+      ModelCatalogSchema.parse({
+        ...validCatalog,
+        scope: "SINGLE_ACCOUNT",
+        accountCount: 2,
+      }),
+    ).toThrow();
+    expect(() =>
+      ModelCatalogSchema.parse({
+        ...validCatalog,
+        models: [
+          {
+            ...validCatalog.models[0],
+            supportedReasoningEfforts: [{ value: " ", description: "" }],
+          },
+        ],
+      }),
+    ).toThrow();
+    for (const leakedField of ["accountId", "accountAlias", "codexHome"]) {
+      expect(() =>
+        ModelCatalogSchema.parse({ ...validCatalog, [leakedField]: "must-not-reach-browser" }),
+      ).toThrow();
+    }
+  });
+
   test("exposes strict Thread, Turn and Item projections without owner credentials", () => {
     const configSnapshot = {
       model: null,
@@ -87,6 +197,7 @@ describe("shared contracts scaffold", () => {
       title: "Build it",
       status: "RUNNING",
       updatedAt: "2026-07-21T00:00:00.000Z",
+      archivedAt: null,
       currentTurn: {
         id: "turn-1",
         threadId: "thread-1",
@@ -129,9 +240,12 @@ describe("shared contracts scaffold", () => {
       ],
     });
     expect(thread.currentTurn?.prompt).toBe("Implement the feature");
+    expect(thread.archivedAt).toBeNull();
     expect(thread.turns).toHaveLength(1);
     expect(JSON.stringify(thread)).not.toMatch(/ownerId|leaseId|credential|accountAlias/i);
     expect(() => ThreadSchema.parse({ ...thread, accountAlias: "Codex A" })).toThrow();
+    const { archivedAt: _archivedAt, ...withoutArchiveState } = thread;
+    expect(() => ThreadSchema.parse(withoutArchiveState)).toThrow();
   });
 
   test("keeps reasoning presentation explicitly non-auditable", () => {

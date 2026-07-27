@@ -1,7 +1,12 @@
 import type { EffectiveThreadConfigSnapshot } from "@codexplatform/contracts";
 import type { Personality } from "./generated/Personality.js";
 import type { JsonValue } from "./generated/serde_json/JsonValue.js";
+import type { Model } from "./generated/v2/Model.js";
+import type { ModelListParams } from "./generated/v2/ModelListParams.js";
+import type { ModelListResponse } from "./generated/v2/ModelListResponse.js";
 import type { SandboxPolicy } from "./generated/v2/SandboxPolicy.js";
+import type { ThreadBackgroundTerminalsListResponse } from "./generated/v2/ThreadBackgroundTerminalsListResponse.js";
+import type { ThreadBackgroundTerminalsTerminateResponse } from "./generated/v2/ThreadBackgroundTerminalsTerminateResponse.js";
 import type { ThreadMemoryModeSetParams } from "./generated/v2/ThreadMemoryModeSetParams.js";
 import type { ThreadMemoryModeSetResponse } from "./generated/v2/ThreadMemoryModeSetResponse.js";
 import type { ThreadResumeParams } from "./generated/v2/ThreadResumeParams.js";
@@ -49,6 +54,8 @@ interface RateLimitsResponse {
   rateLimits: RateLimitSnapshot;
   rateLimitsByLimitId: Record<string, RateLimitSnapshot | undefined> | null;
 }
+
+const MAX_MODEL_CATALOG_PAGES = 100;
 
 export class CodexAppServerRuntime {
   private readonly memoryDisabledThreadIds = new Set<string>();
@@ -115,6 +122,41 @@ export class CodexAppServerRuntime {
     return { status: "WEEKLY_QUOTA_UNKNOWN" };
   }
 
+  async listModels(): Promise<Model[]> {
+    const models: Model[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    let pageCount = 0;
+
+    do {
+      if (pageCount >= MAX_MODEL_CATALOG_PAGES) {
+        throw new Error(`Codex model/list exceeded ${MAX_MODEL_CATALOG_PAGES} pages`);
+      }
+      pageCount += 1;
+
+      const params: ModelListParams = {
+        cursor,
+        limit: 100,
+        includeHidden: false,
+      };
+      const page: ModelListResponse = await this.rpc.request<ModelListResponse>(
+        "model/list",
+        params,
+      );
+      models.push(...page.data.filter((model) => !model.hidden));
+
+      if (page.nextCursor !== null) {
+        if (seenCursors.has(page.nextCursor)) {
+          throw new Error("Codex model/list returned a repeated pagination cursor");
+        }
+        seenCursors.add(page.nextCursor);
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+
+    return models;
+  }
+
   async startThread(input: {
     cwd: string;
     dynamicTools: DynamicToolDefinition[];
@@ -174,8 +216,27 @@ export class CodexAppServerRuntime {
     });
   }
 
-  interruptTurn(threadId: string, turnId: string): Promise<unknown> {
-    return this.rpc.request("turn/interrupt", { threadId, turnId });
+  async interruptTurn(threadId: string, turnId: string): Promise<void> {
+    await this.rpc.request("turn/interrupt", { threadId, turnId });
+    let cursor: string | null = null;
+    do {
+      const page: ThreadBackgroundTerminalsListResponse =
+        await this.rpc.request<ThreadBackgroundTerminalsListResponse>(
+          "thread/backgroundTerminals/list",
+          { threadId, cursor, limit: 100 },
+        );
+      for (const terminal of page.data) {
+        const result = await this.rpc.request<ThreadBackgroundTerminalsTerminateResponse>(
+          "thread/backgroundTerminals/terminate",
+          { threadId, processId: terminal.processId },
+        );
+        if (!result.terminated) {
+          throw new Error(`Codex background terminal ${terminal.processId} was not terminated`);
+        }
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+    await this.rpc.request("thread/backgroundTerminals/clean", { threadId });
   }
 
   async resumeThread(

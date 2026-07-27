@@ -1,6 +1,7 @@
 import type {
   Bootstrap,
   EffectiveConfigOverride,
+  ModelCatalog,
   SubagentThread,
   SubagentThreadDetail,
   TaskDetail,
@@ -27,6 +28,7 @@ export interface AuthApi {
 
 export interface PlatformApi {
   getBootstrap(): Promise<Bootstrap>;
+  listModels(userId: string, threadId?: string): Promise<ModelCatalog>;
   createProject(userId: string, input: { name: string }): Promise<unknown>;
   listProjects(userId: string): Promise<unknown>;
   createTask(userId: string, input: { projectId: string; title: string }): Promise<unknown>;
@@ -37,6 +39,9 @@ export interface PlatformApi {
     input: { projectId: string; title: string; config?: EffectiveConfigOverride },
   ): Promise<Thread>;
   listThreads(userId: string, projectId?: string): Promise<Thread[]>;
+  listArchivedThreads(userId: string): Promise<Thread[]>;
+  archiveThread(threadId: string, userId: string): Promise<{ ok: true }>;
+  unarchiveThread(threadId: string, userId: string): Promise<{ ok: true }>;
   getThread(threadId: string, userId: string): Promise<Thread | null>;
   getAdminThread(threadId: string, adminUserId: string): Promise<Thread | null>;
   startThreadTurn(

@@ -5,6 +5,7 @@ import type {
   AdminUsage,
   Bootstrap,
   ConnectionSummary,
+  ModelCatalog,
   PlatformApi,
   PluginSummary,
   ProjectSummary,
@@ -113,6 +114,10 @@ export const httpApi: PlatformApi = {
     return { authenticated: true, user: session.user };
   },
   getBootstrap: () => request<Bootstrap>("/api/bootstrap"),
+  listModels: (threadId) =>
+    request<ModelCatalog>(
+      threadId ? `/api/models?threadId=${encodeURIComponent(threadId)}` : "/api/models",
+    ),
   listProjects: async () => {
     const projects = await request<RawProject[]>("/api/projects");
     return projects.map((project) => ({ ...project, taskCount: project.taskCount ?? 0 }));
@@ -146,6 +151,7 @@ export const httpApi: PlatformApi = {
     request<Thread[]>(
       projectId ? `/api/threads?projectId=${encodeURIComponent(projectId)}` : "/api/threads",
     ),
+  listArchivedThreads: () => request<Thread[]>("/api/threads/archived"),
   getThread: (threadId) => request<Thread>(`/api/threads/${encodeURIComponent(threadId)}`),
   createThread: (input) =>
     request<Thread>("/api/threads", {
@@ -161,6 +167,16 @@ export const httpApi: PlatformApi = {
     request(`/api/threads/${encodeURIComponent(threadId)}/${action}`, {
       method: "POST",
       body: JSON.stringify(action === "steer" && input ? { prompt: input } : {}),
+    }),
+  archiveThread: (threadId) =>
+    request<{ ok: true }>(`/api/threads/${encodeURIComponent(threadId)}/archive`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  unarchiveThread: (threadId) =>
+    request<{ ok: true }>(`/api/threads/${encodeURIComponent(threadId)}/unarchive`, {
+      method: "POST",
+      body: JSON.stringify({}),
     }),
   listSubagents: (threadId) =>
     request<SubagentThread[]>(`/api/threads/${encodeURIComponent(threadId)}/subagents`),

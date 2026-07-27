@@ -6,6 +6,22 @@ import { httpApi } from "./api.js";
 afterEach(() => vi.unstubAllGlobals());
 
 describe("HTTP API adapter", () => {
+  test("reads account-independent model catalogs for new and bound Threads", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ models: [], stale: false }))
+      .mockResolvedValueOnce(jsonResponse({ models: [], stale: false }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await httpApi.listModels?.();
+    await httpApi.listModels?.("thread / 1");
+
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/models",
+      "/api/models?threadId=thread%20%2F%201",
+    ]);
+  });
+
   test("uses the actor-aware 1.1 Thread, settings and Subagent endpoints", async () => {
     const fetcher = vi
       .fn<typeof fetch>()
@@ -63,6 +79,35 @@ describe("HTTP API adapter", () => {
       "/api/admin/usage",
       "/api/admin/runtime-health",
     ]);
+  });
+
+  test("uses the platform-owned Thread archive endpoints", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse([]))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetcher);
+    const archiveApi = httpApi as typeof httpApi & {
+      listArchivedThreads(): Promise<unknown>;
+      archiveThread(threadId: string): Promise<unknown>;
+      unarchiveThread(threadId: string): Promise<unknown>;
+    };
+
+    expect(archiveApi.listArchivedThreads).toBeTypeOf("function");
+    expect(archiveApi.archiveThread).toBeTypeOf("function");
+    expect(archiveApi.unarchiveThread).toBeTypeOf("function");
+    await archiveApi.listArchivedThreads();
+    await archiveApi.archiveThread("thread / 1");
+    await archiveApi.unarchiveThread("thread / 1");
+
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/threads/archived",
+      "/api/threads/thread%20%2F%201/archive",
+      "/api/threads/thread%20%2F%201/unarchive",
+    ]);
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({ method: "POST" });
+    expect(fetcher.mock.calls[2]?.[1]).toMatchObject({ method: "POST" });
   });
 
   test("normalizes the real API session and account shapes for the UI", async () => {

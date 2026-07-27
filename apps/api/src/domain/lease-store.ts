@@ -245,6 +245,55 @@ export class SQLiteLeaseStore {
     return this.promoteQueue(now);
   }
 
+  releaseTurnBeforeRuntime(turnId: string, now: Date): LeasedTurn[] {
+    this.immediateTransaction(() => {
+      const turn = this.sqlite
+        .prepare(
+          `SELECT account_id, user_id
+           FROM user_turn_slots WHERE turn_id = ?`,
+        )
+        .get(turnId) as { account_id: string; user_id: string } | undefined;
+      if (!turn) return;
+
+      this.sqlite.prepare("DELETE FROM user_turn_slots WHERE turn_id = ?").run(turnId);
+      const otherTurn = this.sqlite
+        .prepare(
+          `SELECT 1 FROM user_turn_slots
+           WHERE account_id = ? AND user_id = ? LIMIT 1`,
+        )
+        .get(turn.account_id, turn.user_id);
+      if (otherTurn) return;
+
+      const slot = this.sqlite
+        .prepare(
+          `SELECT account_id, slot_index, user_id, lease_id
+           FROM account_slots
+           WHERE account_id = ? AND user_id = ? LIMIT 1`,
+        )
+        .get(turn.account_id, turn.user_id) as AccountSlotRow | undefined;
+      if (!slot) return;
+      this.sqlite
+        .prepare(
+          `UPDATE account_leases
+           SET status = 'RELEASED', released_at = ?, release_reason = 'PRE_RUNTIME_REJECTED'
+           WHERE id = ? AND status = 'ACTIVE'`,
+        )
+        .run(now.getTime(), slot.lease_id);
+      this.sqlite
+        .prepare(
+          `UPDATE account_slots
+           SET user_id = NULL, lease_id = NULL, claimed_at = NULL, last_activity_at = NULL
+           WHERE account_id = ? AND slot_index = ?`,
+        )
+        .run(slot.account_id, slot.slot_index);
+      this.sqlite
+        .prepare("UPDATE codex_accounts SET status = 'AVAILABLE' WHERE id = ? AND status = 'FULL'")
+        .run(slot.account_id);
+    });
+
+    return this.promoteQueue(now);
+  }
+
   heartbeatTurn(turnId: string, now: Date): boolean {
     return this.immediateTransaction(() => {
       const turn = this.sqlite
@@ -460,6 +509,109 @@ export class SQLiteLeaseStore {
       )
       .get(accountId, accountId) as { active_users: number; active_turns: number };
     return { activeUsers: row.active_users, activeTurns: row.active_turns };
+  }
+
+  listEligibleAccountIdsForUser(
+    userId: string,
+    now: Date,
+    requiredAccountId: string | null = null,
+  ): string[] {
+    const userSlots = this.sqlite
+      .prepare(
+        `SELECT account_id, slot_index, user_id, lease_id
+         FROM account_slots
+         WHERE user_id = ?
+         ORDER BY claimed_at, account_id`,
+      )
+      .all(userId) as AccountSlotRow[];
+    const relevantSlots = requiredAccountId
+      ? userSlots.filter((slot) => slot.account_id === requiredAccountId)
+      : userSlots;
+    const eligibleExisting = relevantSlots
+      .filter((slot) => this.isAccountEligibleForExistingUser(slot.account_id, now))
+      .map((slot) => slot.account_id);
+    if (eligibleExisting.length > 0) return [...new Set(eligibleExisting)];
+
+    if (userSlots.length > 0) {
+      const hasBlockingTurn = Boolean(
+        this.sqlite.prepare("SELECT 1 FROM user_turn_slots WHERE user_id = ? LIMIT 1").get(userId),
+      );
+      if (hasBlockingTurn) return [];
+    }
+
+    const accountIds: string[] = [];
+    const excluded = new Set<string>();
+    while (true) {
+      const account = this.selectEligibleAccount(now, requiredAccountId, excluded);
+      if (!account) break;
+      accountIds.push(account.id);
+      excluded.add(account.id);
+    }
+    return accountIds;
+  }
+
+  listModelRoutingAccountIdsForUser(
+    userId: string,
+    now: Date,
+    requiredAccountId: string | null = null,
+  ): string[] {
+    const existing = this.sqlite
+      .prepare(
+        `SELECT s.account_id
+         FROM account_slots s
+         JOIN codex_accounts a ON a.id = s.account_id
+         WHERE s.user_id = ?
+           AND (? IS NULL OR a.id = ?)
+           AND a.status IN ('AVAILABLE', 'FULL')
+           AND a.auth_status = 'AUTHENTICATED'
+           AND a.health_score > 0
+           AND (
+             (a.weekly_remaining IS NOT NULL
+               AND a.weekly_remaining > 0
+               AND a.quota_updated_at >= ?)
+             OR (a.weekly_remaining IS NULL AND a.allow_unknown_quota = 1)
+           )
+         ORDER BY s.claimed_at, a.id`,
+      )
+      .all(
+        userId,
+        requiredAccountId,
+        requiredAccountId,
+        now.getTime() - QUOTA_FRESHNESS_MS,
+      ) as Array<{
+      account_id: string;
+    }>;
+    if (existing.length > 0) return [...new Set(existing.map((row) => row.account_id))];
+
+    const rows = this.sqlite
+      .prepare(
+        `SELECT a.id, COUNT(s.user_id) AS active_users
+         FROM codex_accounts a
+         LEFT JOIN account_slots s ON s.account_id = a.id
+         WHERE a.status IN ('AVAILABLE', 'FULL')
+           AND a.auth_status = 'AUTHENTICATED'
+           AND a.health_score > 0
+           AND (? IS NULL OR a.id = ?)
+           AND (
+             (a.weekly_remaining IS NOT NULL
+               AND a.weekly_remaining > 0
+               AND a.quota_updated_at >= ?)
+             OR (a.weekly_remaining IS NULL AND a.allow_unknown_quota = 1)
+           )
+         GROUP BY a.id
+         ORDER BY
+           (a.weekly_remaining IS NOT NULL) DESC,
+           a.weekly_remaining DESC,
+           active_users ASC,
+           a.health_score DESC,
+           (a.last_assigned_at IS NULL) DESC,
+           a.last_assigned_at ASC,
+           a.id ASC`,
+      )
+      .all(requiredAccountId, requiredAccountId, now.getTime() - QUOTA_FRESHNESS_MS) as Array<{
+      id: string;
+    }>;
+    return rows.map((row) => row.id);
   }
 
   recordTurnDuration(durationMs: number, completedAt: Date): void {

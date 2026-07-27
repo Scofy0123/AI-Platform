@@ -171,6 +171,7 @@ export const tasks = sqliteTable("tasks", {
   threadId: text("thread_id"),
   currentTurnId: text("current_turn_id"),
   threadConfigJson: text("thread_config_json"),
+  archivedAt: integer("archived_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });
