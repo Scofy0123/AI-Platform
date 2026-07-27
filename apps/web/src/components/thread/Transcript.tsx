@@ -46,8 +46,8 @@ export function Transcript({
               renderApproval={renderApproval}
             />
           ) : null}
-          <TurnExecutionGroup group={group}>
-            {group.executionRows.map((row) => (
+          {group.status === "UNKNOWN" && group.prompt === null && group.finalAnswer === null ? (
+            group.executionRows.map((row) => (
               <TranscriptRowView
                 row={row}
                 onOpenBottom={onOpenBottom}
@@ -56,8 +56,21 @@ export function Transcript({
                 renderApproval={renderApproval}
                 key={row.id}
               />
-            ))}
-          </TurnExecutionGroup>
+            ))
+          ) : (
+            <TurnExecutionGroup group={group}>
+              {group.executionRows.map((row) => (
+                <TranscriptRowView
+                  row={row}
+                  onOpenBottom={onOpenBottom}
+                  onOpenSide={onOpenSide}
+                  {...(onOpenSubagent ? { onOpenSubagent } : {})}
+                  renderApproval={renderApproval}
+                  key={row.id}
+                />
+              ))}
+            </TurnExecutionGroup>
+          )}
           {group.finalAnswer ? (
             <div className="codex-turn-final-answer">
               <TranscriptRowView

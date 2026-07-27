@@ -85,73 +85,103 @@ describe("Transcript", () => {
     expect(screen.getByText("我正在检查运行链路。")).toBeInTheDocument();
   });
 
+  test("does not invent a running Turn for thread-scoped runtime notices", () => {
+    const notice: TranscriptRow = {
+      ...IDENTITY,
+      turnId: null,
+      id: "runtime-warning",
+      itemId: "runtime-warning",
+      kind: "status",
+      status: "runtime-warning",
+      text: "Transport fallback",
+    };
+    const notices = transcriptGroup([notice]);
+    notices.turnId = null;
+    notices.prompt = null;
+    notices.executionRows = [notice];
+    notices.startedAt = null;
+    notices.status = "UNKNOWN";
+
+    render(
+      <Transcript
+        groups={[notices]}
+        onOpenBottom={vi.fn()}
+        onOpenSide={vi.fn()}
+        renderApproval={() => null}
+      />,
+    );
+
+    expect(screen.getByText("Transport fallback")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Working for/ })).not.toBeInTheDocument();
+  });
+
   test("renders a continuous conversation and opens evidence in dedicated panels", () => {
     const groups: TranscriptGroup[] = [
       transcriptGroup([
-          {
-            ...IDENTITY,
-            id: "user",
-            itemId: "user:turn-1",
-            kind: "user",
-            text: "完成 UAT",
-          },
-          {
-            ...IDENTITY,
-            id: "reasoning",
-            itemId: "reasoning-1",
-            kind: "reasoning-summary",
-            text: "先检查配置，再执行验证。",
-          },
-          {
-            ...IDENTITY,
-            id: "assistant",
-            itemId: "assistant-1",
-            kind: "assistant",
-            text: "我正在验证工作区。",
-          },
-          {
-            ...IDENTITY,
-            id: "command",
-            itemId: "command-1",
-            kind: "command",
-            text: "pnpm test",
-            command: "pnpm test",
-            cwd: "/repo",
-            status: "completed",
-            exitCode: 0,
-            durationMs: 120,
-          },
-          {
-            ...IDENTITY,
-            id: "tool",
-            itemId: "tool-1",
-            kind: "tool",
-            text: "feishu_doc_read",
-            tool: "feishu_doc_read",
-            status: "completed",
-            error: null,
-            durationMs: 240,
-          },
-          {
-            ...IDENTITY,
-            id: "diff",
-            itemId: "diff-1",
-            kind: "diff",
-            text: "1 file changed",
-            changedFiles: 1,
-          },
-          {
-            ...IDENTITY,
-            id: "subagent",
-            itemId: "subagent-1",
-            kind: "subagent",
-            text: "代码审查完成",
-            agentThreadId: "agent-thread-1",
-            name: "Reviewer",
-            role: "review",
-            status: "DONE",
-            resultSummary: "代码审查完成",
-          },
+        {
+          ...IDENTITY,
+          id: "user",
+          itemId: "user:turn-1",
+          kind: "user",
+          text: "完成 UAT",
+        },
+        {
+          ...IDENTITY,
+          id: "reasoning",
+          itemId: "reasoning-1",
+          kind: "reasoning-summary",
+          text: "先检查配置，再执行验证。",
+        },
+        {
+          ...IDENTITY,
+          id: "assistant",
+          itemId: "assistant-1",
+          kind: "assistant",
+          text: "我正在验证工作区。",
+        },
+        {
+          ...IDENTITY,
+          id: "command",
+          itemId: "command-1",
+          kind: "command",
+          text: "pnpm test",
+          command: "pnpm test",
+          cwd: "/repo",
+          status: "completed",
+          exitCode: 0,
+          durationMs: 120,
+        },
+        {
+          ...IDENTITY,
+          id: "tool",
+          itemId: "tool-1",
+          kind: "tool",
+          text: "feishu_doc_read",
+          tool: "feishu_doc_read",
+          status: "completed",
+          error: null,
+          durationMs: 240,
+        },
+        {
+          ...IDENTITY,
+          id: "diff",
+          itemId: "diff-1",
+          kind: "diff",
+          text: "1 file changed",
+          changedFiles: 1,
+        },
+        {
+          ...IDENTITY,
+          id: "subagent",
+          itemId: "subagent-1",
+          kind: "subagent",
+          text: "代码审查完成",
+          agentThreadId: "agent-thread-1",
+          name: "Reviewer",
+          role: "review",
+          status: "DONE",
+          resultSummary: "代码审查完成",
+        },
       ]),
     ];
     const openBottom = vi.fn();
@@ -194,18 +224,18 @@ describe("Transcript", () => {
   test("shows nested Subagent activity as read-only when no navigation handler is available", () => {
     const groups: TranscriptGroup[] = [
       transcriptGroup([
-          {
-            ...IDENTITY,
-            id: "nested-subagent",
-            itemId: "provider-item-1",
-            kind: "subagent",
-            text: "Nested review",
-            agentThreadId: "nested-agent-thread",
-            name: "Nested reviewer",
-            role: "review",
-            status: "ACTIVE",
-            resultSummary: null,
-          },
+        {
+          ...IDENTITY,
+          id: "nested-subagent",
+          itemId: "provider-item-1",
+          kind: "subagent",
+          text: "Nested review",
+          agentThreadId: "nested-agent-thread",
+          name: "Nested reviewer",
+          role: "review",
+          status: "ACTIVE",
+          resultSummary: null,
+        },
       ]),
     ];
 
@@ -225,27 +255,27 @@ describe("Transcript", () => {
   test("uses safe Markdown for user, assistant, and reasoning summary rows", () => {
     const groups: TranscriptGroup[] = [
       transcriptGroup([
-          {
-            ...IDENTITY,
-            id: "user-markdown",
-            itemId: "user:turn-1",
-            kind: "user",
-            text: "**User request**",
-          },
-          {
-            ...IDENTITY,
-            id: "assistant-markdown",
-            itemId: "assistant-1",
-            kind: "assistant",
-            text: "- one\n- two",
-          },
-          {
-            ...IDENTITY,
-            id: "reasoning-markdown",
-            itemId: "reasoning-1",
-            kind: "reasoning-summary",
-            text: "`inspect` then [run](javascript:alert(1))",
-          },
+        {
+          ...IDENTITY,
+          id: "user-markdown",
+          itemId: "user:turn-1",
+          kind: "user",
+          text: "**User request**",
+        },
+        {
+          ...IDENTITY,
+          id: "assistant-markdown",
+          itemId: "assistant-1",
+          kind: "assistant",
+          text: "- one\n- two",
+        },
+        {
+          ...IDENTITY,
+          id: "reasoning-markdown",
+          itemId: "reasoning-1",
+          kind: "reasoning-summary",
+          text: "`inspect` then [run](javascript:alert(1))",
+        },
       ]),
     ];
 

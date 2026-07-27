@@ -312,9 +312,7 @@ export function projectThreadPresentation(
       (row) => row !== group.prompt && row !== group.finalAnswer,
     );
     group.currentAction = deriveCurrentAction(group.executionRows, group.status);
-    group.defaultExpanded = !(
-      group.status === "COMPLETED" && group.finalAnswer !== null
-    );
+    group.defaultExpanded = !(group.status === "COMPLETED" && group.finalAnswer !== null);
     return group;
   });
   const rows = groups.flatMap((group) => group.rows);
@@ -876,11 +874,7 @@ function deriveCurrentAction(rows: TranscriptRow[], status: TranscriptGroup["sta
     (row): row is TranscriptCommandRow => row.kind === "command" && row.status === "running",
   );
   if (command) return command.command ? `Running ${command.command}` : "Running command";
-  if (
-    rows.some(
-      (row) => row.kind === "status" && row.status === "context-compacted",
-    )
-  ) {
+  if (rows.some((row) => row.kind === "status" && row.status === "context-compacted")) {
     return "Compacting context";
   }
   return "Thinking";
