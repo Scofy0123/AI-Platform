@@ -136,6 +136,7 @@ export const TASK_EVENT_TYPES = [
   "TURN_INTERRUPTED",
   "USER_MESSAGE",
   "AGENT_MESSAGE_DELTA",
+  "AGENT_MESSAGE_PHASE",
   "REASONING_SUMMARY_DELTA",
   "PLAN_UPDATED",
   "COMMAND_STARTED",
@@ -158,6 +159,9 @@ export const TASK_EVENT_TYPES = [
 ] as const;
 
 export type TaskEventType = (typeof TASK_EVENT_TYPES)[number];
+
+export const AgentMessagePhaseSchema = z.enum(["commentary", "final_answer"]);
+export type AgentMessagePhase = z.infer<typeof AgentMessagePhaseSchema>;
 
 export const RuntimeModelRerouteReasonSchema = z.enum([
   "SAFETY_POLICY",
@@ -390,6 +394,7 @@ export interface TaskEventPayloadMap {
   TURN_INTERRUPTED: { status: "interrupted" };
   USER_MESSAGE: { itemId: string; kind: "STEER"; text: string };
   AGENT_MESSAGE_DELTA: { itemId: string; delta: string };
+  AGENT_MESSAGE_PHASE: { itemId: string; phase: AgentMessagePhase | null };
   REASONING_SUMMARY_DELTA: { itemId: string; delta: string };
   PLAN_UPDATED: { explanation: string | null; plan: unknown[] };
   COMMAND_STARTED: { itemId: string; command: string; cwd: string };

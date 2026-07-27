@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  AgentMessagePhaseSchema,
   BootstrapSchema,
   ModelCatalogSchema,
   PLATFORM_VERSION,
@@ -76,6 +77,13 @@ describe("shared contracts scaffold", () => {
     expect(TASK_EVENT_TYPES).toEqual(
       expect.arrayContaining(["MODEL_REROUTED", "RUNTIME_WARNING", "CONTEXT_COMPACTED"]),
     );
+  });
+
+  test("accepts only safe agent message presentation phases", () => {
+    expect(AgentMessagePhaseSchema.parse("commentary")).toBe("commentary");
+    expect(AgentMessagePhaseSchema.parse("final_answer")).toBe("final_answer");
+    expect(() => AgentMessagePhaseSchema.parse("raw_reasoning")).toThrow();
+    expect(TASK_EVENT_TYPES).toContain("AGENT_MESSAGE_PHASE");
   });
 
   test("accepts a strict runtime model catalog with ordered provider effort strings", () => {
