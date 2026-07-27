@@ -2092,6 +2092,32 @@ tbody tr:hover {
   background: #3a383d;
 }
 
+.v11-workspace-nav .v11-thread-nav-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.v11-thread-nav-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.v11-thread-running-ring {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border: 1.5px solid rgba(228, 224, 232, 0.24);
+  border-top-color: #e7e3ea;
+  border-radius: 50%;
+  animation: v11-thread-ring-spin 900ms linear infinite;
+}
+
+@keyframes v11-thread-ring-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .v11-workspace-nav .v11-new-chat {
   color: #fff;
   font-size: 14px;

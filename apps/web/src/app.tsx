@@ -30,6 +30,7 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import { ApiError, httpApi } from "./api.js";
+import { ThreadNavItem } from "./components/navigation/ThreadNavItem.js";
 import { BottomPanel } from "./components/thread/BottomPanel.js";
 import {
   ModelEffortPicker,
@@ -309,9 +310,12 @@ function UserSidebar({ session }: { session: Session }) {
         <section aria-labelledby="history-label">
           <h2 id="history-label">History</h2>
           {threads.data?.slice(0, 8).map((thread) => (
-            <NavLink to={`/threads/${thread.id}`} key={thread.id}>
-              {thread.title}
-            </NavLink>
+            <ThreadNavItem
+              id={thread.id}
+              title={thread.title}
+              status={thread.status}
+              key={thread.id}
+            />
           ))}
         </section>
         <Link to="/settings/archived">
