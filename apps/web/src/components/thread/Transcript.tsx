@@ -102,20 +102,19 @@ function TranscriptRowView({
   renderApproval(row: TranscriptApprovalRow): ReactNode;
 }) {
   switch (row.kind) {
-    case "user":
-      {
-        const steer = !row.itemId.startsWith("user:");
-        return (
-          <article
-            className={`v11-user-message${steer ? " v11-steer-message" : ""}`}
-            data-message-side="right"
-            data-message-kind={steer ? "steer" : "prompt"}
-          >
-            {steer ? <div className="v11-message-label">Steer</div> : null}
-            <SafeMarkdown content={row.text} />
-          </article>
-        );
-      }
+    case "user": {
+      const steer = !row.itemId.startsWith("user:");
+      return (
+        <article
+          className={`v11-user-message${steer ? " v11-steer-message" : ""}`}
+          data-message-side="right"
+          data-message-kind={steer ? "steer" : "prompt"}
+        >
+          {steer ? <div className="v11-message-label">Steer</div> : null}
+          <SafeMarkdown content={row.text} />
+        </article>
+      );
+    }
     case "assistant":
       return (
         <article className="codex-transcript-assistant">

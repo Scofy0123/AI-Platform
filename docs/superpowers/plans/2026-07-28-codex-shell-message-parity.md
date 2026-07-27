@@ -37,7 +37,7 @@
 - Modify: `apps/web/src/app.tsx`
 - Modify: `apps/web/src/styles.css`
 
-1. Write failing tests asserting that `ALLOCATING`, `QUEUED`, `RUNNING`, and `WAITING_APPROVAL` render a small accessible spinner at the right edge, while terminal statuses do not.
+1. Write failing tests asserting that the public Thread statuses `QUEUED`, `RUNNING`, and `WAITING_APPROVAL` render a small accessible spinner at the right edge, while terminal statuses do not. `ALLOCATING` remains an internal lease state and is not part of the current `Thread.status` contract.
 2. Run the focused test and confirm failure.
 3. Implement a pure `isActiveThreadStatus` helper and `ThreadNavItem`.
 4. Render `ThreadNavItem` from `UserSidebar`.

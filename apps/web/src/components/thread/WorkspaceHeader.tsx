@@ -39,7 +39,7 @@ export function WorkspaceHeader({
   return (
     <header className="v11-thread-header">
       <div className="v11-thread-title">
-        <span className="v11-thread-project-icon" aria-label="当前项目">
+        <span className="v11-thread-project-icon" role="img" aria-label="当前项目">
           <Icon name="project" />
         </span>
         <h1>{title}</h1>

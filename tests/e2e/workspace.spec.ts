@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { type BrowserContext, expect, type Page, test } from "@playwright/test";
 import { e2eWebUrl } from "./config.js";
 import {
@@ -63,7 +64,7 @@ test("Codex workspace completes two Turns in the same Thread with distinct Item 
 
   const secondPrompt = "第二轮继续验证同一 Thread";
   await page.getByLabel("Message Codex").fill(secondPrompt);
-  await page.getByRole("button", { name: "发送调整" }).click();
+  await page.getByRole("button", { name: "发送消息" }).click();
   await expect(page).toHaveURL(threadUrl);
   await expect(page.getByText(secondPrompt, { exact: true })).toBeVisible();
   await expect(page.getByText(`Fake Runtime completed: ${secondPrompt}`)).toBeVisible();
@@ -205,7 +206,7 @@ test("Settings confirms persistence before reload", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
   await page.getByLabel("Appearance").selectOption("DARK");
   await page.getByRole("button", { name: "Save settings" }).click();
-  await expect(page.getByRole("status")).toContainText("已保存");
+  await expect(page.getByRole("status").filter({ hasText: "已保存" })).toContainText("已保存");
   await page.reload();
   await expect(page.getByLabel("Appearance")).toHaveValue("DARK");
 });
@@ -234,10 +235,15 @@ test("queued Thread disables the composer and cannot submit another Turn", async
   });
 
   await page.goto(`/threads/${seededFixture.queuedThreadId}`);
-  await expect(page.getByText("排队中", { exact: true })).toBeVisible();
+  await expect(page.getByText("Queued at position 1", { exact: true })).toBeVisible();
   await expect(page.getByLabel("Message Codex")).toBeDisabled();
   await expect(page.getByLabel("Message Codex")).toHaveAttribute("placeholder", "等待运行资源…");
-  await expect(page.getByRole("button", { name: "发送调整" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "发送消息" })).toBeDisabled();
+  await expect(
+    page.getByRole("link", { name: /E2E queued Thread/ }).getByRole("status", {
+      name: "任务正在运行",
+    }),
+  ).toBeVisible();
   await page.locator("form.v11-thread-composer").evaluate((form) => {
     (form as HTMLFormElement).requestSubmit();
   });
@@ -253,6 +259,71 @@ test("queued Thread disables the composer and cannot submit another Turn", async
     expect.objectContaining({ id: seededFixture.queuedTurnId, status: "QUEUED" }),
   ]);
   expect(thread.queue?.position).toBe(1);
+});
+
+test("running Thread matches the Codex shell, message alignment, and Composer control", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1512, height: 949 });
+  await page.goto(`/threads/${seededFixture.runningThreadId}`);
+
+  const header = page.locator("header.v11-thread-header");
+  await expect(header.getByRole("heading", { name: "E2E running Thread" })).toBeVisible();
+  await expect(header.getByRole("button")).toHaveCount(4);
+  await expect(header.getByRole("button", { name: "Thread actions" })).toBeVisible();
+  await expect(header.getByRole("button", { name: "Toggle pinned summary" })).toBeVisible();
+  await expect(header.getByRole("button", { name: "Toggle bottom panel" })).toBeVisible();
+  await expect(header.getByRole("button", { name: "Toggle side panel" })).toBeVisible();
+  await expect(header.getByText("Live", { exact: true })).toHaveCount(0);
+  await expect(header.getByRole("button", { name: "停止" })).toHaveCount(0);
+
+  const prompt = page.getByText("E2E running prompt", { exact: true });
+  await expect(prompt).toBeVisible();
+  await expect(prompt.locator("xpath=ancestor::article[1]")).toHaveAttribute(
+    "data-message-side",
+    "right",
+  );
+  await expect(page.getByRole("button", { name: /^Working for / })).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: /E2E running Thread/ }).getByRole("status", {
+      name: "任务正在运行",
+    }),
+  ).toBeVisible();
+
+  await expect(page.getByRole("button", { name: "停止" })).toBeVisible();
+
+  const desktopHeaderBox = await header.boundingBox();
+  const desktopPromptBox = await prompt.boundingBox();
+  const desktopConversationBox = await page.getByLabel("Thread conversation").boundingBox();
+  expect(desktopHeaderBox).not.toBeNull();
+  expect(desktopPromptBox).not.toBeNull();
+  expect(desktopConversationBox).not.toBeNull();
+  expect((desktopPromptBox?.x ?? 0) + (desktopPromptBox?.width ?? 0)).toBeGreaterThan(
+    (desktopConversationBox?.x ?? 0) + (desktopConversationBox?.width ?? 0) / 2,
+  );
+
+  if (process.env.CODEXPLATFORM_CAPTURE_UAT === "1") {
+    await page.screenshot({
+      path: resolve("docs/research/codex-reference/codexplatform-parity-uat.png"),
+      fullPage: true,
+    });
+  }
+
+  await page.getByLabel("Message Codex").fill("调整执行方向");
+  await expect(page.getByRole("button", { name: "停止" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "发送 Steer" })).toBeVisible();
+
+  await page.setViewportSize({ width: 760, height: 900 });
+  await expect(header.getByRole("heading", { name: "E2E running Thread" })).toBeVisible();
+  await expect(header.getByRole("button")).toHaveCount(4);
+  await expect(page.getByRole("button", { name: "发送 Steer" })).toBeVisible();
+  const narrowHeaderBox = await header.boundingBox();
+  const narrowComposerBox = await page.locator("form.v11-thread-composer").boundingBox();
+  expect(narrowHeaderBox).not.toBeNull();
+  expect(narrowComposerBox).not.toBeNull();
+  expect(narrowComposerBox?.y ?? 0).toBeGreaterThan(
+    (narrowHeaderBox?.y ?? 0) + (narrowHeaderBox?.height ?? 0),
+  );
 });
 
 test("administrator uses a separate management console", async ({ page }, testInfo) => {

@@ -96,10 +96,11 @@ Agent、Reasoning Summary、Plan、Tool、Command、Approval、Subagent 与最�
 
 当 Thread 状态为以下任一值时，在对应历史记录最右侧显示旋转圆环：
 
-- `ALLOCATING`
 - `QUEUED`
 - `RUNNING`
 - `WAITING_APPROVAL`
+
+`ALLOCATING` remains an internal lease state and is not exposed by the current public `Thread.status` contract.
 
 终态与不可执行状态不显示：
 

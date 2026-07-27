@@ -17,7 +17,7 @@ function renderItem(status: Parameters<typeof ThreadNavItem>[0]["status"]) {
 }
 
 describe("ThreadNavItem", () => {
-  test.each(["ALLOCATING", "QUEUED", "RUNNING", "WAITING_APPROVAL"] as const)(
+  test.each(["QUEUED", "RUNNING", "WAITING_APPROVAL"] as const)(
     "shows the Codex running ring for %s",
     (status) => {
       renderItem(status);

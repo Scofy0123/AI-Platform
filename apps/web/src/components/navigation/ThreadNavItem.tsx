@@ -1,12 +1,7 @@
 import { NavLink } from "react-router-dom";
 import type { TaskStatus } from "../../types.js";
 
-const ACTIVE_THREAD_STATUSES = new Set<TaskStatus>([
-  "ALLOCATING",
-  "QUEUED",
-  "RUNNING",
-  "WAITING_APPROVAL",
-]);
+const ACTIVE_THREAD_STATUSES = new Set<TaskStatus>(["QUEUED", "RUNNING", "WAITING_APPROVAL"]);
 
 export function isActiveThreadStatus(status: TaskStatus) {
   return ACTIVE_THREAD_STATUSES.has(status);

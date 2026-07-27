@@ -293,6 +293,7 @@ function seedPrivateThreadTree(
     )
     .run(e2eIdentity.userId, e2eCanaries.accountAlias, seededFixture.threadId, now - 4);
   seedQueuedThread(sqlite, configSnapshot, now);
+  seedRunningThread(sqlite, configSnapshot, now);
 
   seedSubagent(sqlite, {
     threadId: seededFixture.activeSubagentId,
@@ -325,6 +326,45 @@ function seedPrivateThreadTree(
       }),
       now - 2,
     );
+}
+
+function seedRunningThread(
+  sqlite: { prepare(sql: string): { run(...parameters: unknown[]): unknown } },
+  configSnapshot: string,
+  now: number,
+): void {
+  sqlite
+    .prepare(
+      `INSERT INTO tasks (
+        id, project_id, owner_id, title, status, account_id, account_alias, thread_id,
+        current_turn_id, created_at, updated_at
+      ) VALUES (?, ?, ?, 'E2E running Thread', 'RUNNING', 'primary-codex', ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      seededFixture.runningThreadId,
+      seededFixture.projectId,
+      e2eIdentity.userId,
+      e2eCanaries.accountAlias,
+      seededFixture.runningRuntimeThreadId,
+      seededFixture.runningTurnId,
+      now - 10_000,
+      now,
+    );
+  sqlite
+    .prepare(
+      `INSERT INTO turns (
+        id, task_id, codex_turn_id, prompt, status, config_snapshot_json, started_at
+      ) VALUES (?, ?, 'e2e-running-runtime-turn', 'E2E running prompt', 'RUNNING', ?, ?)`,
+    )
+    .run(seededFixture.runningTurnId, seededFixture.runningThreadId, configSnapshot, now - 10_000);
+  sqlite
+    .prepare(
+      `INSERT INTO task_events (
+        task_id, sequence, thread_id, turn_id, item_id, type, payload_json, created_at
+      ) VALUES (?, 1, ?, 'e2e-running-runtime-turn', 'e2e-running-start',
+        'TURN_STARTED', '{"status":"inProgress"}', ?)`,
+    )
+    .run(seededFixture.runningThreadId, seededFixture.runningRuntimeThreadId, now - 9_000);
 }
 
 function seedQueuedThread(
