@@ -125,6 +125,7 @@ const thread = {
   ],
   queue: null,
   items: [],
+  composerState: { planMode: false, revision: 0 },
 };
 
 function createApi(session: Session = adminSession) {
@@ -146,6 +147,35 @@ function createApi(session: Session = adminSession) {
     createProject: vi.fn().mockResolvedValue({ id: "project-created" }),
     listTasks: vi.fn().mockResolvedValue([task]),
     listModels: vi.fn().mockResolvedValue(modelCatalog),
+    listComposerCapabilities: vi.fn().mockResolvedValue([
+      {
+        id: "files-and-folders",
+        kind: "FILE_PICKER",
+        section: "ADD",
+        label: "Files and folders",
+        description: "Attach files from this device",
+        availability: "AVAILABLE",
+        unavailableReason: null,
+      },
+      {
+        id: "goal",
+        kind: "GOAL",
+        section: "ADD",
+        label: "Goal",
+        description: "Set a goal to keep pursuing",
+        availability: "AVAILABLE",
+        unavailableReason: null,
+      },
+      {
+        id: "plan-mode",
+        kind: "PLAN_MODE",
+        section: "ADD",
+        label: "Plan mode",
+        description: "Turn plan mode on",
+        availability: "AVAILABLE",
+        unavailableReason: null,
+      },
+    ]),
     getTask: vi.fn().mockResolvedValue({
       ...task,
       prompt: "读取飞书知识库并形成摘要",
@@ -165,6 +195,38 @@ function createApi(session: Session = adminSession) {
       currentTurn: null,
     }),
     createThread: vi.fn().mockResolvedValue({ ...thread, id: "thread-created" }),
+    createDraft: vi.fn().mockResolvedValue({ id: "draft-1" }),
+    deleteDraft: vi.fn().mockResolvedValue(undefined),
+    uploadAttachments: vi.fn().mockImplementation(async (threadId: string, files: File[]) => ({
+      id: `attachment-${files[0]?.name ?? "file"}`,
+      threadId,
+      kind: files.some((file) => file.webkitRelativePath) ? "FOLDER" : "FILE",
+      name: files[0]?.name ?? "file",
+      relativePath: `.codexplatform/attachments/a/${files[0]?.name ?? "file"}`,
+      mimeType: files[0]?.type || "application/octet-stream",
+      sizeBytes: files.reduce((sum: number, file: File) => sum + file.size, 0),
+      fileCount: files.length,
+      scanStatus: "READY",
+      createdAt: "2026-07-28T10:00:00.000Z",
+    })),
+    deleteAttachment: vi.fn().mockResolvedValue(undefined),
+    getThreadGoal: vi.fn().mockRejectedValue(new ApiError("Goal not found", 404)),
+    putThreadGoal: vi.fn().mockImplementation(async (threadId, input) => ({
+      threadId,
+      ...input,
+      status: "ACTIVE",
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      runtimeSyncState: "PENDING",
+      createdAt: "2026-07-28T10:00:00.000Z",
+      updatedAt: "2026-07-28T10:00:00.000Z",
+    })),
+    patchThreadGoal: vi.fn(),
+    deleteThreadGoal: vi.fn().mockResolvedValue({ cleared: true, runtimeSyncState: "SYNCED" }),
+    patchThreadComposer: vi.fn().mockImplementation(async (_threadId, patch) => ({
+      planMode: patch.planMode,
+      revision: patch.revision + 1,
+    })),
     startThreadTurn: vi.fn().mockResolvedValue({ status: "RUNNING", turnId: "turn-created" }),
     threadAction: vi.fn().mockResolvedValue({ ok: true }),
     archiveThread: vi.fn().mockResolvedValue({ ok: true }),
@@ -1083,6 +1145,93 @@ describe("CodexPlatform 1.1 user workspace", () => {
         name: "Model and Effort: Fake Codex Deep · high",
       }),
     ).toBeInTheDocument();
+  });
+
+  test("creates a hidden Draft for files and supports a pure-attachment first Turn", async () => {
+    const api = createApi();
+    render(<App initialEntries={["/threads/new?project=project-1"]} api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Add files and more" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Files and folders/ }));
+    const file = new File(["# UAT"], "uat.md", { type: "text/markdown" });
+    fireEvent.change(screen.getByLabelText("Choose files input"), {
+      target: { files: [file] },
+    });
+
+    expect(await screen.findByRole("listitem", { name: /uat.md.*Ready/ })).toBeInTheDocument();
+    expect(api.createDraft).toHaveBeenCalledWith({ projectId: "project-1" });
+    expect(api.createThread).not.toHaveBeenCalled();
+    expect(screen.queryByText("Untitled")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(api.startThreadTurn).toHaveBeenCalledWith(
+        "draft-1",
+        "",
+        {
+          model: "fake-codex-standard",
+          reasoningEffort: "medium",
+          permissionMode: "ASK_FOR_APPROVAL",
+        },
+        ["attachment-uat.md"],
+      ),
+    );
+  });
+
+  test("sets a Draft Goal and sticky Plan mode from the compact Add menu", async () => {
+    const api = createApi();
+    render(<App initialEntries={["/threads/new?project=project-1"]} api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Add files and more" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Goal/ }));
+    fireEvent.change(await screen.findByLabelText("Goal objective"), {
+      target: { value: "持续完成真实 UAT" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save Goal" }));
+    await waitFor(() =>
+      expect(api.putThreadGoal).toHaveBeenCalledWith(
+        "draft-1",
+        expect.objectContaining({ objective: "持续完成真实 UAT" }),
+      ),
+    );
+    expect(await screen.findByText("持续完成真实 UAT")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Add files and more" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: /Plan mode/ }));
+    await waitFor(() =>
+      expect(api.patchThreadComposer).toHaveBeenCalledWith("draft-1", {
+        planMode: true,
+        revision: 0,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Add files and more" }));
+    expect(screen.getByRole("menuitemcheckbox", { name: /Plan mode/ })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
+  test("locks Plan during an active Turn but allows an attachment-only Steer", async () => {
+    const api = createApi();
+    render(<App initialEntries={["/threads/thread-1"]} api={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Add files and more" }));
+    const plan = screen.getByRole("menuitemcheckbox", { name: /Plan mode/ });
+    expect(plan).toBeDisabled();
+    expect(screen.getByText("当前 Turn 执行中，Plan mode 已锁定")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Files and folders/ }));
+    fireEvent.change(screen.getByLabelText("Choose files input"), {
+      target: { files: [new File(["log"], "runtime.log", { type: "text/plain" })] },
+    });
+
+    expect(await screen.findByRole("listitem", { name: /runtime.log.*Ready/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "发送 Steer" }));
+    await waitFor(() =>
+      expect(api.threadAction).toHaveBeenCalledWith("thread-1", "steer", "", [
+        "attachment-runtime.log",
+      ]),
+    );
+    expect(api.createDraft).not.toHaveBeenCalled();
   });
 
   test("submits both the selected Runtime model and its supported Effort", async () => {

@@ -118,7 +118,7 @@ test("new Thread exposes governed Composer capabilities and submits its Runtime 
   await page.getByRole("button", { name: "Add files and more" }).click();
   await expect(page.getByRole("menuitem", { name: /Files and folders/ })).toBeEnabled();
   await expect(page.getByRole("menuitem", { name: /Goal/ })).toBeEnabled();
-  await expect(page.getByRole("menuitem", { name: /Plan mode/ })).toBeEnabled();
+  await expect(page.getByRole("menuitemcheckbox", { name: /Plan mode/ })).toBeEnabled();
   await expect(page.getByRole("menuitem", { name: /Record a skill/ })).toHaveCount(0);
   if (process.env.CODEXPLATFORM_CAPTURE_UAT === "1") {
     await page.screenshot({ path: testInfo.outputPath("composer-add-menu.png") });
@@ -174,6 +174,52 @@ test("new Thread exposes governed Composer capabilities and submits its Runtime 
       }),
     }),
   ]);
+});
+
+test("Composer Draft activates from a Goal, sticky Plan mode, and a pure attachment Turn", async ({
+  page,
+}) => {
+  await page.goto("/threads/new");
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitem", { name: /Goal/ }).click();
+  await page.getByLabel("Goal objective").fill("持续验证附件驱动的计划");
+  await page.getByRole("button", { name: "Save Goal" }).click();
+  await expect(page.getByText("持续验证附件驱动的计划", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitemcheckbox", { name: /Plan mode/ }).click();
+  await expect(page.getByText("Plan mode · On", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitem", { name: /Files and folders/ }).click();
+  await page.getByLabel("Choose files input").setInputFiles({
+    name: "composer-uat.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("attachment-only UAT"),
+  });
+  await expect(page.getByRole("listitem", { name: /composer-uat.txt.*Ready/ })).toBeVisible();
+
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(page).toHaveURL(/\/threads\/(?!new$)[^/]+$/);
+  await expect(page.getByRole("heading", { name: "composer-uat.txt" })).toBeVisible();
+  await expect(page.getByText(/Fake Runtime completed:/)).toBeVisible();
+  await expect(page.getByText("持续验证附件驱动的计划", { exact: true })).toBeVisible();
+
+  const threadId = new URL(page.url()).pathname.split("/").at(-1);
+  expect(threadId).toBeTruthy();
+  const response = await page.request.get(`/api/threads/${threadId}`);
+  expect(response.status()).toBe(200);
+  const thread = (await response.json()) as {
+    title: string;
+    composerState: { planMode: boolean };
+    turns: Array<{ prompt: string }>;
+  };
+  expect(thread).toMatchObject({
+    title: "composer-uat.txt",
+    composerState: { planMode: true },
+  });
+  expect(thread.turns).toEqual([expect.objectContaining({ prompt: "" })]);
 });
 
 test("Pinned, Side, and Bottom surfaces coexist while command output stays out of Transcript", async ({

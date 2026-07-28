@@ -362,6 +362,13 @@ function registerRoutes(
     );
   });
 
+  app.get("/api/threads/:id/attachments", async (request, reply) => {
+    const actor = requireSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    return platform.listAttachments(id, actor.user.id);
+  });
+
   app.delete("/api/threads/:id/attachments/:attachmentId", async (request, reply) => {
     const actor = requireWriteSession(request, reply, auth);
     if (!actor) return;

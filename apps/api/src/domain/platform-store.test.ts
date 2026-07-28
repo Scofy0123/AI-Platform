@@ -220,6 +220,7 @@ describe("SQLitePlatformStore", () => {
       scanStatus: "READY",
       now: NOW,
     });
+    expect(store.listUnclaimedAttachments(draft.id, "user-1")).toEqual([attachment]);
     const turn = store.createTurn({
       id: "turn-with-input",
       taskId: draft.id,
@@ -240,11 +241,47 @@ describe("SQLitePlatformStore", () => {
     });
     expect(store.getTaskForUser(draft.id, "user-1")).toMatchObject({
       lifecycleState: "ACTIVE",
+      title: "diagram.png",
     });
     expect(() => store.deleteAttachment(attachment.id, draft.id, "user-1")).toThrow(
       "Attachment is already claimed by a Turn",
     );
+    expect(store.listUnclaimedAttachments(draft.id, "user-1")).toEqual([]);
     expect(JSON.stringify(store.getTurnInputSnapshot(turn.id))).not.toContain("/private/");
+  });
+
+  test("derives a Draft title exactly once when the first Turn activates it", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Titles", now: NOW });
+    const draft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+    const longPrompt = `  ${"首次任务标题".repeat(20)}  `;
+
+    store.createTurn({
+      id: "draft-title-turn",
+      taskId: draft.id,
+      ownerId: "user-1",
+      prompt: longPrompt,
+      status: "ALLOCATING",
+      now: NOW,
+    });
+
+    expect(store.getTaskForUser(draft.id, "user-1")?.title).toBe(longPrompt.trim().slice(0, 80));
+
+    store.setTurnStatus("draft-title-turn", "COMPLETED");
+    store.createTurn({
+      id: "later-turn",
+      taskId: draft.id,
+      ownerId: "user-1",
+      prompt: "后续 Turn 不应改标题",
+      status: "ALLOCATING",
+      now: new Date(NOW.getTime() + 1_000),
+    });
+
+    expect(store.getTaskForUser(draft.id, "user-1")?.title).toBe(longPrompt.trim().slice(0, 80));
   });
 
   test("claims only owned, READY, unclaimed attachments into immutable Steer snapshots", () => {

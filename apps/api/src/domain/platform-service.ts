@@ -651,6 +651,10 @@ export class LocalPlatformService implements PlatformApi {
     await this.processAttachmentCleanupJobs(this.now());
   }
 
+  async listAttachments(threadId: string, userId: string): Promise<DraftAttachment[]> {
+    return this.options.store.listUnclaimedAttachments(threadId, userId);
+  }
+
   async getThreadGoal(threadId: string, userId: string): Promise<ThreadGoalView | null> {
     return this.options.store.getThreadGoal(threadId, userId);
   }

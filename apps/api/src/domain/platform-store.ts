@@ -641,6 +641,21 @@ export class SQLitePlatformStore {
     return row ? mapAttachment(row) : null;
   }
 
+  listUnclaimedAttachments(threadId: string, ownerId: string): DraftAttachment[] {
+    const task = this.sqlite
+      .prepare("SELECT 1 FROM tasks WHERE id = ? AND owner_id = ? AND lifecycle_state != 'EXPIRED'")
+      .get(threadId, ownerId);
+    if (!task) throw new Error("Thread not found");
+    const rows = this.sqlite
+      .prepare(
+        `SELECT * FROM draft_attachments
+         WHERE task_id = ? AND owner_id = ? AND claimed_turn_id IS NULL
+         ORDER BY created_at, id`,
+      )
+      .all(threadId, ownerId) as AttachmentRow[];
+    return rows.map(mapAttachment);
+  }
+
   getReadyAttachments(
     threadId: string,
     ownerId: string,
@@ -776,12 +791,13 @@ export class SQLitePlatformStore {
   }): TurnRecord {
     this.immediateTransaction(() => {
       const task = this.sqlite
-        .prepare("SELECT owner_id, lifecycle_state, plan_mode FROM tasks WHERE id = ?")
+        .prepare("SELECT owner_id, lifecycle_state, plan_mode, title FROM tasks WHERE id = ?")
         .get(input.taskId) as
         | {
             owner_id: string;
             lifecycle_state: "DRAFT" | "ACTIVE" | "EXPIRED";
             plan_mode: number;
+            title: string;
           }
         | undefined;
       if (!task || task.owner_id !== input.ownerId) throw new Error("Task not found");
@@ -863,12 +879,16 @@ export class SQLitePlatformStore {
           .run(input.id, input.now.getTime(), ...attachmentIds);
       }
       if (task.lifecycle_state === "DRAFT") {
+        const draftTitle =
+          task.title === "Untitled"
+            ? input.prompt.trim().slice(0, 80) || attachments[0]?.name || "New task"
+            : task.title;
         this.sqlite
           .prepare(
             `UPDATE tasks SET lifecycle_state = 'ACTIVE', status = 'READY',
-             draft_expires_at = NULL, updated_at = ? WHERE id = ?`,
+             draft_expires_at = NULL, title = ?, updated_at = ? WHERE id = ?`,
           )
-          .run(input.now.getTime(), input.taskId);
+          .run(draftTitle, input.now.getTime(), input.taskId);
       }
     });
     return this.getTurn(input.id) as TurnRecord;

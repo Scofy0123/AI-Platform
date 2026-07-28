@@ -2241,6 +2241,190 @@ tbody tr:hover {
   font-size: 12px;
 }
 
+.composer-resources:empty {
+  display: none;
+}
+
+.composer-resources {
+  display: grid;
+  gap: 8px;
+  margin: 0 5px 9px;
+  padding: 0;
+  border: 0;
+}
+
+.composer-attachment-chips {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.composer-attachment-chip,
+.composer-goal-chip {
+  display: grid;
+  min-width: 0;
+  max-width: 280px;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 8px;
+  border: 1px solid #3d3941;
+  border-radius: 9px;
+  color: #d7d3da;
+  background: #2a282d;
+}
+
+.composer-attachment-chip > svg,
+.composer-goal-chip > svg {
+  width: 15px;
+  height: 15px;
+  color: #9d97a2;
+}
+
+.composer-attachment-chip > span,
+.composer-goal-chip > span {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.composer-attachment-chip strong,
+.composer-goal-chip strong {
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 580;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-attachment-chip small,
+.composer-goal-chip small {
+  overflow: hidden;
+  color: #8e8993;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-attachment-chip > button {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: #908b95;
+  background: transparent;
+  cursor: pointer;
+}
+
+.composer-attachment-chip > button:hover {
+  color: #f0edf2;
+  background: #413d45;
+}
+
+.composer-attachment-chip > em {
+  grid-column: 2 / -1;
+  color: #ed8e99;
+  font-size: 9px;
+  font-style: normal;
+}
+
+.composer-attachment-chip.status-scanning > svg,
+.composer-attachment-chip.status-uploading > svg {
+  color: #b89aee;
+}
+
+.composer-attachment-chip.status-failed,
+.composer-attachment-chip.status-blocked {
+  border-color: rgba(237, 125, 136, 0.38);
+}
+
+.composer-goal-chip {
+  max-width: 100%;
+  grid-template-columns: 18px minmax(0, 1fr);
+  border-color: rgba(169, 138, 239, 0.28);
+  background: rgba(169, 138, 239, 0.07);
+}
+
+.composer-goal-chip > svg {
+  color: #ae8bec;
+}
+
+.composer-goal-chip.status-paused,
+.composer-goal-chip.status-budget_limited,
+.composer-goal-chip.status-complete {
+  opacity: 0.68;
+}
+
+.composer-goal-editor {
+  display: grid;
+  gap: 7px;
+  padding: 9px 10px;
+  border: 1px solid #3e3a42;
+  border-radius: 11px;
+  background: #29272c;
+}
+
+.composer-goal-editor label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+}
+
+.composer-goal-editor label > span {
+  padding-top: 4px;
+  color: #aaa4ae;
+  font-size: 11px;
+}
+
+.composer-goal-editor textarea {
+  min-height: 40px;
+  max-height: 96px;
+  padding: 3px 4px;
+  border: 0;
+  font-size: 12px;
+}
+
+.composer-goal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.composer-goal-actions > span {
+  margin-right: auto;
+  color: #847f89;
+  font-size: 9px;
+}
+
+.composer-goal-actions button {
+  height: 25px;
+  padding: 0 8px;
+  border: 1px solid #454149;
+  border-radius: 7px;
+  color: #c8c4cc;
+  background: #302e34;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.composer-goal-actions button:hover:not(:disabled) {
+  color: #f0edf2;
+  background: #3b3840;
+}
+
+.composer-goal-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .composer-add-menu,
 .composer-permission-picker {
   position: relative;

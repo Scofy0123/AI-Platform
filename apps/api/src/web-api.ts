@@ -56,6 +56,7 @@ export interface PlatformApi {
       files: Array<{ name: string; relativePath: string; mimeType: string; content: Buffer }>;
     },
   ): Promise<DraftAttachment>;
+  listAttachments(threadId: string, userId: string): Promise<DraftAttachment[]>;
   deleteAttachment(threadId: string, attachmentId: string, userId: string): Promise<void>;
   getThreadGoal(threadId: string, userId: string): Promise<ThreadGoalView | null>;
   putThreadGoal(threadId: string, userId: string, input: ThreadGoalInput): Promise<ThreadGoalView>;

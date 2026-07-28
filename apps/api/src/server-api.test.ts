@@ -1427,6 +1427,24 @@ describe("CodexPlatform HTTP API", () => {
     );
   });
 
+  test("lists only the current user's unclaimed Composer attachments", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/threads/thread-1/attachments",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({ id: "attachment-1", scanStatus: "READY" }),
+    ]);
+    expect(platform.listAttachments).toHaveBeenCalledWith("thread-1", "user-1");
+  });
+
   test("maps attachment validation errors to 400 and size limits to 413", async () => {
     const { auth, platform } = services();
     platform.uploadAttachment
@@ -1896,6 +1914,20 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       scanStatus: "READY" as const,
       createdAt: "2026-07-28T12:00:00.000Z",
     })),
+    listAttachments: vi.fn(async () => [
+      {
+        id: "attachment-1",
+        threadId: "thread-1",
+        kind: "FILE" as const,
+        name: "notes.txt",
+        relativePath: ".codexplatform/attachments/attachment-1/notes.txt",
+        mimeType: "text/plain",
+        sizeBytes: 5,
+        fileCount: 1,
+        scanStatus: "READY" as const,
+        createdAt: "2026-07-28T12:00:00.000Z",
+      },
+    ]),
     deleteAttachment: vi.fn(async () => undefined),
     getThreadGoal: vi.fn(async () => ({
       threadId: "thread-1",
