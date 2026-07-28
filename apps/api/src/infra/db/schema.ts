@@ -244,6 +244,8 @@ export const threadGoals = sqliteTable("thread_goals", {
   runtimeThreadId: text("runtime_thread_id"),
   runtimeUpdatedAt: integer("runtime_updated_at"),
   activatedAt: integer("activated_at", { mode: "timestamp_ms" }),
+  revision: integer("revision").notNull().default(1),
+  deletedAt: integer("deleted_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });

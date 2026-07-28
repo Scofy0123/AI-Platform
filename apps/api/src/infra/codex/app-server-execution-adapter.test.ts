@@ -384,6 +384,14 @@ describe("AppServerExecutionAdapter", () => {
   test("synchronizes an attached Goal immediately and verifies the Runtime projection", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();
+    vi.mocked(runtime.getThreadGoal).mockResolvedValue({
+      objective: "新的持续目标",
+      status: "paused",
+      tokenBudget: 200_000,
+      tokensUsed: 25,
+      timeUsedSeconds: 12,
+      updatedAt: 2,
+    });
     const adapter = new AppServerExecutionAdapter({
       supervisor: {
         startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
@@ -414,7 +422,7 @@ describe("AppServerExecutionAdapter", () => {
       }),
     ).resolves.toMatchObject({
       attachment: "ATTACHED",
-      goal: { status: "PAUSED", tokensUsed: 0, timeUsedSeconds: 0 },
+      goal: { status: "PAUSED", tokensUsed: 25, timeUsedSeconds: 12 },
     });
     expect(runtime.setThreadGoal).toHaveBeenLastCalledWith("thread-1", {
       objective: "新的持续目标",
@@ -422,6 +430,167 @@ describe("AppServerExecutionAdapter", () => {
       tokenBudget: 200_000,
     });
     expect(runtime.getThreadGoal).toHaveBeenCalledWith("thread-1");
+  });
+
+  test.each([
+    ["objective", { objective: "错误目标" }],
+    ["status", { status: "active" }],
+    ["tokenBudget", { tokenBudget: 199_999 }],
+    ["tokensUsed", { tokensUsed: 24 }],
+  ] as const)("rejects a Runtime Goal verification conflict in %s", async (_field, patch) => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.getThreadGoal).mockResolvedValue({
+      objective: "新的持续目标",
+      status: "paused",
+      tokenBudget: 200_000,
+      tokensUsed: 25,
+      timeUsedSeconds: 12,
+      updatedAt: 2,
+      ...patch,
+    });
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Run",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    await expect(
+      adapter.syncThreadGoal("thread-1", {
+        objective: "新的持续目标",
+        status: "PAUSED",
+        tokenBudget: 200_000,
+        tokensUsed: 25,
+        timeBudgetSeconds: 3_600,
+        timeUsedSeconds: 12,
+      }),
+    ).rejects.toMatchObject({ code: "GOAL_SYNC_CONFLICT" });
+  });
+
+  test("verifies that an attached Runtime Goal is absent after clear", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Run",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    await expect(adapter.clearThreadGoal("thread-1")).rejects.toMatchObject({
+      code: "GOAL_SYNC_CONFLICT",
+    });
+    expect(runtime.getThreadGoal).toHaveBeenCalledWith("thread-1");
+  });
+
+  test("does not negative-cache a transient Goal capability probe failure", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.readGoalProtocolCapability)
+      .mockImplementationOnce(() => {
+        throw new Error("temporary pipe failure");
+      })
+      .mockReturnValueOnce({ availability: "AVAILABLE", reasonCode: null, reason: null });
+    const startAccount = vi.fn(async () => ({ accountId: "account-1", rpc, runtime }));
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: { startAccount, stopAll: async () => undefined },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const account = {
+      id: "account-1",
+      alias: "Codex A",
+      status: "AVAILABLE" as const,
+      authStatus: "AUTHENTICATED" as const,
+      maxActiveUsers: 4,
+      activeUsers: 0,
+      activeTurns: 0,
+      healthScore: 100,
+      weeklyRemaining: null,
+      quotaUpdatedAt: null,
+      quotaResetsAt: null,
+      allowUnknownQuota: true,
+      codexHome: "/tmp/account-1",
+    };
+
+    await expect(adapter.readGoalCapability(account)).resolves.toMatchObject({
+      reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+    });
+    await expect(adapter.readGoalCapability(account)).resolves.toMatchObject({
+      availability: "AVAILABLE",
+    });
+    expect(runtime.readGoalProtocolCapability).toHaveBeenCalledTimes(2);
+  });
+
+  test("clears a deterministic Goal capability cache when the Runtime generation changes", async () => {
+    const rpc1 = new FakeRpc();
+    const rpc2 = new FakeRpc();
+    const runtime1 = runtimePort();
+    const runtime2 = runtimePort();
+    vi.mocked(runtime1.readGoalProtocolCapability).mockReturnValue({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "old Runtime",
+    });
+    let current = { accountId: "account-1", rpc: rpc1, runtime: runtime1 };
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => current,
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const account = {
+      id: "account-1",
+      alias: "Codex A",
+      status: "AVAILABLE" as const,
+      authStatus: "AUTHENTICATED" as const,
+      maxActiveUsers: 4,
+      activeUsers: 0,
+      activeTurns: 0,
+      healthScore: 100,
+      weeklyRemaining: null,
+      quotaUpdatedAt: null,
+      quotaResetsAt: null,
+      allowUnknownQuota: true,
+      codexHome: "/tmp/account-1",
+    };
+
+    await expect(adapter.readGoalCapability(account)).resolves.toMatchObject({
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+    });
+    current = { accountId: "account-1", rpc: rpc2, runtime: runtime2 };
+    await adapter.listModels(account);
+    await expect(adapter.readGoalCapability(account)).resolves.toMatchObject({
+      availability: "AVAILABLE",
+    });
+    expect(runtime2.readGoalProtocolCapability).toHaveBeenCalledTimes(1);
   });
 
   test("never starts a Turn when Goal synchronization fails", async () => {

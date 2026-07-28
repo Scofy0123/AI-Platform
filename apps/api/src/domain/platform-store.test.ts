@@ -430,6 +430,89 @@ describe("SQLitePlatformStore", () => {
     });
   });
 
+  test("returns only the first atomic token-budget transition for enforcement", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Goal tokens", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Goal tokens",
+      now: NOW,
+    });
+    store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "有界目标",
+      tokenBudget: 100,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+
+    expect(
+      store.updateThreadGoalTokens(task.id, "user-1", 100, new Date(NOW.getTime() + 1)),
+    ).toMatchObject({
+      triggered: true,
+      goal: { status: "BUDGET_LIMITED", tokensUsed: 100 },
+    });
+    expect(
+      store.updateThreadGoalTokens(task.id, "user-1", 120, new Date(NOW.getTime() + 2)),
+    ).toMatchObject({
+      triggered: false,
+      goal: { status: "BUDGET_LIMITED", tokensUsed: 120 },
+    });
+    store.markThreadGoalRecovery(task.id, "user-1", new Date(NOW.getTime() + 3));
+    expect(
+      store.updateThreadGoalTokens(task.id, "user-1", 150, new Date(NOW.getTime() + 4)),
+    ).toMatchObject({
+      triggered: false,
+      goal: { status: "NEEDS_RECOVERY", tokensUsed: 150 },
+    });
+  });
+
+  test("uses Goal revision CAS to reject a stale Runtime synchronization", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Goal CAS", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Goal CAS",
+      now: NOW,
+    });
+    const first = store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "第一版",
+      tokenBudget: 100,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+    const second = store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "第二版",
+      tokenBudget: 200,
+      timeBudgetSeconds: 3_600,
+      now: new Date(NOW.getTime() + 1),
+    });
+
+    expect(second.revision).toBeGreaterThan(first.revision);
+    expect(() =>
+      store.syncThreadGoal({
+        threadId: task.id,
+        ownerId: "user-1",
+        runtimeThreadId: "runtime-thread",
+        status: "ACTIVE",
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        expectedRevision: first.revision,
+        source: "COMMAND",
+        now: new Date(NOW.getTime() + 2),
+      }),
+    ).toThrow(expect.objectContaining({ code: "GOAL_MUTATION_SUPERSEDED" }));
+    expect(store.getThreadGoal(task.id, "user-1")).toMatchObject({
+      objective: "第二版",
+      runtimeSyncState: "PENDING",
+    });
+  });
+
   test.each(["PUT", "PATCH", "DELETE"] as const)(
     "atomically rejects Goal %s after a pending Turn freezes its snapshot",
     (operation) => {

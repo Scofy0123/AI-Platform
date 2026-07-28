@@ -8,6 +8,7 @@ import {
   type ThreadGoalView,
 } from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
+import { GoalSyncConflictError } from "../../domain/errors.js";
 import type {
   ApprovalDraft,
   AttachedGoalRuntimeResult,
@@ -183,24 +184,25 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
   }
 
   async readGoalCapability(account: InternalAccount): Promise<GoalRuntimeCapability> {
-    const cached = this.goalCapabilityByAccount.get(account.id);
-    if (cached) return { ...cached };
     try {
       const managed = await this.options.supervisor.startAccount({
         accountId: account.id,
         codexHome: account.codexHome,
       });
+      this.attach(managed);
+      const cached = this.goalCapabilityByAccount.get(account.id);
+      if (cached) return { ...cached };
       const capability = managed.runtime.readGoalProtocolCapability();
-      this.goalCapabilityByAccount.set(account.id, capability);
+      if (cacheableGoalCapability(capability)) {
+        this.goalCapabilityByAccount.set(account.id, capability);
+      }
       return { ...capability };
     } catch (error) {
-      const capability: GoalRuntimeCapability = {
+      return {
         availability: "UNAVAILABLE",
         reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
         reason: error instanceof Error ? error.message : "Goal Runtime capability probe failed",
       };
-      this.goalCapabilityByAccount.set(account.id, capability);
-      return capability;
     }
   }
 
@@ -249,7 +251,14 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     const runtime = this.runtimeByThread.get(threadId);
     if (!runtime) return { attachment: "DETACHED" };
     try {
-      return { attachment: "ATTACHED", cleared: await runtime.clearThreadGoal(threadId) };
+      const cleared = await runtime.clearThreadGoal(threadId);
+      if ((await runtime.getThreadGoal(threadId)) !== null) {
+        throw new GoalSyncConflictError(
+          "clear",
+          "Runtime Goal remained present after thread/goal/clear",
+        );
+      }
+      return { attachment: "ATTACHED", cleared };
     } catch (error) {
       this.cacheAttachedGoalFailure(threadId, error);
       throw error;
@@ -264,8 +273,12 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     if (applied.attachment === "DETACHED") return applied;
     const verified = await this.getThreadGoal(threadId);
     if (verified.attachment === "DETACHED" || !verified.goal) {
-      throw new Error("Runtime Goal verification failed after synchronization");
+      throw new GoalSyncConflictError(
+        "clear",
+        "Runtime Goal verification returned no Goal after synchronization",
+      );
     }
+    assertGoalProjectionMatches(goal, verified.goal);
     return {
       ...verified,
       goal: {
@@ -352,7 +365,9 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         this.goalCapabilityByAccount.get(input.accountId) ??
         managed.runtime.readGoalProtocolCapability();
       if (capability.availability !== "AVAILABLE") {
-        this.goalCapabilityByAccount.set(input.accountId, capability);
+        if (cacheableGoalCapability(capability)) {
+          this.goalCapabilityByAccount.set(input.accountId, capability);
+        }
         throw new Error(capability.reason ?? "Goal protocol is unavailable for this Runtime");
       }
       const synced = await managed.runtime.setThreadGoal(threadId, {
@@ -517,6 +532,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     const attached = this.attachedConnectionByAccount.get(managed.accountId);
     if (attached?.rpc === managed.rpc) return attached.generation;
     const generation = (this.lastConnectionGenerationByAccount.get(managed.accountId) ?? 0) + 1;
+    this.goalCapabilityByAccount.delete(managed.accountId);
     this.lastConnectionGenerationByAccount.set(managed.accountId, generation);
     this.attachedConnectionByAccount.set(managed.accountId, { rpc: managed.rpc, generation });
     managed.rpc.on("notification", (message: unknown) => {
@@ -755,10 +771,11 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       (candidate) => candidate.threadId === threadId,
     );
     if (!context) return;
+    if (!isMethodNotFoundError(error)) return;
     this.goalCapabilityByAccount.set(context.accountId, {
       availability: "UNAVAILABLE",
-      reasonCode: "RUNTIME_GOAL_RPC_FAILED",
-      reason: error instanceof Error ? error.message : "Goal Runtime RPC failed",
+      reasonCode: "RUNTIME_GOAL_METHOD_UNSUPPORTED",
+      reason: error instanceof Error ? error.message : "Goal Runtime method is unsupported",
     });
   }
 
@@ -964,6 +981,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     source?: { sourceTaskId: string; sourceRuntimeTurnId?: string },
   ): void {
     this.attachedConnectionByAccount.delete(accountId);
+    this.goalCapabilityByAccount.delete(accountId);
     for (const [contextKey, context] of this.contextByThread) {
       if (context.accountId !== accountId) continue;
       if (context.turnId) {
@@ -1077,6 +1095,48 @@ function projectRuntimeGoal(
     timeBudgetSeconds: fallback?.timeBudgetSeconds ?? 3_600,
     timeUsedSeconds: nativeGoal.timeUsedSeconds,
   };
+}
+
+function assertGoalProjectionMatches(
+  expected: ThreadGoalSnapshot,
+  actual: ThreadGoalSnapshot,
+): void {
+  if (actual.objective !== expected.objective) {
+    throw new GoalSyncConflictError("objective", "Runtime Goal objective did not match the write");
+  }
+  const expectedStatus = platformGoalStatus(runtimeGoalStatus(expected.status));
+  if (actual.status !== expectedStatus) {
+    throw new GoalSyncConflictError("status", "Runtime Goal status did not match the write");
+  }
+  if (actual.tokenBudget !== expected.tokenBudget) {
+    throw new GoalSyncConflictError(
+      "tokenBudget",
+      "Runtime Goal token budget did not match the write",
+    );
+  }
+  if (actual.tokensUsed < expected.tokensUsed) {
+    throw new GoalSyncConflictError("tokensUsed", "Runtime Goal token usage moved backwards");
+  }
+  if (actual.timeUsedSeconds < expected.timeUsedSeconds) {
+    throw new GoalSyncConflictError("timeUsedSeconds", "Runtime Goal elapsed time moved backwards");
+  }
+}
+
+function cacheableGoalCapability(capability: GoalRuntimeCapability): boolean {
+  return (
+    capability.availability === "AVAILABLE" ||
+    capability.reasonCode === "RUNTIME_VERSION_UNSUPPORTED" ||
+    capability.reasonCode === "RUNTIME_GOAL_METHOD_UNSUPPORTED"
+  );
+}
+
+function isMethodNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === -32_601
+  );
 }
 
 function messageThreadId(value: unknown): string | null {

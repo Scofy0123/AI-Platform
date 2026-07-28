@@ -223,6 +223,8 @@ CREATE TABLE IF NOT EXISTS thread_goals (
   runtime_thread_id TEXT,
   runtime_updated_at INTEGER,
   activated_at INTEGER,
+  revision INTEGER NOT NULL DEFAULT 1,
+  deleted_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -460,6 +462,8 @@ export function migrateDatabase(sqlite: Database.Database): void {
       runtime_thread_id TEXT,
       runtime_updated_at INTEGER,
       activated_at INTEGER,
+      revision INTEGER NOT NULL DEFAULT 1,
+      deleted_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -500,6 +504,8 @@ export function migrateDatabase(sqlite: Database.Database): void {
   );
   ensureColumn(sqlite, "turn_input_snapshots", "goal_json", "TEXT");
   ensureColumn(sqlite, "thread_goals", "runtime_updated_at", "INTEGER");
+  ensureColumn(sqlite, "thread_goals", "revision", "INTEGER NOT NULL DEFAULT 1");
+  ensureColumn(sqlite, "thread_goals", "deleted_at", "INTEGER");
   ensureColumn(sqlite, "steer_input_snapshots", "delivery_error", "TEXT");
   ensureColumn(sqlite, "steer_input_snapshots", "delivered_at", "INTEGER");
   ensureColumn(sqlite, "steer_input_snapshots", "failed_at", "INTEGER");
@@ -713,10 +719,13 @@ function ensureColumn(
     | "failed_at"
     | "unknown_at"
     | "goal_json"
-    | "runtime_updated_at",
+    | "runtime_updated_at"
+    | "revision"
+    | "deleted_at",
   definition:
     | "TEXT"
     | "INTEGER"
+    | "INTEGER NOT NULL DEFAULT 1"
     | "TEXT NOT NULL DEFAULT 'CONNECTED'"
     | "TEXT NOT NULL DEFAULT 'ACTIVE'"
     | "TEXT NOT NULL DEFAULT 'PENDING'",

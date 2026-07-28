@@ -14,7 +14,7 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { z } from "zod";
 import type { FeishuConnectionStatus, PlatformUser } from "./auth/auth-store.js";
 import { MAX_TURN_ATTACHMENT_BYTES } from "./domain/attachments.js";
-import { GoalMutationBlockedByPendingTurnError } from "./domain/errors.js";
+import { DomainError, GoalMutationBlockedByPendingTurnError } from "./domain/errors.js";
 import {
   AllocatedModelSelectionChangedError,
   ModelCatalogUnavailableError,
@@ -90,6 +90,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       return reply.code(409).send({
         error: error.code,
         code: error.code,
+        message: error.message,
+      });
+    }
+    if (error instanceof DomainError) {
+      const reasonCode =
+        "reasonCode" in error && typeof error.reasonCode === "string"
+          ? { reasonCode: error.reasonCode }
+          : {};
+      return reply.code(error.httpStatus).send({
+        error: error.code,
+        code: error.code,
+        ...reasonCode,
         message: error.message,
       });
     }

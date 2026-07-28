@@ -21,8 +21,10 @@ import {
   ActiveTurnResumeConflictError,
   type ApprovalDraft,
   ApprovalTransportUnavailableError,
+  type AttachedGoalRuntimeResult,
   LocalPlatformService,
   ModelCatalogUnavailableError,
+  type RuntimeGoalProjection,
   type RuntimeSafetyPort,
   type TaskEventDraft,
   type TaskExecutionAdapter,
@@ -480,7 +482,11 @@ describe("LocalPlatformService", () => {
         tokenBudget: 200_000,
         timeBudgetSeconds: 3_600,
       }),
-    ).rejects.toThrow("RUNTIME_VERSION_UNSUPPORTED");
+    ).rejects.toMatchObject({
+      code: "GOAL_CAPABILITY_UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      httpStatus: 409,
+    });
     expect(await service.getThreadGoal(task.id, "user-1")).toBeNull();
   });
 
@@ -543,6 +549,8 @@ describe("LocalPlatformService", () => {
       timeBudgetSeconds: 3_600,
     });
     await service.startTurn(task.id, "user-1", "执行");
+    execution.interruptTask.mockClear();
+    execution.syncThreadGoal.mockClear();
     execution.emitTaskEvent({
       taskId: task.id,
       threadId: `thread-${task.id}`,
@@ -550,11 +558,30 @@ describe("LocalPlatformService", () => {
       type: "TOKEN_USAGE_UPDATED",
       payload: tokenUsagePayload(200_000, 180_000, 0, 20_000, 0),
     });
+    execution.emitTaskEvent({
+      taskId: task.id,
+      threadId: `thread-${task.id}`,
+      turnId: `codex-turn-${task.id}`,
+      type: "TOKEN_USAGE_UPDATED",
+      payload: tokenUsagePayload(210_000, 190_000, 0, 20_000, 0),
+    });
+    await nextTick();
 
     expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
       status: "BUDGET_LIMITED",
-      tokensUsed: 200_000,
+      tokensUsed: 210_000,
+      runtimeSyncState: "SYNCED",
     });
+    expect(execution.interruptTask).toHaveBeenCalledTimes(1);
+    expect(execution.interruptTask).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      `codex-turn-${task.id}`,
+    );
+    expect(execution.syncThreadGoal).toHaveBeenCalledTimes(1);
+    expect(execution.syncThreadGoal).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      expect.objectContaining({ status: "BUDGET_LIMITED", tokensUsed: 200_000 }),
+    );
   });
 
   test("interrupts an active Runtime Turn when the Goal watchdog reaches its time budget", async () => {
@@ -670,6 +697,56 @@ describe("LocalPlatformService", () => {
       runtimeSyncState: "NEEDS_RECOVERY",
     });
   });
+
+  test.each(["PATCH_DELETE", "PUT_DELETE"] as const)(
+    "serializes attached Runtime Goal mutation chain for %s",
+    async (scenario) => {
+      const project = await service.createProject("user-1", { name: scenario });
+      const task = await service.createTask("user-1", { projectId: project.id, title: scenario });
+      await service.putThreadGoal(task.id, "user-1", {
+        objective: "原目标",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      });
+      await service.startTurn(task.id, "user-1", "建立 Runtime Thread");
+      execution.syncThreadGoal.mockClear();
+      execution.clearThreadGoal.mockClear();
+      const gate = deferred<AttachedGoalRuntimeResult<RuntimeGoalProjection>>();
+      execution.syncThreadGoal.mockImplementationOnce(async () => gate.promise);
+
+      const first =
+        scenario === "PATCH_DELETE"
+          ? service.patchThreadGoal(task.id, "user-1", { objective: "先提交的修改" })
+          : service.putThreadGoal(task.id, "user-1", {
+              objective: "先提交的替换",
+              tokenBudget: 100_000,
+              timeBudgetSeconds: 1_800,
+            });
+      await nextTick();
+      const deletion = service.deleteThreadGoal(task.id, "user-1");
+      await nextTick();
+      expect(execution.clearThreadGoal).not.toHaveBeenCalled();
+
+      const stored = await service.getThreadGoal(task.id, "user-1");
+      gate.resolve({
+        attachment: "ATTACHED",
+        goal: {
+          objective: stored?.objective ?? "",
+          status: stored?.status ?? "ACTIVE",
+          tokenBudget: stored?.tokenBudget ?? 1,
+          tokensUsed: stored?.tokensUsed ?? 0,
+          timeBudgetSeconds: stored?.timeBudgetSeconds ?? 1,
+          timeUsedSeconds: stored?.timeUsedSeconds ?? 0,
+        },
+        runtimeUpdatedAt: NOW.getTime() + 10,
+      });
+      await first;
+      await deletion;
+
+      expect(execution.clearThreadGoal).toHaveBeenCalledTimes(1);
+      expect(await service.getThreadGoal(task.id, "user-1")).toBeNull();
+    },
+  );
 
   test.each([
     ["PUT", "ALLOCATING"],
@@ -2774,6 +2851,11 @@ describe("LocalPlatformService", () => {
   test("immediately recovers all persisted running Turns after a process restart", async () => {
     const project = await service.createProject("user-1", { name: "Restart recovery" });
     const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "跨重启目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
     await service.startTurn(task.id, "user-1", "Run once");
 
     expect(service.recoverInterruptedTurns()).toBe(1);
@@ -2789,6 +2871,13 @@ describe("LocalPlatformService", () => {
         (event) => event.type === "RECOVERY_REQUIRED",
       ),
     ).toHaveLength(1);
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
+    });
+    await expect(service.startTurn(task.id, "user-1", "不得在恢复前继续")).rejects.toThrow(
+      "does not accept new Turns",
+    );
     expect(accounts.list()[0]).toMatchObject({ activeTurns: 0 });
   });
 
@@ -3131,9 +3220,27 @@ describe("LocalPlatformService", () => {
       projectId: project2.id,
       title: "Task 2",
     });
+    await service.putThreadGoal(task1.id, "user-1", {
+      objective: "用户一未完成目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await service.putThreadGoal(task2.id, "user-2", {
+      objective: "用户二未完成目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
     await service.startTurn(task1.id, "user-1", "Run one");
     await service.startTurn(task2.id, "user-2", "Run two");
-    expect(accounts.list()[0]).toMatchObject({ activeTurns: 2 });
+    execution.emitTaskEvent({
+      taskId: task2.id,
+      threadId: `thread-${task2.id}`,
+      turnId: `codex-turn-${task2.id}`,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed" },
+    });
+    await service.patchThreadGoal(task2.id, "user-2", { action: "PAUSE" });
+    expect(accounts.list()[0]).toMatchObject({ activeTurns: 1 });
 
     execution.emit("accountCrashed", {
       accountId: "account-1",
@@ -3149,6 +3256,14 @@ describe("LocalPlatformService", () => {
     expect(accounts.list()[0]).toMatchObject({
       status: "QUARANTINED",
       activeTurns: 0,
+    });
+    expect(await service.getThreadGoal(task1.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
+    });
+    expect(await service.getThreadGoal(task2.id, "user-2")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
     });
     for (const [task, userId] of [
       [task1, "user-1"],

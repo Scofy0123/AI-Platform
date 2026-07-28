@@ -37,7 +37,7 @@ import {
   MAX_FOLDER_FILES,
   MAX_TURN_ATTACHMENT_BYTES,
 } from "./attachments.js";
-import { GoalMutationBlockedByPendingTurnError } from "./errors.js";
+import { GoalMutationBlockedByPendingTurnError, GoalMutationSupersededError } from "./errors.js";
 
 export interface ProjectRecord {
   id: string;
@@ -79,8 +79,17 @@ interface ThreadGoalRow {
   runtime_sync_state: ThreadGoalView["runtimeSyncState"];
   runtime_thread_id: string | null;
   runtime_updated_at: number | null;
+  revision: number;
+  deleted_at: number | null;
   created_at: number;
   updated_at: number;
+}
+
+export type StoredThreadGoalView = ThreadGoalView & { revision: number };
+
+export interface ThreadGoalTokenUpdate {
+  triggered: boolean;
+  goal: StoredThreadGoalView;
 }
 
 export interface TaskRecord {
@@ -890,12 +899,12 @@ export class SQLitePlatformStore {
     });
   }
 
-  getThreadGoal(threadId: string, ownerId: string): ThreadGoalView | null {
+  getThreadGoal(threadId: string, ownerId: string): StoredThreadGoalView | null {
     this.requireOwnedGoalThread(threadId, ownerId);
     const row = this.sqlite
       .prepare("SELECT * FROM thread_goals WHERE task_id = ? AND owner_id = ?")
       .get(threadId, ownerId) as ThreadGoalRow | undefined;
-    return row ? mapThreadGoal(row) : null;
+    return row && row.deleted_at === null ? mapThreadGoal(row) : null;
   }
 
   putThreadGoal(input: {
@@ -905,7 +914,7 @@ export class SQLitePlatformStore {
     tokenBudget: number;
     timeBudgetSeconds: number;
     now: Date;
-  }): ThreadGoalView {
+  }): StoredThreadGoalView {
     return this.immediateTransaction(() => {
       this.requireOwnedGoalThread(input.threadId, input.ownerId);
       this.assertNoPendingGoalTurn(input.threadId, input.ownerId);
@@ -914,8 +923,8 @@ export class SQLitePlatformStore {
           `INSERT INTO thread_goals (
             task_id, owner_id, objective, status, token_budget, tokens_used,
             time_budget_seconds, time_used_seconds, runtime_sync_state,
-            activated_at, created_at, updated_at
-           ) VALUES (?, ?, ?, 'ACTIVE', ?, 0, ?, 0, 'PENDING', ?, ?, ?)
+            activated_at, revision, deleted_at, created_at, updated_at
+           ) VALUES (?, ?, ?, 'ACTIVE', ?, 0, ?, 0, 'PENDING', ?, 1, NULL, ?, ?)
            ON CONFLICT(task_id) DO UPDATE SET
              objective = excluded.objective,
              status = 'ACTIVE',
@@ -927,6 +936,8 @@ export class SQLitePlatformStore {
              runtime_thread_id = NULL,
              runtime_updated_at = NULL,
              activated_at = excluded.activated_at,
+             revision = thread_goals.revision + 1,
+             deleted_at = NULL,
              updated_at = excluded.updated_at`,
         )
         .run(
@@ -939,7 +950,7 @@ export class SQLitePlatformStore {
           input.now.getTime(),
           input.now.getTime(),
         );
-      return this.getThreadGoal(input.threadId, input.ownerId) as ThreadGoalView;
+      return this.getThreadGoal(input.threadId, input.ownerId) as StoredThreadGoalView;
     });
   }
 
@@ -948,7 +959,7 @@ export class SQLitePlatformStore {
     ownerId: string;
     patch: ThreadGoalPatch;
     now: Date;
-  }): ThreadGoalView {
+  }): StoredThreadGoalView {
     const patch = ThreadGoalPatchSchema.parse(input.patch);
     return this.immediateTransaction(() => {
       const current = this.getThreadGoal(input.threadId, input.ownerId);
@@ -972,7 +983,8 @@ export class SQLitePlatformStore {
                    THEN MAX(0, CAST((? - activated_at) / 1000 AS INTEGER))
                  ELSE 0
                END),
-             runtime_sync_state = 'PENDING', activated_at = ?, updated_at = ?
+             runtime_sync_state = 'PENDING', activated_at = ?,
+             revision = revision + 1, updated_at = ?
            WHERE task_id = ? AND owner_id = ?`,
         )
         .run(
@@ -986,20 +998,55 @@ export class SQLitePlatformStore {
           input.threadId,
           input.ownerId,
         );
-      return this.getThreadGoal(input.threadId, input.ownerId) as ThreadGoalView;
+      return this.getThreadGoal(input.threadId, input.ownerId) as StoredThreadGoalView;
     });
   }
 
   deleteThreadGoal(threadId: string, ownerId: string): boolean {
+    return this.deleteThreadGoalMutation(threadId, ownerId, new Date()).deleted;
+  }
+
+  deleteThreadGoalMutation(
+    threadId: string,
+    ownerId: string,
+    now: Date,
+  ): { deleted: boolean; revision: number } {
     return this.immediateTransaction(() => {
       this.requireOwnedGoalThread(threadId, ownerId);
       this.assertNoPendingGoalTurn(threadId, ownerId);
-      return (
-        this.sqlite
-          .prepare("DELETE FROM thread_goals WHERE task_id = ? AND owner_id = ?")
-          .run(threadId, ownerId).changes === 1
-      );
+      const result = this.sqlite
+        .prepare(
+          `UPDATE thread_goals
+           SET deleted_at = ?, runtime_sync_state = 'PENDING',
+               revision = revision + 1, updated_at = ?
+           WHERE task_id = ? AND owner_id = ? AND deleted_at IS NULL
+           RETURNING revision`,
+        )
+        .get(now.getTime(), now.getTime(), threadId, ownerId) as { revision: number } | undefined;
+      return { deleted: Boolean(result), revision: result?.revision ?? 0 };
     });
+  }
+
+  finalizeThreadGoalDelete(input: {
+    threadId: string;
+    ownerId: string;
+    expectedRevision: number;
+    runtimeSyncState: "PENDING" | "SYNCED";
+    now: Date;
+  }): void {
+    const result = this.sqlite
+      .prepare(
+        `UPDATE thread_goals SET runtime_sync_state = ?, updated_at = ?
+         WHERE task_id = ? AND owner_id = ? AND revision = ? AND deleted_at IS NOT NULL`,
+      )
+      .run(
+        input.runtimeSyncState,
+        input.now.getTime(),
+        input.threadId,
+        input.ownerId,
+        input.expectedRevision,
+      );
+    if (result.changes !== 1) throw new GoalMutationSupersededError();
   }
 
   syncThreadGoal(input: {
@@ -1010,9 +1057,10 @@ export class SQLitePlatformStore {
     tokensUsed: number;
     timeUsedSeconds: number;
     runtimeUpdatedAt?: number;
+    expectedRevision?: number;
     source?: "COMMAND" | "NOTIFICATION";
     now: Date;
-  }): ThreadGoalView {
+  }): StoredThreadGoalView {
     const current = this.getThreadGoal(input.threadId, input.ownerId);
     if (!current) throw new Error("Goal not found");
     const runtimeUpdatedAt = input.runtimeUpdatedAt ?? input.now.getTime();
@@ -1037,7 +1085,8 @@ export class SQLitePlatformStore {
            ELSE NULL
          END,
          updated_at = ?
-         WHERE task_id = ? AND owner_id = ?
+         WHERE task_id = ? AND owner_id = ? AND deleted_at IS NULL
+           AND (? IS NULL OR revision = ?)
            AND (
              runtime_updated_at IS NULL OR
              ? > runtime_updated_at OR
@@ -1055,42 +1104,64 @@ export class SQLitePlatformStore {
         input.now.getTime(),
         input.threadId,
         input.ownerId,
+        input.expectedRevision ?? null,
+        input.expectedRevision ?? null,
         runtimeUpdatedAt,
         input.source ?? "NOTIFICATION",
         runtimeUpdatedAt,
       );
-    if (result.changes === 0) return current;
-    return this.getThreadGoal(input.threadId, input.ownerId) as ThreadGoalView;
+    if (result.changes === 0) {
+      if (input.expectedRevision !== undefined) throw new GoalMutationSupersededError();
+      return current;
+    }
+    return this.getThreadGoal(input.threadId, input.ownerId) as StoredThreadGoalView;
   }
 
-  updateThreadGoalTokens(threadId: string, ownerId: string, tokensUsed: number, now: Date): void {
-    this.sqlite
-      .prepare(
-        `UPDATE thread_goals SET
+  updateThreadGoalTokens(
+    threadId: string,
+    ownerId: string,
+    tokensUsed: number,
+    now: Date,
+  ): ThreadGoalTokenUpdate | null {
+    return this.immediateTransaction(() => {
+      const before = this.getThreadGoal(threadId, ownerId);
+      if (!before) return null;
+      this.sqlite
+        .prepare(
+          `UPDATE thread_goals SET
            tokens_used = MAX(tokens_used, ?),
            status = CASE
-             WHEN MAX(tokens_used, ?) >= token_budget THEN 'BUDGET_LIMITED'
+             WHEN status = 'ACTIVE' AND MAX(tokens_used, ?) >= token_budget
+               THEN 'BUDGET_LIMITED'
              ELSE status
            END,
            activated_at = CASE
-             WHEN MAX(tokens_used, ?) >= token_budget THEN NULL
+             WHEN status = 'ACTIVE' AND MAX(tokens_used, ?) >= token_budget THEN NULL
              ELSE activated_at
            END,
            runtime_sync_state = CASE
-             WHEN MAX(tokens_used, ?) >= token_budget THEN 'PENDING'
+             WHEN status = 'ACTIVE' AND MAX(tokens_used, ?) >= token_budget THEN 'PENDING'
              ELSE runtime_sync_state
            END,
            updated_at = ?
-         WHERE task_id = ? AND owner_id = ?`,
-      )
-      .run(tokensUsed, tokensUsed, tokensUsed, tokensUsed, now.getTime(), threadId, ownerId);
+         WHERE task_id = ? AND owner_id = ? AND deleted_at IS NULL`,
+        )
+        .run(tokensUsed, tokensUsed, tokensUsed, tokensUsed, now.getTime(), threadId, ownerId);
+      const goal = this.getThreadGoal(threadId, ownerId);
+      if (!goal) return null;
+      return {
+        triggered: before.status === "ACTIVE" && goal.status === "BUDGET_LIMITED",
+        goal,
+      };
+    });
   }
 
   markThreadGoalRecovery(threadId: string, ownerId: string, now: Date): void {
     this.sqlite
       .prepare(
         `UPDATE thread_goals SET status = 'NEEDS_RECOVERY',
-         runtime_sync_state = 'NEEDS_RECOVERY', activated_at = NULL, updated_at = ?
+         runtime_sync_state = 'NEEDS_RECOVERY', activated_at = NULL,
+         deleted_at = NULL, updated_at = ?
          WHERE task_id = ? AND owner_id = ?`,
       )
       .run(now.getTime(), threadId, ownerId);
@@ -1100,7 +1171,7 @@ export class SQLitePlatformStore {
     const rows = this.sqlite
       .prepare(
         `SELECT task_id, owner_id FROM thread_goals
-         WHERE status = 'ACTIVE' AND (
+         WHERE deleted_at IS NULL AND status = 'ACTIVE' AND (
            tokens_used >= token_budget OR
            (activated_at IS NOT NULL AND time_used_seconds + CAST((? - activated_at) / 1000 AS INTEGER) >= time_budget_seconds)
          )`,
@@ -1151,7 +1222,7 @@ export class SQLitePlatformStore {
     const row = this.sqlite
       .prepare("SELECT * FROM thread_goals WHERE task_id = ? AND owner_id = ?")
       .get(threadId, ownerId) as ThreadGoalRow | undefined;
-    if (!row) return null;
+    if (!row || row.deleted_at !== null) return null;
     const goal = mapThreadGoal(row);
     return {
       objective: goal.objective,
@@ -1397,6 +1468,11 @@ export class SQLitePlatformStore {
                  SELECT 1 FROM user_turn_slots uts
                  WHERE uts.account_id = ? AND uts.task_id = t.id
                )
+               OR EXISTS (
+                 SELECT 1 FROM thread_goals tg
+                 WHERE tg.task_id = t.id AND tg.deleted_at IS NULL
+                   AND tg.status IN ('ACTIVE', 'PAUSED')
+               )
              )
            ORDER BY t.created_at, t.id`,
         )
@@ -1436,6 +1512,15 @@ export class SQLitePlatformStore {
               )`,
         )
         .run(now.getTime(), now.getTime(), accountId, accountId);
+      const recoverGoal = this.sqlite.prepare(
+        `UPDATE thread_goals
+         SET status = 'NEEDS_RECOVERY', runtime_sync_state = 'NEEDS_RECOVERY',
+             activated_at = NULL, deleted_at = NULL, updated_at = ?
+         WHERE task_id = ? AND owner_id = ? AND status IN ('ACTIVE', 'PAUSED')`,
+      );
+      for (const row of rows) {
+        recoverGoal.run(now.getTime(), row.task_id, row.owner_id);
+      }
       this.sqlite
         .prepare(
           `UPDATE tasks
@@ -1446,6 +1531,11 @@ export class SQLitePlatformStore {
                status IN ('RUNNING', 'WAITING_APPROVAL')
                OR id IN (
                  SELECT task_id FROM user_turn_slots WHERE account_id = ?
+               )
+               OR id IN (
+                 SELECT tg.task_id
+                 FROM thread_goals tg
+                 WHERE tg.deleted_at IS NULL AND tg.status = 'NEEDS_RECOVERY'
                )
              )`,
         )
@@ -2750,8 +2840,8 @@ function mapTask(row: TaskRow): TaskRecord {
   };
 }
 
-function mapThreadGoal(row: ThreadGoalRow): ThreadGoalView {
-  return ThreadGoalViewSchema.parse({
+function mapThreadGoal(row: ThreadGoalRow): StoredThreadGoalView {
+  const view = ThreadGoalViewSchema.parse({
     threadId: row.task_id,
     objective: row.objective,
     status: row.status,
@@ -2763,6 +2853,7 @@ function mapThreadGoal(row: ThreadGoalRow): ThreadGoalView {
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
   });
+  return { ...view, revision: row.revision };
 }
 
 function mapAttachment(row: AttachmentRow): DraftAttachment {

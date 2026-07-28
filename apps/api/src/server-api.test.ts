@@ -10,7 +10,10 @@ import type {
   UserSettingsView,
 } from "@codexplatform/contracts";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { GoalMutationBlockedByPendingTurnError } from "./domain/errors.js";
+import {
+  GoalCapabilityUnavailableError,
+  GoalMutationBlockedByPendingTurnError,
+} from "./domain/errors.js";
 import {
   ActiveTurnResumeConflictError,
   InvalidThreadResumeResponseError,
@@ -1166,6 +1169,40 @@ describe("CodexPlatform HTTP API", () => {
       message: "A QUEUED Turn already froze the Goal input snapshot",
     });
   });
+
+  test.each([
+    ["RUNTIME_VERSION_UNSUPPORTED", 409],
+    ["RUNTIME_CAPABILITY_PROBE_FAILED", 503],
+  ] as const)(
+    "maps unavailable Goal capability %s to a machine-readable response",
+    async (reasonCode, statusCode) => {
+      const { auth, platform } = services();
+      platform.putThreadGoal.mockRejectedValueOnce(
+        new GoalCapabilityUnavailableError(reasonCode, "Goal protocol unavailable", statusCode),
+      );
+      const app = buildApp({ auth, platform });
+      apps.push(app);
+
+      const response = await app.inject({
+        method: "PUT",
+        url: "/api/threads/thread-1/goal",
+        cookies: {
+          codexplatform_session: "valid-session",
+          codexplatform_csrf: "valid-csrf",
+        },
+        headers: { "x-csrf-token": "valid-csrf" },
+        payload: { objective: "持续完成" },
+      });
+
+      expect(response.statusCode).toBe(statusCode);
+      expect(response.json()).toEqual({
+        error: "GOAL_CAPABILITY_UNAVAILABLE",
+        code: "GOAL_CAPABILITY_UNAVAILABLE",
+        reasonCode,
+        message: "Goal protocol unavailable",
+      });
+    },
+  );
 
   test("returns not found when archive routes target a Draft or expired Draft", async () => {
     const { auth, platform } = services();
