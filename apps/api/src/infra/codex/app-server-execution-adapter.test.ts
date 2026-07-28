@@ -2282,6 +2282,52 @@ describe("AppServerExecutionAdapter", () => {
     expect(rpc.respond).not.toHaveBeenCalled();
   });
 
+  test("binds root turn notifications to the canonical Turn returned by turn/start", async () => {
+    const rpc = new FakeRpc();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime: runtimePort() }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const taskEvents: Array<{ type: string; turnId: string | null }> = [];
+    adapter.on("taskEvent", (event) => taskEvents.push({ type: event.type, turnId: event.turnId }));
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Build it",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    rpc.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "transport-turn-42",
+        itemId: "message-1",
+        delta: "done",
+      },
+    });
+    rpc.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turn: { id: "transport-turn-42", status: "completed" },
+      },
+    });
+
+    expect(taskEvents).toEqual([
+      { type: "AGENT_MESSAGE_DELTA", turnId: "turn-1" },
+      { type: "TURN_COMPLETED", turnId: "turn-1" },
+    ]);
+  });
+
   test("does not report a completed turn as failed when its worker later exits", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();

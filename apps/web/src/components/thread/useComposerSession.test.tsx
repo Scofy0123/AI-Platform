@@ -192,6 +192,46 @@ describe("useComposerSession", () => {
     expect(api.createDraft).not.toHaveBeenCalled();
   });
 
+  test("refreshes Goal usage when a terminal Turn event arrives", async () => {
+    const api = createApi();
+    if (!api.getThreadGoal) throw new Error("getThreadGoal mock missing");
+    const goal = {
+      threadId: "thread-1",
+      objective: "持续验收",
+      status: "ACTIVE" as const,
+      tokenBudget: 200_000,
+      tokensUsed: 0,
+      timeBudgetSeconds: 3_600,
+      timeUsedSeconds: 0,
+      runtimeSyncState: "SYNCED" as const,
+      createdAt: "2026-07-28T10:00:00.000Z",
+      updatedAt: "2026-07-28T10:00:00.000Z",
+    };
+    vi.mocked(api.getThreadGoal)
+      .mockResolvedValueOnce(goal)
+      .mockResolvedValueOnce({
+        ...goal,
+        tokensUsed: 140_107,
+        timeUsedSeconds: 14,
+        updatedAt: "2026-07-28T10:00:14.000Z",
+      });
+    const { result, rerender } = renderHook(
+      ({ refreshKey }) =>
+        useComposerSession({
+          api,
+          threadId: "thread-1",
+          goalRefreshKey: refreshKey,
+          resolveProjectId: async () => "project-1",
+        }),
+      { initialProps: { refreshKey: 0 } },
+    );
+
+    await waitFor(() => expect(result.current.goal?.tokensUsed).toBe(0));
+    rerender({ refreshKey: 42 });
+    await waitFor(() => expect(result.current.goal?.tokensUsed).toBe(140_107));
+    expect(api.getThreadGoal).toHaveBeenCalledTimes(2);
+  });
+
   test("keeps loaded attachments while a slower Composer bootstrap finishes or props refresh", async () => {
     const composer = deferred<{ planMode: boolean; revision: number }>();
     const api = createApi();

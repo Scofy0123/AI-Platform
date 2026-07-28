@@ -1,8 +1,11 @@
 # CodexPlatform 1.1：Composer 权限、附件与能力菜单设计
 
 日期：2026-07-28
-状态：已确认，进入实现
+状态：1.1A 已实现并验证（2026-07-29）
 范围：用户端 Composer、Turn 输入、组织策略与 Codex App Server 适配
+
+验证结论：Files/Folders、隐藏 Draft、Goal 和 sticky Plan 已通过自动化验证与真实单操作者
+App Server UAT；生产恶意文件扫描、独立 Worker 和多人凭证隔离仍是后续门禁。
 
 ## 1. 决策
 

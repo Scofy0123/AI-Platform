@@ -766,14 +766,20 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     const normalizer = this.normalizerByTask.get(context.taskId);
     if (!normalizer) return;
     for (const event of normalizer.normalizeNotification(message)) {
-      if (event.type === "TURN_STARTED" && event.turnId) {
-        context.turnId = event.turnId;
+      // Root notifications can expose a transport-local Turn id that differs from turn/start.
+      // Keep the RPC response id as the platform's canonical identity for the attached Turn.
+      const eventTurnId =
+        context.parentThreadId === null && context.turnId
+          ? context.turnId
+          : (event.turnId ?? context.turnId);
+      if (event.type === "TURN_STARTED" && eventTurnId) {
+        if (context.parentThreadId !== null || !context.turnId) context.turnId = eventTurnId;
         this.options.actors.bind({
           taskId: context.taskId,
           accountId: context.accountId,
           connectionGeneration: context.connectionGeneration,
           threadId: context.threadId,
-          turnId: event.turnId,
+          turnId: eventTurnId,
           actorContext: context.actorContext,
         });
       }
@@ -783,7 +789,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       const draft: TaskEventDraft = {
         taskId: event.taskId,
         threadId: event.threadId,
-        turnId: event.turnId,
+        turnId: eventTurnId,
         ...(context.parentThreadId !== null && event.type !== "SUBAGENT_ACTIVITY"
           ? { subagentThreadId: context.threadId }
           : {}),
@@ -792,19 +798,19 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       } as TaskEventDraft;
       this.emit("taskEvent", draft);
       if (
-        event.turnId &&
+        eventTurnId &&
         (event.type === "TURN_COMPLETED" ||
           event.type === "TURN_FAILED" ||
           event.type === "TURN_INTERRUPTED")
       ) {
-        this.deletePendingApprovalsForTurn(accountId, connectionGeneration, threadId, event.turnId);
+        this.deletePendingApprovalsForTurn(accountId, connectionGeneration, threadId, eventTurnId);
         this.options.actors.clearTurn({
           accountId,
           connectionGeneration,
           threadId,
-          turnId: event.turnId,
+          turnId: eventTurnId,
         });
-        if (context.turnId === event.turnId) context.turnId = null;
+        if (context.turnId === eventTurnId) context.turnId = null;
         this.detachDescendantContexts(context);
       }
     }

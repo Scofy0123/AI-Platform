@@ -71,6 +71,9 @@ sequenceDiagram
 - 单个附件根最多 50 MiB，单 Turn 200 MiB、32 个附件根、目录最多 500 个文件；不自动解压。
 - Goal 原生 Token 预算与平台 60 分钟 Watchdog 同时生效；预算到达后暂停，不自动重复外部副作用。
 - Plan mode 为 Thread sticky，使用锁定协议中的 collaboration preset；能力探测失败时拒绝启用。
+- App Server 某些传输通知中的 Turn ID 与 `turn/start` 返回的规范 ID 可能不同。Adapter 以
+  `turn/start` 返回值作为根 Turn 的 canonical identity；平台仅在任务存在唯一活跃 Turn 时对缺失
+  identity 做安全回填，确保完成事件原子释放槽位并结束计时。
 
 ## 用户端与管理后台
 

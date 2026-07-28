@@ -8,6 +8,11 @@
 
 **Tech Stack:** TypeScript, Zod, Fastify, React, SQLite WAL, Codex App Server JSONL, Vitest, Testing Library, Playwright.
 
+**Implementation status (2026-07-29):** Complete for 1.1A. Files/Folders, hidden Draft, Goal and
+sticky Plan are implemented; `pnpm verify` passes, and the real single-operator App Server UAT
+completed a Plan Turn followed by a file-create/read Turn with the same Goal. Record Skill and the
+non-core Add catalog remain intentionally hidden.
+
 ---
 
 ## File map

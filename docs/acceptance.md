@@ -50,19 +50,22 @@ pnpm verify
 - 该回归证明当前单操作者真实链路的 transport 修复，不替代完整 `REAL_CODEX_E2E=1`、
   凭证隔离探针或真实多人门禁。
 
-### 2026-07-28 Composer 权限与能力注册表纵切
+### 2026-07-29 Composer 核心能力纵切
 
-- `pnpm verify`：PASS；510 项 Vitest 通过、2 项条件跳过，12 项 Playwright 通过，协议校验与
+- `pnpm verify`：PASS；694 项 Vitest 通过、3 项条件跳过，14 项 Playwright 通过，协议校验与
   Production Build 通过。
 - `ASK_FOR_APPROVAL`、`APPROVE_FOR_ME`、`FULL_ACCESS` 和 `CUSTOM` 已有统一契约；App Server
   参数映射由 Runtime 单测逐字段核验。当前组织策略只开放前两档，`FULL_ACCESS` 与 `CUSTOM`
   在 Composer 中可见但不可选，并显示门禁原因。
 - `GET /api/composer/capabilities` 按当前飞书用户和 Thread 返回服务端能力真值；浏览器不能自行把
   Files、Goal 或 Plan 标记成可用。本轮只交付这三项，其余 Add 类别隐藏。
-- Files、隐藏 Draft、Goal 和 Plan 处于实施中；本节只定义验收，不代表已交付。通过自动测试、
-  浏览器 UAT、真实 App Server 参数复核和数据复核后，才补充执行证据。
+- Files、隐藏 Draft、Goal 和 Plan 已实现并完成自动化验证。真实单操作者 UAT 进一步验证：
+  Plan Turn 只规划并收敛为 `Worked for 3s`；关闭 Plan 后第二个 Turn 真实创建并回读
+  `real-goal-plan-uat.txt`，返回 `REAL_GOAL_PLAN_TURN2_OK`；Goal 跨两轮保持 `ACTIVE/SYNCED`，
+  SQLite 记录 140,107 / 200,000 tokens 与 14 秒用量。
 - Playwright 已验证权限菜单选择 `Approve for me` 后，保存的 Turn 配置快照为
-  `permissionMode=APPROVE_FOR_ME`；同时验证 Full access 与四个 Add 能力的禁用状态。
+  `permissionMode=APPROVE_FOR_ME`；同时验证 Full access 门禁、隐藏 Draft 恢复、文件/目录/拖放、
+  纯附件 Turn、运行中附件 Steer、Goal 和 sticky Plan。
 - 视觉 UAT 产物名为 `composer-add-menu.png` 和 `composer-permissions.png`，由
   `CODEXPLATFORM_CAPTURE_UAT=1` 生成在 Playwright 输出目录；截图只证明 Fake Runtime 页面结构，
   不替代真实飞书登录和 Real Runtime Smoke。

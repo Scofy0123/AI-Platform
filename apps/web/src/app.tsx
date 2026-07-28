@@ -690,10 +690,20 @@ function ThreadPage() {
   const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
   const [permission, setPermission] = useState<ExecutionPermissionSelection | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const goalRefreshKey = events.reduce(
+    (latest, event) =>
+      ["TURN_COMPLETED", "TURN_FAILED", "TURN_INTERRUPTED", "RECOVERY_REQUIRED"].includes(
+        event.type,
+      )
+        ? Math.max(latest, event.sequence)
+        : latest,
+    0,
+  );
   const composer = useComposerSession({
     api,
     threadId,
     initialComposerState: thread.data?.composerState,
+    goalRefreshKey,
     resolveProjectId: async () => {
       if (!thread.data?.projectId) throw new Error("Thread project is unavailable");
       return thread.data.projectId;

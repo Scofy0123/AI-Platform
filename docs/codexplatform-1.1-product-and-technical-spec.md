@@ -592,11 +592,12 @@ flowchart LR
 本方案同时描述 1.1 产品目标和生产演进。仓库中的“已实现”状态必须以当前 commit、自动测试、浏览器 UAT 和外部 Smoke 证据为准：
 
 - 本机 fake Runtime 可用于调度、UI 和权限回归。
-- 本轮 PR Head 已实现 Runtime 模型目录、模型/Effort 联动、连续 Transcript、三个独立
-  Workspace Surface、安全 Markdown、复合 Item 详情边界和运行路径脱敏；是否“通过”仍以
-  `pnpm verify`、真实浏览器 UAT 与外部 Smoke 的独立证据为准。
-- Files/Folders、隐藏 Draft、Goal 和 Plan mode 当前处于本轮实施中；只有自动测试、浏览器 UAT、
-  App Server 参数证据和数据复核均通过后，才从“实施中”更新为“已验证”。
-- real Runtime 的单操作者纵切需要实际完成 Codex 登录并通过 Smoke 才能标记为已验证。
+- 本轮 PR Head 已实现并通过 Runtime 模型目录、模型/Effort 联动、连续 Transcript、三个独立
+  Workspace Surface、安全 Markdown、复合 Item 详情边界和运行路径脱敏。
+- Files/Folders、隐藏 Draft、Goal 和 Plan mode 已实现并完成自动化验证；2026-07-29
+  `pnpm verify` 通过 694 项 Vitest、14 项 Playwright、协议校验和 Production Build。
+- real Runtime 单操作者纵切已完成 Plan 规划 Turn、关闭 Plan 后的真实文件创建/回读 Turn、
+  Goal 跨 Turn 保留，以及页面、SSE、SQLite、工作区文件和 Runtime 结果的交叉复核。该结论不扩大
+  为真实多人、正式恶意文件扫描或 1.1B 生产隔离已完成。
 - 真实飞书 Tool 需要当前飞书用户 Token 和可读测试文档，必须独立验收。
 - 生产多人执行、独立 Worker、Credential Broker、正式 MCP Gateway、PostgreSQL、消息总线、KMS 和 HA 属于 1.1B 规划，不属于 1.1A 已实现能力。

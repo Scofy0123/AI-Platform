@@ -1978,13 +1978,20 @@ export class LocalPlatformService implements PlatformApi {
       }
       return;
     }
-    const schedulerKey = runtimeTurnKey(draft.taskId, draft.turnId);
+    const implicitActiveTurn =
+      !draft.turnId && ownerId
+        ? this.options.store.getActiveTurnForTask(draft.taskId, ownerId)
+        : null;
+    const runtimeTurnId = draft.turnId ?? implicitActiveTurn?.codexTurnId ?? null;
+    const schedulerKey = runtimeTurnKey(draft.taskId, runtimeTurnId);
     const schedulerTurnId = schedulerKey
       ? this.schedulerTurnByRuntimeTurn.get(schedulerKey)
       : undefined;
     const platformTurnId =
       schedulerTurnId ??
-      this.options.store.findPlatformTurnIdForRuntimeTurn(draft.taskId, draft.turnId);
+      this.options.store.findPlatformTurnIdForRuntimeTurn(draft.taskId, runtimeTurnId) ??
+      implicitActiveTurn?.id ??
+      null;
     if (schedulerTurnId) this.options.leases.heartbeatTurn(schedulerTurnId, occurredAt);
     if (draft.type === "TOKEN_USAGE_UPDATED" && ownerId && draft.threadId) {
       const payload = draft.payload as TaskEventPayloadMap["TOKEN_USAGE_UPDATED"];
@@ -1992,7 +1999,7 @@ export class LocalPlatformService implements PlatformApi {
         taskId: draft.taskId,
         ownerId,
         runtimeThreadId: draft.threadId,
-        turnId: draft.turnId,
+        turnId: runtimeTurnId,
         ...payload,
         now: occurredAt,
       });
@@ -2023,7 +2030,7 @@ export class LocalPlatformService implements PlatformApi {
           threadId: payload.agentThreadId,
           parentTaskId: draft.taskId,
           parentRuntimeThreadId: draft.threadId,
-          parentTurnId: draft.turnId,
+          parentTurnId: runtimeTurnId,
           ownerId,
           sessionId: null,
           name: payload.name ?? payload.agentThreadId,
@@ -2041,17 +2048,19 @@ export class LocalPlatformService implements PlatformApi {
       draft.type as keyof typeof TERMINAL_STATUS_BY_EVENT
     ] as "COMPLETED" | "FAILED" | "INTERRUPTED" | undefined;
     if (terminalStatus) {
-      if (draft.turnId) {
-        this.options.store.markTurnApprovalsForRecovery(draft.taskId, draft.turnId);
+      if (runtimeTurnId) {
+        this.options.store.markTurnApprovalsForRecovery(draft.taskId, runtimeTurnId);
       }
       if (schedulerTurnId) {
         this.finishSchedulerTurn(schedulerTurnId, terminalStatus, occurredAt);
+      } else if (implicitActiveTurn) {
+        this.finishSchedulerTurn(implicitActiveTurn.id, terminalStatus, occurredAt);
       }
       if (schedulerKey) this.schedulerTurnByRuntimeTurn.delete(schedulerKey);
-      if (draft.turnId) {
+      if (runtimeTurnId) {
         this.options.store.setTaskInactiveIfCurrent(
           draft.taskId,
-          draft.turnId,
+          runtimeTurnId,
           terminalStatus,
           occurredAt,
         );
@@ -2059,17 +2068,17 @@ export class LocalPlatformService implements PlatformApi {
       return;
     }
     if (draft.type === "RECOVERY_REQUIRED") {
-      if (draft.turnId) {
-        this.options.store.markTurnApprovalsForRecovery(draft.taskId, draft.turnId);
+      if (runtimeTurnId) {
+        this.options.store.markTurnApprovalsForRecovery(draft.taskId, runtimeTurnId);
       }
       if (platformTurnId) {
         this.finishSchedulerTurn(platformTurnId, "NEEDS_RECOVERY", occurredAt);
       }
       if (schedulerKey) this.schedulerTurnByRuntimeTurn.delete(schedulerKey);
-      if (draft.turnId) {
+      if (runtimeTurnId) {
         this.options.store.setTaskInactiveIfCurrent(
           draft.taskId,
-          draft.turnId,
+          runtimeTurnId,
           "NEEDS_RECOVERY",
           occurredAt,
         );

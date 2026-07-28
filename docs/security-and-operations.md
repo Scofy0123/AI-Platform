@@ -131,6 +131,8 @@ codex-cli 0.144.6
   文件扫描和 DLP。压缩包不自动解压，失败或未完成扫描的附件不能进入 Turn。
 - Goal 的 200k Token 预算由 Runtime Goal 管理，60 分钟预算由平台 Watchdog 管理；预算到达只暂停
   Goal，不自动重试已经产生外部副作用的 Tool Call。
+- 2026-07-29 单操作者真实 UAT 已验证 Goal 跨 Plan/执行两个 Turn 保留，累计用量写入
+  `thread_goals` 并在终态后刷新到 Composer；这不替代生产恶意文件扫描、独立 Worker 或多人凭证隔离。
 
 ## 故障恢复
 

@@ -19,6 +19,7 @@ interface UseComposerSessionInput {
   api: PlatformApi;
   threadId?: string | undefined;
   initialComposerState?: ComposerState | undefined;
+  goalRefreshKey?: number | undefined;
   resolveProjectId(): Promise<string>;
 }
 
@@ -26,6 +27,7 @@ export function useComposerSession({
   api,
   threadId,
   initialComposerState,
+  goalRefreshKey,
   resolveProjectId,
 }: UseComposerSessionInput) {
   const [resourceThreadId, setResourceThreadId] = useState(threadId ?? null);
@@ -185,6 +187,36 @@ export function useComposerSession({
       // The error is kept in Composer state so the next user action can retry.
     });
   }, [restoreStoredDraft, threadId]);
+
+  useEffect(() => {
+    if (!threadId || goalRefreshKey === undefined || goalRefreshKey <= 0 || !api.getThreadGoal) {
+      return;
+    }
+    const generation = sessionGenerationRef.current;
+    void api
+      .getThreadGoal(threadId)
+      .then((nextGoal) => {
+        if (
+          sessionGenerationRef.current === generation &&
+          resourceThreadIdRef.current === threadId
+        ) {
+          setGoal(nextGoal);
+        }
+      })
+      .catch((cause: unknown) => {
+        if (
+          sessionGenerationRef.current !== generation ||
+          resourceThreadIdRef.current !== threadId
+        ) {
+          return;
+        }
+        if (hasStatus(cause, 404)) {
+          setGoal(null);
+          return;
+        }
+        setError(errorMessage(cause));
+      });
+  }, [api, goalRefreshKey, threadId]);
 
   const runBusy = async <T>(operation: () => Promise<T>): Promise<T> => {
     setBusyCount((count) => count + 1);

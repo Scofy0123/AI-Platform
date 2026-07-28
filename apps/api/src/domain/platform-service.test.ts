@@ -3490,6 +3490,60 @@ describe("LocalPlatformService", () => {
     ).toEqual(["LEASE_ACQUIRED", "TURN_COMPLETED"]);
   });
 
+  test("reconciles a terminal event that omits the Runtime Turn identity", async () => {
+    const project = await service.createProject("user-1", { name: "Implicit terminal" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Finish without an event Turn id");
+
+    execution.emitTaskEvent({
+      taskId: task.id,
+      threadId: `thread-${task.id}`,
+      turnId: null,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed" },
+    });
+
+    expect(await service.getTask(task.id, "user-1")).toMatchObject({ status: "COMPLETED" });
+    expect(
+      database.sqlite.prepare("SELECT status FROM turns WHERE task_id = ?").get(task.id),
+    ).toEqual({
+      status: "COMPLETED",
+    });
+    expect(accounts.list()[0]).toMatchObject({ activeTurns: 0 });
+    expect(await service.listTaskEvents(task.id, "user-1", 0)).toEqual([
+      expect.objectContaining({ type: "LEASE_ACQUIRED" }),
+      expect.objectContaining({ type: "TURN_COMPLETED", turnId: expect.any(String) }),
+    ]);
+  });
+
+  test("reconciles an identity-free terminal event emitted before startTask resolves", async () => {
+    const project = await service.createProject("user-1", { name: "Implicit early terminal" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    execution.startTask.mockImplementationOnce(async () => {
+      execution.emitTaskEvent({
+        taskId: task.id,
+        threadId: `thread-${task.id}`,
+        turnId: null,
+        type: "TURN_COMPLETED",
+        payload: { status: "completed" },
+      });
+      return {
+        threadId: `thread-${task.id}`,
+        turnId: `codex-turn-${task.id}`,
+      };
+    });
+
+    await expect(service.startTurn(task.id, "user-1", "Finish immediately")).resolves.toMatchObject(
+      {
+        status: "COMPLETED",
+      },
+    );
+    expect(
+      database.sqlite.prepare("SELECT status FROM turns WHERE task_id = ?").get(task.id),
+    ).toEqual({ status: "COMPLETED" });
+    expect(accounts.list()[0]).toMatchObject({ activeTurns: 0 });
+  });
+
   test("reconciles an approval emitted before startTask resolves", async () => {
     const project = await service.createProject("user-1", { name: "Early approval" });
     const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
