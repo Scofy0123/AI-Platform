@@ -176,6 +176,8 @@ export const tasks = sqliteTable("tasks", {
   currentTurnId: text("current_turn_id"),
   threadConfigJson: text("thread_config_json"),
   archivedAt: integer("archived_at", { mode: "timestamp_ms" }),
+  lifecycleState: text("lifecycle_state").notNull().default("ACTIVE"),
+  draftExpiresAt: integer("draft_expires_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });
@@ -192,6 +194,36 @@ export const turns = sqliteTable("turns", {
   startedAt: integer("started_at", { mode: "timestamp_ms" }).notNull(),
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
   durationMs: integer("duration_ms"),
+});
+
+export const draftAttachments = sqliteTable("draft_attachments", {
+  id: text("id").primaryKey(),
+  taskId: text("task_id")
+    .notNull()
+    .references(() => tasks.id, { onDelete: "cascade" }),
+  ownerId: text("owner_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(),
+  name: text("name").notNull(),
+  relativePath: text("relative_path").notNull(),
+  mimeType: text("mime_type").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  fileCount: integer("file_count").notNull(),
+  scanStatus: text("scan_status").notNull(),
+  blockedReason: text("blocked_reason"),
+  claimedTurnId: text("claimed_turn_id").references(() => turns.id),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const turnInputSnapshots = sqliteTable("turn_input_snapshots", {
+  turnId: text("turn_id")
+    .primaryKey()
+    .references(() => turns.id, { onDelete: "cascade" }),
+  prompt: text("prompt").notNull(),
+  attachmentsJson: text("attachments_json").notNull(),
+  capturedAt: integer("captured_at", { mode: "timestamp_ms" }).notNull(),
 });
 
 export const taskEvents = sqliteTable(

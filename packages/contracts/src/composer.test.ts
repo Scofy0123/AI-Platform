@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import {
   ComposerCapabilitySchema,
+  DraftAttachmentSchema,
+  EffectiveTurnInputSnapshotSchema,
   ExecutionPermissionSelectionSchema,
   TurnInputBundleSchema,
 } from "./composer.js";
@@ -67,6 +69,53 @@ describe("TurnInputBundleSchema", () => {
     ).toMatchObject({
       prompt: "Inspect the repository",
       permission: { mode: "ASK_FOR_APPROVAL" },
+    });
+  });
+
+  test("accepts an attachment-only Turn but rejects a completely empty Turn", () => {
+    expect(
+      TurnInputBundleSchema.parse({
+        prompt: "   ",
+        permission: { mode: "ASK_FOR_APPROVAL", profileId: null },
+        planMode: false,
+        attachmentIds: ["attachment-1"],
+      }),
+    ).toMatchObject({ prompt: "", attachmentIds: ["attachment-1"] });
+
+    expect(() =>
+      TurnInputBundleSchema.parse({
+        prompt: "   ",
+        permission: { mode: "ASK_FOR_APPROVAL", profileId: null },
+        planMode: false,
+        attachmentIds: [],
+      }),
+    ).toThrow();
+  });
+
+  test("defines safe attachment and immutable effective input contracts", () => {
+    const attachment = DraftAttachmentSchema.parse({
+      id: "attachment-1",
+      threadId: "thread-1",
+      kind: "FILE",
+      name: "diagram.png",
+      relativePath: ".codexplatform/attachments/attachment-1/diagram.png",
+      mimeType: "image/png",
+      sizeBytes: 128,
+      fileCount: 1,
+      scanStatus: "READY",
+      createdAt: "2026-07-28T12:00:00.000Z",
+    });
+    expect(JSON.stringify(attachment)).not.toContain("/private/");
+
+    expect(
+      EffectiveTurnInputSnapshotSchema.parse({
+        prompt: "",
+        attachments: [attachment],
+        capturedAt: "2026-07-28T12:00:01.000Z",
+      }),
+    ).toMatchObject({
+      prompt: "",
+      attachments: [{ id: "attachment-1", scanStatus: "READY" }],
     });
   });
 });

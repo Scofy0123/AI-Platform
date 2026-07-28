@@ -1082,6 +1082,135 @@ describe("CodexPlatform HTTP API", () => {
     expect(platform.unarchiveThread).toHaveBeenCalledWith("thread-1", "user-1");
   });
 
+  test("creates and deletes hidden Drafts through owner-scoped CSRF routes", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const missingCsrf = await app.inject({
+      method: "POST",
+      url: "/api/threads/drafts",
+      cookies: { codexplatform_session: "valid-session" },
+      payload: { projectId: "project-1" },
+    });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/threads/drafts",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { projectId: "project-1" },
+    });
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: "/api/threads/draft-1/draft",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+    });
+
+    expect(missingCsrf.statusCode).toBe(403);
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toMatchObject({ id: "draft-1", lifecycleState: "DRAFT" });
+    expect(deleted.statusCode).toBe(204);
+    expect(platform.createDraft).toHaveBeenCalledWith("user-1", { projectId: "project-1" });
+    expect(platform.deleteDraft).toHaveBeenCalledWith("draft-1", "user-1");
+  });
+
+  test("accepts multipart attachment uploads without exposing an absolute path", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const boundary = "codexplatform-test-boundary";
+    const payload = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="file"; filename="notes.txt"',
+      "Content-Type: text/plain",
+      "",
+      "hello",
+      `--${boundary}--`,
+      "",
+    ].join("\r\n");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/threads/draft-1/attachments",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: {
+        "x-csrf-token": "valid-csrf",
+        "content-type": `multipart/form-data; boundary=${boundary}`,
+      },
+      payload,
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json()).toMatchObject({
+      id: "attachment-1",
+      relativePath: ".codexplatform/attachments/attachment-1/notes.txt",
+      scanStatus: "READY",
+    });
+    expect(response.body).not.toContain("/private/");
+    expect(platform.uploadAttachment).toHaveBeenCalledWith(
+      "draft-1",
+      "user-1",
+      expect.objectContaining({
+        files: [
+          {
+            name: "notes.txt",
+            relativePath: "notes.txt",
+            mimeType: "text/plain",
+            content: Buffer.from("hello"),
+          },
+        ],
+      }),
+    );
+  });
+
+  test("preserves a multipart folder tree as one attachment root", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const boundary = "codexplatform-folder-boundary";
+    const payload = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="files"; filename="research/a.txt"',
+      "Content-Type: text/plain",
+      "",
+      "a",
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="files"; filename="research/nested/b.txt"',
+      "Content-Type: text/plain",
+      "",
+      "b",
+      `--${boundary}--`,
+      "",
+    ].join("\r\n");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/threads/draft-1/attachments",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: {
+        "x-csrf-token": "valid-csrf",
+        "content-type": `multipart/form-data; boundary=${boundary}`,
+      },
+      payload,
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(platform.uploadAttachment).toHaveBeenCalledWith(
+      "draft-1",
+      "user-1",
+      expect.objectContaining({
+        files: [
+          expect.objectContaining({ relativePath: "research/a.txt", content: Buffer.from("a") }),
+          expect.objectContaining({
+            relativePath: "research/nested/b.txt",
+            content: Buffer.from("b"),
+          }),
+        ],
+      }),
+    );
+  });
+
   test("returns conflict when an active Thread cannot be archived", async () => {
     const { auth, platform } = services();
     platform.archiveThread.mockRejectedValueOnce(
@@ -1445,6 +1574,26 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       queue: null,
       items: [],
     })),
+    createDraft: vi.fn(async () => ({
+      id: "draft-1",
+      projectId: "project-1",
+      lifecycleState: "DRAFT" as const,
+      expiresAt: "2026-07-28T13:00:00.000Z",
+    })),
+    deleteDraft: vi.fn(async () => undefined),
+    uploadAttachment: vi.fn(async () => ({
+      id: "attachment-1",
+      threadId: "draft-1",
+      kind: "FILE" as const,
+      name: "notes.txt",
+      relativePath: ".codexplatform/attachments/attachment-1/notes.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      fileCount: 1,
+      scanStatus: "READY" as const,
+      createdAt: "2026-07-28T12:00:00.000Z",
+    })),
+    deleteAttachment: vi.fn(async () => undefined),
     listThreads: vi.fn(async () => []),
     listArchivedThreads: vi.fn(async (): Promise<Thread[]> => []),
     archiveThread: vi.fn(async () => ({ ok: true as const })),

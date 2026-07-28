@@ -38,6 +38,157 @@ describe("SQLitePlatformStore", () => {
     expect(store.getTaskForUser(task.id, "user-2")).toBeNull();
   });
 
+  test("keeps Draft Threads out of every list and project count until activation", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Drafts", now: NOW });
+    const draft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+
+    expect(draft.lifecycleState).toBe("DRAFT");
+    expect(store.listTasks("user-1")).toEqual([]);
+    expect(store.listArchivedTasks("user-1")).toEqual([]);
+    expect(store.listProjects("user-1")).toEqual([
+      expect.objectContaining({ id: project.id, taskCount: 0 }),
+    ]);
+    expect(store.getUserUsage("user-1")).toMatchObject({ threads: 0, turns: 0 });
+    expect(store.getTaskForUser(draft.id, "user-2")).toBeNull();
+
+    store.activateDraft(draft.id, "user-1", new Date(NOW.getTime() + 1));
+    expect(store.listTasks("user-1")).toEqual([
+      expect.objectContaining({ id: draft.id, lifecycleState: "ACTIVE" }),
+    ]);
+    expect(store.listProjects("user-1")).toEqual([
+      expect.objectContaining({ id: project.id, taskCount: 1 }),
+    ]);
+  });
+
+  test("deletes only an owned unactivated Draft and expires stale Drafts", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Drafts", now: NOW });
+    const mine = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+    const stale = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() - 1),
+    });
+
+    expect(() => store.deleteDraft(mine.id, "user-2")).toThrow("Thread not found");
+    expect(store.deleteDraft(mine.id, "user-1")).toEqual({ attachmentRefs: [] });
+    expect(store.expireDrafts(NOW)).toEqual([
+      expect.objectContaining({ threadId: stale.id, attachmentRefs: [] }),
+    ]);
+    expect(store.getTaskForUser(stale.id, "user-1")).toBeNull();
+  });
+
+  test("atomically activates a Draft, claims READY attachments, and snapshots Turn input", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Inputs", now: NOW });
+    const draft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+    const attachment = store.createAttachment({
+      id: "attachment-1",
+      threadId: draft.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "diagram.png",
+      relativePath: ".codexplatform/attachments/attachment-1/diagram.png",
+      mimeType: "image/png",
+      sizeBytes: 128,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    const turn = store.createTurn({
+      id: "turn-with-input",
+      taskId: draft.id,
+      ownerId: "user-1",
+      prompt: "",
+      status: "ALLOCATING",
+      attachmentIds: [attachment.id],
+      now: NOW,
+    });
+
+    expect(store.getReadyAttachments(draft.id, "user-1", [attachment.id])).toEqual([attachment]);
+    expect(store.getTurnInputSnapshot(turn.id)).toEqual({
+      prompt: "",
+      attachments: [attachment],
+      capturedAt: NOW.toISOString(),
+    });
+    expect(store.getTaskForUser(draft.id, "user-1")).toMatchObject({
+      lifecycleState: "ACTIVE",
+    });
+    expect(() => store.deleteAttachment(attachment.id, draft.id, "user-1")).toThrow(
+      "Attachment is already claimed by a Turn",
+    );
+    expect(JSON.stringify(store.getTurnInputSnapshot(turn.id))).not.toContain("/private/");
+  });
+
+  test("enforces attachment root, aggregate-size, and folder-file limits", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Limits", now: NOW });
+    const thread = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Limits",
+      now: NOW,
+    });
+    for (let index = 0; index < 32; index += 1) {
+      store.createAttachment({
+        id: `attachment-${index}`,
+        threadId: thread.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: `file-${index}.txt`,
+        relativePath: `.codexplatform/attachments/attachment-${index}/file-${index}.txt`,
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      });
+    }
+    expect(() =>
+      store.createAttachment({
+        id: "attachment-33",
+        threadId: thread.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: "extra.txt",
+        relativePath: ".codexplatform/attachments/attachment-33/extra.txt",
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      }),
+    ).toThrow("Attachment root limit");
+    expect(() =>
+      store.createAttachment({
+        id: "folder-too-large",
+        threadId: thread.id,
+        ownerId: "user-1",
+        kind: "FOLDER",
+        name: "folder",
+        relativePath: ".codexplatform/attachments/folder-too-large/folder",
+        mimeType: "application/x-directory",
+        sizeBytes: 1,
+        fileCount: 501,
+        scanStatus: "READY",
+        now: NOW,
+      }),
+    ).toThrow("Folder exceeds the 500 file limit");
+  });
+
   test("separates active and archived Thread lists by owner and project", () => {
     const firstProject = store.createProject({
       ownerId: "user-1",

@@ -1,10 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import {
+  type DraftAttachment,
+  DraftAttachmentSchema,
   type EffectiveConfigOverride,
   EffectiveConfigOverrideSchema,
   type EffectiveThreadConfigSnapshot,
   EffectiveThreadConfigSnapshotSchema,
+  type EffectiveTurnInputSnapshot,
+  EffectiveTurnInputSnapshotSchema,
   type SubagentStatus,
   type SubagentThread,
   type SubagentThreadDetail,
@@ -23,6 +27,11 @@ import {
   type RuntimePathRedactionContext,
   sanitizeEventTransport,
 } from "../event-payload-safety.js";
+import {
+  MAX_ATTACHMENT_ROOTS,
+  MAX_FOLDER_FILES,
+  MAX_TURN_ATTACHMENT_BYTES,
+} from "./attachments.js";
 
 export interface ProjectRecord {
   id: string;
@@ -47,6 +56,8 @@ export interface TaskRecord {
   currentTurnId: string | null;
   threadConfig: EffectiveConfigOverride | null;
   archivedAt: string | null;
+  lifecycleState: "DRAFT" | "ACTIVE" | "EXPIRED";
+  draftExpiresAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -155,8 +166,23 @@ interface TaskRow {
   current_turn_id: string | null;
   thread_config_json: string | null;
   archived_at: number | null;
+  lifecycle_state: "DRAFT" | "ACTIVE" | "EXPIRED";
+  draft_expires_at: number | null;
   created_at: number;
   updated_at: number;
+}
+
+interface AttachmentRow {
+  id: string;
+  task_id: string;
+  kind: "FILE" | "FOLDER";
+  name: string;
+  relative_path: string;
+  mime_type: string;
+  size_bytes: number;
+  file_count: number;
+  scan_status: DraftAttachment["scanStatus"];
+  created_at: number;
 }
 
 interface EventRow {
@@ -257,7 +283,8 @@ export class SQLitePlatformStore {
     const rows = this.sqlite
       .prepare(
         `SELECT p.*,
-          (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS task_count
+          (SELECT COUNT(*) FROM tasks t
+            WHERE t.project_id = p.id AND t.lifecycle_state = 'ACTIVE') AS task_count
          FROM projects p WHERE p.owner_id = ? ORDER BY p.updated_at DESC, p.id`,
       )
       .all(ownerId) as ProjectRow[];
@@ -294,19 +321,46 @@ export class SQLitePlatformStore {
     return this.getTaskForUser(id, input.ownerId) as TaskRecord;
   }
 
+  createDraft(input: {
+    ownerId: string;
+    projectId: string;
+    now: Date;
+    expiresAt: Date;
+  }): TaskRecord {
+    if (!this.getProject(input.projectId, input.ownerId)) throw new Error("Project not found");
+    const id = randomUUID();
+    this.sqlite
+      .prepare(
+        `INSERT INTO tasks (
+          id, project_id, owner_id, title, status, lifecycle_state, draft_expires_at,
+          created_at, updated_at
+         ) VALUES (?, ?, ?, 'Untitled', 'DRAFT', 'DRAFT', ?, ?, ?)`,
+      )
+      .run(
+        id,
+        input.projectId,
+        input.ownerId,
+        input.expiresAt.getTime(),
+        input.now.getTime(),
+        input.now.getTime(),
+      );
+    return this.getTaskForUser(id, input.ownerId) as TaskRecord;
+  }
+
   listTasks(ownerId: string, projectId?: string): TaskRecord[] {
     const rows = projectId
       ? (this.sqlite
           .prepare(
             `SELECT * FROM tasks
              WHERE owner_id = ? AND project_id = ? AND archived_at IS NULL
+               AND lifecycle_state = 'ACTIVE'
              ORDER BY updated_at DESC`,
           )
           .all(ownerId, projectId) as TaskRow[])
       : (this.sqlite
           .prepare(
             `SELECT * FROM tasks
-             WHERE owner_id = ? AND archived_at IS NULL
+             WHERE owner_id = ? AND archived_at IS NULL AND lifecycle_state = 'ACTIVE'
              ORDER BY updated_at DESC`,
           )
           .all(ownerId) as TaskRow[]);
@@ -317,7 +371,7 @@ export class SQLitePlatformStore {
     const rows = this.sqlite
       .prepare(
         `SELECT * FROM tasks
-         WHERE owner_id = ? AND archived_at IS NOT NULL
+         WHERE owner_id = ? AND archived_at IS NOT NULL AND lifecycle_state = 'ACTIVE'
          ORDER BY archived_at DESC, id`,
       )
       .all(ownerId) as TaskRow[];
@@ -329,6 +383,157 @@ export class SQLitePlatformStore {
       .prepare("SELECT * FROM tasks WHERE id = ? AND owner_id = ?")
       .get(taskId, ownerId) as TaskRow | undefined;
     return row ? mapTask(row) : null;
+  }
+
+  activateDraft(threadId: string, ownerId: string, now: Date): TaskRecord {
+    const result = this.sqlite
+      .prepare(
+        `UPDATE tasks
+         SET lifecycle_state = 'ACTIVE', status = 'READY', draft_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND owner_id = ? AND lifecycle_state = 'DRAFT'`,
+      )
+      .run(now.getTime(), threadId, ownerId);
+    if (result.changes !== 1) throw new Error("Thread not found");
+    return this.getTaskForUser(threadId, ownerId) as TaskRecord;
+  }
+
+  deleteDraft(threadId: string, ownerId: string): { attachmentRefs: string[] } {
+    return this.immediateTransaction(() => {
+      const draft = this.sqlite
+        .prepare("SELECT id FROM tasks WHERE id = ? AND owner_id = ? AND lifecycle_state = 'DRAFT'")
+        .get(threadId, ownerId);
+      if (!draft) throw new Error("Thread not found");
+      const attachmentRefs = this.attachmentRefs(threadId);
+      this.sqlite.prepare("DELETE FROM tasks WHERE id = ?").run(threadId);
+      return { attachmentRefs };
+    });
+  }
+
+  expireDrafts(now: Date): Array<{ threadId: string; attachmentRefs: string[] }> {
+    return this.immediateTransaction(() => {
+      const rows = this.sqlite
+        .prepare(
+          `SELECT id FROM tasks
+           WHERE lifecycle_state = 'DRAFT' AND draft_expires_at IS NOT NULL AND draft_expires_at <= ?`,
+        )
+        .all(now.getTime()) as Array<{ id: string }>;
+      const expired = rows.map(({ id }) => ({
+        threadId: id,
+        attachmentRefs: this.attachmentRefs(id),
+      }));
+      for (const { id } of rows) {
+        this.sqlite.prepare("UPDATE tasks SET lifecycle_state = 'EXPIRED' WHERE id = ?").run(id);
+        this.sqlite.prepare("DELETE FROM tasks WHERE id = ?").run(id);
+      }
+      return expired;
+    });
+  }
+
+  createAttachment(input: {
+    id: string;
+    threadId: string;
+    ownerId: string;
+    kind: "FILE" | "FOLDER";
+    name: string;
+    relativePath: string;
+    mimeType: string;
+    sizeBytes: number;
+    fileCount: number;
+    scanStatus: DraftAttachment["scanStatus"];
+    blockedReason?: string | null;
+    now: Date;
+  }): DraftAttachment {
+    return this.immediateTransaction(() => {
+      const task = this.sqlite
+        .prepare(
+          "SELECT 1 FROM tasks WHERE id = ? AND owner_id = ? AND lifecycle_state != 'EXPIRED'",
+        )
+        .get(input.threadId, input.ownerId);
+      if (!task) throw new Error("Thread not found");
+      if (input.fileCount > MAX_FOLDER_FILES) throw new Error("Folder exceeds the 500 file limit");
+      const aggregate = this.sqlite
+        .prepare(
+          `SELECT COUNT(*) AS roots, COALESCE(SUM(size_bytes), 0) AS bytes
+           FROM draft_attachments WHERE task_id = ?`,
+        )
+        .get(input.threadId) as { roots: number; bytes: number };
+      if (aggregate.roots >= MAX_ATTACHMENT_ROOTS)
+        throw new Error("Attachment root limit exceeded");
+      if (aggregate.bytes + input.sizeBytes > MAX_TURN_ATTACHMENT_BYTES) {
+        throw new Error("Attachments exceed the 200 MiB Turn limit");
+      }
+      this.sqlite
+        .prepare(
+          `INSERT INTO draft_attachments (
+            id, task_id, owner_id, kind, name, relative_path, mime_type, size_bytes, file_count,
+            scan_status, blocked_reason, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.threadId,
+          input.ownerId,
+          input.kind,
+          input.name,
+          input.relativePath,
+          input.mimeType,
+          input.sizeBytes,
+          input.fileCount,
+          input.scanStatus,
+          input.blockedReason ?? null,
+          input.now.getTime(),
+          input.now.getTime(),
+        );
+      return this.getAttachment(input.id, input.threadId, input.ownerId) as DraftAttachment;
+    });
+  }
+
+  getAttachment(attachmentId: string, threadId: string, ownerId: string): DraftAttachment | null {
+    const row = this.sqlite
+      .prepare(
+        `SELECT * FROM draft_attachments
+         WHERE id = ? AND task_id = ? AND owner_id = ?`,
+      )
+      .get(attachmentId, threadId, ownerId) as AttachmentRow | undefined;
+    return row ? mapAttachment(row) : null;
+  }
+
+  getReadyAttachments(
+    threadId: string,
+    ownerId: string,
+    attachmentIds: string[],
+  ): DraftAttachment[] {
+    if (attachmentIds.length === 0) return [];
+    const placeholders = attachmentIds.map(() => "?").join(",");
+    const rows = this.sqlite
+      .prepare(
+        `SELECT * FROM draft_attachments
+         WHERE task_id = ? AND owner_id = ? AND scan_status = 'READY'
+           AND id IN (${placeholders})`,
+      )
+      .all(threadId, ownerId, ...attachmentIds) as AttachmentRow[];
+    const byId = new Map(rows.map((row) => [row.id, mapAttachment(row)]));
+    return attachmentIds.flatMap((id) => {
+      const attachment = byId.get(id);
+      return attachment ? [attachment] : [];
+    });
+  }
+
+  deleteAttachment(attachmentId: string, threadId: string, ownerId: string): string {
+    return this.immediateTransaction(() => {
+      const row = this.sqlite
+        .prepare(
+          `SELECT relative_path, claimed_turn_id FROM draft_attachments
+           WHERE id = ? AND task_id = ? AND owner_id = ?`,
+        )
+        .get(attachmentId, threadId, ownerId) as
+        | { relative_path: string; claimed_turn_id: string | null }
+        | undefined;
+      if (!row) throw new Error("Attachment not found");
+      if (row.claimed_turn_id) throw new Error("Attachment is already claimed by a Turn");
+      this.sqlite.prepare("DELETE FROM draft_attachments WHERE id = ?").run(attachmentId);
+      return row.relative_path;
+    });
   }
 
   archiveThread(input: { threadId: string; ownerId: string; now: Date }): TaskRecord {
@@ -413,13 +618,41 @@ export class SQLitePlatformStore {
     prompt: string;
     status: "ALLOCATING" | "QUEUED";
     configSnapshot?: EffectiveThreadConfigSnapshot;
+    attachmentIds?: string[];
     now: Date;
   }): TurnRecord {
     this.immediateTransaction(() => {
       const task = this.sqlite
-        .prepare("SELECT owner_id FROM tasks WHERE id = ?")
-        .get(input.taskId) as { owner_id: string } | undefined;
+        .prepare("SELECT owner_id, lifecycle_state FROM tasks WHERE id = ?")
+        .get(input.taskId) as
+        | { owner_id: string; lifecycle_state: "DRAFT" | "ACTIVE" | "EXPIRED" }
+        | undefined;
       if (!task || task.owner_id !== input.ownerId) throw new Error("Task not found");
+      const attachmentIds = [...new Set(input.attachmentIds ?? [])];
+      if (input.prompt.trim().length === 0 && attachmentIds.length === 0) {
+        throw new Error("Invalid Turn input");
+      }
+      if (attachmentIds.length > MAX_ATTACHMENT_ROOTS)
+        throw new Error("Attachment root limit exceeded");
+      const attachments = this.getReadyAttachments(input.taskId, input.ownerId, attachmentIds);
+      if (attachments.length !== attachmentIds.length) {
+        throw new Error("Attachments must exist, be owned, unclaimed, and READY");
+      }
+      const claimedCount =
+        attachmentIds.length === 0
+          ? 0
+          : (
+              this.sqlite
+                .prepare(
+                  `SELECT COUNT(*) AS count FROM draft_attachments
+                 WHERE task_id = ? AND owner_id = ? AND claimed_turn_id IS NULL
+                   AND id IN (${attachmentIds.map(() => "?").join(",")})`,
+                )
+                .get(input.taskId, input.ownerId, ...attachmentIds) as { count: number }
+            ).count;
+      if (claimedCount !== attachmentIds.length) {
+        throw new Error("Attachments must exist, be owned, unclaimed, and READY");
+      }
       const active = this.sqlite
         .prepare(
           `SELECT 1 FROM turns
@@ -446,8 +679,43 @@ export class SQLitePlatformStore {
           ),
           input.now.getTime(),
         );
+      this.sqlite
+        .prepare(
+          `INSERT INTO turn_input_snapshots (turn_id, prompt, attachments_json, captured_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(input.id, input.prompt, JSON.stringify(attachments), input.now.getTime());
+      if (attachmentIds.length > 0) {
+        this.sqlite
+          .prepare(
+            `UPDATE draft_attachments SET claimed_turn_id = ?, updated_at = ?
+             WHERE id IN (${attachmentIds.map(() => "?").join(",")})`,
+          )
+          .run(input.id, input.now.getTime(), ...attachmentIds);
+      }
+      if (task.lifecycle_state === "DRAFT") {
+        this.sqlite
+          .prepare(
+            `UPDATE tasks SET lifecycle_state = 'ACTIVE', status = 'READY',
+             draft_expires_at = NULL, updated_at = ? WHERE id = ?`,
+          )
+          .run(input.now.getTime(), input.taskId);
+      }
     });
     return this.getTurn(input.id) as TurnRecord;
+  }
+
+  getTurnInputSnapshot(turnId: string): EffectiveTurnInputSnapshot | null {
+    const row = this.sqlite
+      .prepare("SELECT * FROM turn_input_snapshots WHERE turn_id = ?")
+      .get(turnId) as { prompt: string; attachments_json: string; captured_at: number } | undefined;
+    return row
+      ? EffectiveTurnInputSnapshotSchema.parse({
+          prompt: row.prompt,
+          attachments: JSON.parse(row.attachments_json),
+          capturedAt: new Date(row.captured_at).toISOString(),
+        })
+      : null;
   }
 
   getLatestTurnPrompt(taskId: string, ownerId: string): string | null {
@@ -921,9 +1189,9 @@ export class SQLitePlatformStore {
     const row = this.sqlite
       .prepare(
         `SELECT
-          (SELECT COUNT(*) FROM tasks WHERE owner_id = ?) AS threads,
+          (SELECT COUNT(*) FROM tasks WHERE owner_id = ? AND lifecycle_state = 'ACTIVE') AS threads,
           (SELECT COUNT(*) FROM turns tr JOIN tasks t ON t.id = tr.task_id
-            WHERE t.owner_id = ?) AS turns,
+            WHERE t.owner_id = ? AND t.lifecycle_state = 'ACTIVE') AS turns,
           (SELECT COUNT(*) FROM tool_calls WHERE user_id = ?) AS tool_calls,
           (SELECT COUNT(*) FROM subagent_threads WHERE owner_id = ?) AS subagents,
           (SELECT COUNT(*) FROM thread_token_usage WHERE owner_id = ?) AS token_rows,
@@ -1017,8 +1285,9 @@ export class SQLitePlatformStore {
       .prepare(
         `SELECT
           (SELECT COUNT(*) FROM users) AS users,
-          (SELECT COUNT(*) FROM tasks) AS threads,
-          (SELECT COUNT(*) FROM turns) AS turns,
+          (SELECT COUNT(*) FROM tasks WHERE lifecycle_state = 'ACTIVE') AS threads,
+          (SELECT COUNT(*) FROM turns tr JOIN tasks t ON t.id = tr.task_id
+            WHERE t.lifecycle_state = 'ACTIVE') AS turns,
           (SELECT COUNT(*) FROM tool_calls) AS tool_calls,
           (SELECT COUNT(*) FROM subagent_threads) AS subagents,
           (SELECT COUNT(*) FROM thread_token_usage) AS token_rows,
@@ -1755,11 +2024,20 @@ export class SQLitePlatformStore {
     const row = this.sqlite
       .prepare(
         `SELECT p.*,
-          (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS task_count
+          (SELECT COUNT(*) FROM tasks t
+            WHERE t.project_id = p.id AND t.lifecycle_state = 'ACTIVE') AS task_count
          FROM projects p WHERE p.id = ? AND p.owner_id = ?`,
       )
       .get(id, ownerId) as ProjectRow | undefined;
     return row ? mapProject(row) : null;
+  }
+
+  private attachmentRefs(taskId: string): string[] {
+    return (
+      this.sqlite
+        .prepare("SELECT relative_path FROM draft_attachments WHERE task_id = ?")
+        .all(taskId) as Array<{ relative_path: string }>
+    ).map((row) => row.relative_path);
   }
 
   private getTaskRow(taskId: string): TaskRow {
@@ -1859,9 +2137,27 @@ function mapTask(row: TaskRow): TaskRecord {
       ? EffectiveConfigOverrideSchema.parse(JSON.parse(row.thread_config_json))
       : null,
     archivedAt: row.archived_at === null ? null : new Date(row.archived_at).toISOString(),
+    lifecycleState: row.lifecycle_state,
+    draftExpiresAt:
+      row.draft_expires_at === null ? null : new Date(row.draft_expires_at).toISOString(),
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
   };
+}
+
+function mapAttachment(row: AttachmentRow): DraftAttachment {
+  return DraftAttachmentSchema.parse({
+    id: row.id,
+    threadId: row.task_id,
+    kind: row.kind,
+    name: row.name,
+    relativePath: row.relative_path,
+    mimeType: row.mime_type,
+    sizeBytes: row.size_bytes,
+    fileCount: row.file_count,
+    scanStatus: row.scan_status,
+    createdAt: new Date(row.created_at).toISOString(),
+  });
 }
 
 function mapTurn(row: TurnRow): TurnRecord {

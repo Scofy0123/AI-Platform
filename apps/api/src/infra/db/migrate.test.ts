@@ -127,6 +127,61 @@ describe("migrateDatabase", () => {
     ]);
   });
 
+  test("adds Draft lifecycle, attachment staging, and Turn input snapshots additively", () => {
+    const database = new Database(":memory:");
+    databases.push(database);
+    database.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        queue_ticket INTEGER,
+        account_id TEXT,
+        account_alias TEXT,
+        lease_id TEXT,
+        thread_id TEXT,
+        current_turn_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE turns (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        codex_turn_id TEXT,
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        duration_ms INTEGER
+      );
+      INSERT INTO tasks (
+        id, project_id, owner_id, title, status, created_at, updated_at
+      ) VALUES ('legacy-thread', 'project-1', 'user-1', 'Legacy', 'READY', 1, 2);
+    `);
+
+    migrateDatabase(database);
+    migrateDatabase(database);
+
+    const taskColumns = database.pragma("table_info(tasks)") as Array<{ name: string }>;
+    expect(taskColumns.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["lifecycle_state", "draft_expires_at"]),
+    );
+    expect(
+      database
+        .prepare("SELECT lifecycle_state, draft_expires_at FROM tasks WHERE id = 'legacy-thread'")
+        .get(),
+    ).toEqual({ lifecycle_state: "ACTIVE", draft_expires_at: null });
+    expect(
+      database
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('draft_attachments', 'turn_input_snapshots') ORDER BY name",
+        )
+        .all(),
+    ).toEqual([{ name: "draft_attachments" }, { name: "turn_input_snapshots" }]);
+  });
+
   test("adds persistent session and Feishu connection state without deleting identities", () => {
     const database = new Database(":memory:");
     databases.push(database);

@@ -158,6 +158,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   current_turn_id TEXT,
   thread_config_json TEXT,
   archived_at INTEGER,
+  lifecycle_state TEXT NOT NULL DEFAULT 'ACTIVE'
+    CHECK(lifecycle_state IN ('DRAFT', 'ACTIVE', 'EXPIRED')),
+  draft_expires_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -174,6 +177,34 @@ CREATE TABLE IF NOT EXISTS turns (
   started_at INTEGER NOT NULL,
   completed_at INTEGER,
   duration_ms INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS draft_attachments (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('FILE', 'FOLDER')),
+  name TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+  file_count INTEGER NOT NULL CHECK(file_count BETWEEN 1 AND 500),
+  scan_status TEXT NOT NULL
+    CHECK(scan_status IN ('UPLOADING', 'SCANNING', 'READY', 'BLOCKED', 'FAILED')),
+  blocked_reason TEXT,
+  claimed_turn_id TEXT REFERENCES turns(id),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS draft_attachments_task_idx
+  ON draft_attachments(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS turn_input_snapshots (
+  turn_id TEXT PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
+  prompt TEXT NOT NULL,
+  attachments_json TEXT NOT NULL,
+  captured_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -320,11 +351,40 @@ export function migrateDatabase(sqlite: Database.Database): void {
   ensureColumn(sqlite, "task_events", "item_id", "TEXT");
   ensureColumn(sqlite, "tasks", "thread_config_json", "TEXT");
   ensureColumn(sqlite, "tasks", "archived_at", "INTEGER");
+  ensureColumn(sqlite, "tasks", "lifecycle_state", "TEXT NOT NULL DEFAULT 'ACTIVE'");
+  ensureColumn(sqlite, "tasks", "draft_expires_at", "INTEGER");
   sqlite.exec(
     `CREATE INDEX IF NOT EXISTS tasks_owner_archived_updated_idx
        ON tasks(owner_id, archived_at, updated_at DESC)`,
   );
   ensureColumn(sqlite, "turns", "config_snapshot_json", "TEXT");
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS draft_attachments (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      owner_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('FILE', 'FOLDER')),
+      name TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+      file_count INTEGER NOT NULL CHECK(file_count BETWEEN 1 AND 500),
+      scan_status TEXT NOT NULL
+        CHECK(scan_status IN ('UPLOADING', 'SCANNING', 'READY', 'BLOCKED', 'FAILED')),
+      blocked_reason TEXT,
+      claimed_turn_id TEXT REFERENCES turns(id),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS draft_attachments_task_idx
+      ON draft_attachments(task_id, created_at);
+    CREATE TABLE IF NOT EXISTS turn_input_snapshots (
+      turn_id TEXT PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
+      prompt TEXT NOT NULL,
+      attachments_json TEXT NOT NULL,
+      captured_at INTEGER NOT NULL
+    );
+  `);
   ensureColumn(sqlite, "queue_entries", "required_account_id", "TEXT");
   ensureColumn(sqlite, "sessions", "persistent_at", "INTEGER");
   ensureColumn(sqlite, "feishu_credentials", "status", "TEXT NOT NULL DEFAULT 'CONNECTED'");
@@ -470,12 +530,18 @@ function ensureColumn(
     | "item_id"
     | "thread_config_json"
     | "archived_at"
+    | "lifecycle_state"
+    | "draft_expires_at"
     | "config_snapshot_json"
     | "persistent_at"
     | "status"
     | "last_refresh_error_code"
     | "reauth_required_at",
-  definition: "TEXT" | "INTEGER" | "TEXT NOT NULL DEFAULT 'CONNECTED'",
+  definition:
+    | "TEXT"
+    | "INTEGER"
+    | "TEXT NOT NULL DEFAULT 'CONNECTED'"
+    | "TEXT NOT NULL DEFAULT 'ACTIVE'",
 ): void {
   const columns = sqlite.pragma(`table_info(${table})`) as Array<{ name: string }>;
   if (columns.some((entry) => entry.name === column)) return;

@@ -6,6 +6,7 @@ import {
 } from "@codexplatform/contracts";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
 import sensible from "@fastify/sensible";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
@@ -55,6 +56,14 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.register(cors, {
     origin: options.webOrigin ?? "http://127.0.0.1:5173",
     credentials: true,
+  });
+  app.register(multipart, {
+    preservePath: true,
+    limits: {
+      files: 500,
+      fileSize: 50 * 1024 * 1024,
+      parts: 1_000,
+    },
   });
 
   app.setErrorHandler((error, _request, reply) => {
@@ -274,6 +283,64 @@ function registerRoutes(
       : reply.code(404).send({ error: "Thread not found" });
   });
 
+  app.post("/api/threads/drafts", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const body = parseBody(
+      z.object({ projectId: z.string().min(1) }).strict(),
+      request.body,
+      reply,
+    );
+    if (!body) return;
+    return reply.code(201).send(await platform.createDraft(actor.user.id, body));
+  });
+
+  app.delete("/api/threads/:id/draft", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    await platform.deleteDraft(id, actor.user.id);
+    return reply.code(204).send();
+  });
+
+  app.post("/api/threads/:id/attachments", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    const files: Array<{
+      name: string;
+      relativePath: string;
+      mimeType: string;
+      content: Buffer;
+    }> = [];
+    for await (const file of request.files()) {
+      const content = await file.toBuffer();
+      if (file.file.truncated) {
+        return reply.code(400).send({ error: "Attachment exceeds the 50 MiB file limit" });
+      }
+      files.push({
+        name: file.filename.split("/").at(-1) ?? file.filename,
+        relativePath: file.filename,
+        mimeType: file.mimetype,
+        content,
+      });
+    }
+    if (files.length === 0) return reply.code(400).send({ error: "Missing attachment file" });
+    return reply.code(201).send(
+      await platform.uploadAttachment(id, actor.user.id, {
+        files,
+      }),
+    );
+  });
+
+  app.delete("/api/threads/:id/attachments/:attachmentId", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const { id, attachmentId } = request.params as { id: string; attachmentId: string };
+    await platform.deleteAttachment(id, attachmentId, actor.user.id);
+    return reply.code(204).send();
+  });
+
   app.post("/api/threads/:id/archive", async (request, reply) => {
     const actor = requireWriteSession(request, reply, auth);
     if (!actor) return;
@@ -293,20 +360,29 @@ function registerRoutes(
     if (!actor) return;
     const { id } = request.params as { id: string };
     const body = parseBody(
-      z.object({
-        prompt: z.string().trim().min(1).max(100_000),
-        config: EffectiveConfigOverrideSchema.optional(),
-      }),
+      z
+        .object({
+          prompt: z.string().trim().max(100_000),
+          config: EffectiveConfigOverrideSchema.optional(),
+          attachmentIds: z.array(z.string().min(1)).max(32).default([]),
+        })
+        .refine((body) => body.prompt.length > 0 || body.attachmentIds.length > 0, {
+          message: "A Turn requires a prompt or at least one attachment",
+        }),
       request.body,
       reply,
     );
     if (!body) return;
-    const result = await platform.startThreadTurn(
-      id,
-      actor.user.id,
-      body.prompt,
-      ...(body.config ? [body.config] : []),
-    );
+    const result =
+      body.config || body.attachmentIds.length > 0
+        ? await platform.startThreadTurn(
+            id,
+            actor.user.id,
+            body.prompt,
+            body.config,
+            body.attachmentIds,
+          )
+        : await platform.startThreadTurn(id, actor.user.id, body.prompt);
     const refreshed = await platform.getThread(id, actor.user.id);
     return reply
       .code(202)

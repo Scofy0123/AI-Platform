@@ -58,62 +58,7 @@ export function listComposerCapabilities(context: ComposerCapabilityContext): Co
         context.planModeUnavailableReason ?? "Runtime version does not support plan mode",
       unavailableAvailability: "UNSUPPORTED",
     }),
-    capability({
-      id: "record-a-skill",
-      kind: "SKILL_RECORDER",
-      section: "ADD",
-      label: "Record a skill",
-      description: "Record a reusable workflow",
-      available: context.skillRecorderAvailable,
-      unavailableReason:
-        context.skillRecorderUnavailableReason ?? "Requires an isolated Computer Use Worker",
-      unavailableAvailability: "UNSUPPORTED",
-    }),
   ];
-
-  for (const skill of context.approvedSkills) {
-    capabilities.push(
-      ComposerCapabilitySchema.parse({
-        id: `skill:${skill.id}`,
-        kind: "SKILL",
-        section: "PLUGINS",
-        label: skill.label,
-        description: skill.description,
-        availability: "AVAILABLE",
-        unavailableReason: null,
-      }),
-    );
-  }
-
-  for (const app of context.approvedApps) {
-    capabilities.push(
-      ComposerCapabilitySchema.parse({
-        id: `app:${app.id}`,
-        kind: "APP",
-        section: "APPS",
-        label: app.label,
-        description: app.description,
-        availability: app.connected ? "AVAILABLE" : "AUTH_REQUIRED",
-        unavailableReason: app.connected
-          ? null
-          : "Connect this app with your own enterprise identity",
-      }),
-    );
-  }
-
-  for (const thread of context.recentThreads) {
-    capabilities.push(
-      ComposerCapabilitySchema.parse({
-        id: `thread:${thread.id}`,
-        kind: "THREAD_REFERENCE",
-        section: "FILES_AND_CHATS",
-        label: thread.label,
-        description: thread.description,
-        availability: "AVAILABLE",
-        unavailableReason: null,
-      }),
-    );
-  }
 
   return capabilities;
 }

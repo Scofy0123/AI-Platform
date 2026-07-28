@@ -1,6 +1,7 @@
 import type {
   Bootstrap,
   ComposerCapability,
+  DraftAttachment,
   EffectiveConfigOverride,
   ModelCatalog,
   SubagentThread,
@@ -41,6 +42,16 @@ export interface PlatformApi {
     userId: string,
     input: { projectId: string; title: string; config?: EffectiveConfigOverride },
   ): Promise<Thread>;
+  createDraft(userId: string, input: { projectId: string }): Promise<unknown>;
+  deleteDraft(threadId: string, userId: string): Promise<void>;
+  uploadAttachment(
+    threadId: string,
+    userId: string,
+    input: {
+      files: Array<{ name: string; relativePath: string; mimeType: string; content: Buffer }>;
+    },
+  ): Promise<DraftAttachment>;
+  deleteAttachment(threadId: string, attachmentId: string, userId: string): Promise<void>;
   listThreads(userId: string, projectId?: string): Promise<Thread[]>;
   listArchivedThreads(userId: string): Promise<Thread[]>;
   archiveThread(threadId: string, userId: string): Promise<{ ok: true }>;
@@ -52,6 +63,7 @@ export interface PlatformApi {
     userId: string,
     prompt: string,
     config?: EffectiveConfigOverride,
+    attachmentIds?: string[],
   ): Promise<unknown>;
   steerThread(threadId: string, userId: string, prompt: string): Promise<unknown>;
   interruptThread(threadId: string, userId: string): Promise<unknown>;

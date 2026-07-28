@@ -51,7 +51,11 @@ interface RuntimePort {
   startTurn(
     threadId: string,
     prompt: string,
-    options: { cwd: string; effectiveConfig: EffectiveThreadConfigSnapshot },
+    options: {
+      cwd: string;
+      effectiveConfig: EffectiveThreadConfigSnapshot;
+      attachments?: Array<{ name: string; path: string; mimeType: string }>;
+    },
   ): Promise<unknown>;
   disableThreadMemory(threadId: string): Promise<unknown>;
   steerTurn(threadId: string, turnId: string, prompt: string): Promise<unknown>;
@@ -156,6 +160,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     existingThreadId: string | null;
     effectiveConfig: EffectiveThreadConfigSnapshot;
     actorContext: ActorContext;
+    attachments?: Array<{ name: string; path: string; mimeType: string }>;
   }): Promise<{ threadId: string; turnId: string }> {
     const managed = await this.options.supervisor.startAccount({
       accountId: input.accountId,
@@ -241,6 +246,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         await managed.runtime.startTurn(threadId, input.prompt, {
           cwd: input.cwd,
           effectiveConfig: input.effectiveConfig,
+          ...(input.attachments?.length ? { attachments: input.attachments } : {}),
         }),
       );
       const context = this.contextByThread.get(contextKey);

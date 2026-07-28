@@ -69,12 +69,58 @@ export const ComposerCapabilitySchema = z
   });
 export type ComposerCapability = z.infer<typeof ComposerCapabilitySchema>;
 
+export const AttachmentScanStatusSchema = z.enum([
+  "UPLOADING",
+  "SCANNING",
+  "READY",
+  "BLOCKED",
+  "FAILED",
+]);
+export type AttachmentScanStatus = z.infer<typeof AttachmentScanStatusSchema>;
+
+export const DraftAttachmentSchema = z
+  .object({
+    id: z.string().min(1),
+    threadId: z.string().min(1),
+    kind: z.enum(["FILE", "FOLDER"]),
+    name: z.string().min(1),
+    relativePath: z
+      .string()
+      .min(1)
+      .refine((value) => !value.startsWith("/") && !value.includes("\0") && !value.includes("..")),
+    mimeType: z.string().min(1),
+    sizeBytes: z.number().int().nonnegative(),
+    fileCount: z.number().int().positive().max(500),
+    scanStatus: AttachmentScanStatusSchema,
+    createdAt: z.iso.datetime(),
+  })
+  .strict();
+export type DraftAttachment = z.infer<typeof DraftAttachmentSchema>;
+
+export const EffectiveTurnInputSnapshotSchema = z
+  .object({
+    prompt: z.string(),
+    attachments: z.array(DraftAttachmentSchema).max(32),
+    capturedAt: z.iso.datetime(),
+  })
+  .strict();
+export type EffectiveTurnInputSnapshot = z.infer<typeof EffectiveTurnInputSnapshotSchema>;
+
 export const TurnInputBundleSchema = z
   .object({
-    prompt: z.string().trim().min(1),
+    prompt: z.string().trim(),
     permission: ExecutionPermissionSelectionSchema,
     planMode: z.boolean(),
     attachmentIds: z.array(z.string().min(1)).max(32),
   })
-  .strict();
+  .strict()
+  .superRefine((input, context) => {
+    if (input.prompt.length === 0 && input.attachmentIds.length === 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["prompt"],
+        message: "A Turn requires a prompt or at least one attachment",
+      });
+    }
+  });
 export type TurnInputBundle = z.infer<typeof TurnInputBundleSchema>;

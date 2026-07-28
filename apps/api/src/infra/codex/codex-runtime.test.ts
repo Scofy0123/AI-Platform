@@ -552,6 +552,55 @@ describe("CodexAppServerRuntime", () => {
     ]);
   });
 
+  test("maps controlled image and file references into Codex Turn inputs", async () => {
+    const rpc = new FakeRpc({
+      "thread/memoryMode/set": {},
+      "turn/start": { turn: { id: "turn-1" } },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+    const config = {
+      model: null,
+      reasoningEffort: "MEDIUM",
+      permissionMode: "WORKSPACE_WRITE",
+      approvalMode: "ASK",
+      personality: "NONE",
+      instructions: "",
+      sourceVersion: "org-policy-v1",
+    } as const;
+    await runtime.disableThreadMemory("thread-1");
+
+    await runtime.startTurn("thread-1", "", {
+      cwd: "/runtime/workspaces/thread-1",
+      effectiveConfig: config,
+      attachments: [
+        {
+          name: "diagram.png",
+          path: "/runtime/workspaces/thread-1/.codexplatform/attachments/a1/diagram.png",
+          mimeType: "image/png",
+        },
+        {
+          name: "notes.txt",
+          path: "/runtime/workspaces/thread-1/.codexplatform/attachments/a2/notes.txt",
+          mimeType: "text/plain",
+        },
+      ],
+    });
+
+    expect(rpc.requests.at(-1)).toEqual({
+      method: "turn/start",
+      params: expect.objectContaining({
+        input: [
+          { type: "localImage", path: expect.stringContaining("/attachments/a1/diagram.png") },
+          {
+            type: "mention",
+            name: "notes.txt",
+            path: expect.stringContaining("/attachments/a2/notes.txt"),
+          },
+        ],
+      }),
+    });
+  });
+
   test("reapplies the immutable snapshot when resuming and preserves explicit empty instructions", async () => {
     const rpc = new FakeRpc({
       "thread/resume": { thread: { id: "thread-1" } },

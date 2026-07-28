@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import {
   type ActorContext,
   type Bootstrap,
   type ComposerCapability,
+  type DraftAttachment,
   type EffectiveConfigOverride,
   EffectiveConfigOverrideSchema,
   type EffectiveThreadConfigSnapshot,
@@ -34,6 +35,12 @@ import {
 import type { WeeklyQuota } from "../infra/codex/codex-runtime.js";
 import type { PlatformApi } from "../web-api.js";
 import type { AccountAdminStore, InternalAccount } from "./account-admin-store.js";
+import {
+  type AttachmentScanner,
+  BasicAttachmentScanner,
+  MAX_FOLDER_FILES,
+  MAX_TURN_ATTACHMENT_BYTES,
+} from "./attachments.js";
 import { listComposerCapabilities as buildComposerCapabilities } from "./composer-capabilities.js";
 import type { LeasedTurn, SQLiteLeaseStore } from "./lease-store.js";
 import type {
@@ -159,6 +166,7 @@ export interface TaskExecutionAdapter {
     existingThreadId: string | null;
     effectiveConfig: EffectiveThreadConfigSnapshot;
     actorContext: ActorContext;
+    attachments?: Array<{ name: string; path: string; mimeType: string }>;
   }): Promise<{ threadId: string; turnId: string }>;
   steerTask(threadId: string, turnId: string, prompt: string): Promise<void>;
   interruptTask(threadId: string, turnId: string): Promise<void>;
@@ -203,6 +211,7 @@ interface LocalPlatformServiceOptions {
   safety: RuntimeSafetyPort;
   dataDir: string;
   now?: () => Date;
+  attachmentScanner?: AttachmentScanner;
 }
 
 type BufferedExecutionSignal =
@@ -390,8 +399,7 @@ export class LocalPlatformService implements PlatformApi {
       throw new Error("Thread not found");
     }
     return buildComposerCapabilities({
-      stagingAvailable: false,
-      stagingUnavailableReason: "File staging is not enabled in this build",
+      stagingAvailable: true,
       goalAvailable: false,
       goalUnavailableReason: "Goal persistence is not enabled in this build",
       planModeAvailable: false,
@@ -402,6 +410,116 @@ export class LocalPlatformService implements PlatformApi {
       approvedApps: [],
       recentThreads: [],
     });
+  }
+
+  async createDraft(userId: string, input: { projectId: string }) {
+    return this.options.store.createDraft({
+      ownerId: userId,
+      projectId: input.projectId,
+      now: this.now(),
+      expiresAt: new Date(this.now().getTime() + 60 * 60_000),
+    });
+  }
+
+  async deleteDraft(threadId: string, userId: string): Promise<void> {
+    const deleted = this.options.store.deleteDraft(threadId, userId);
+    await this.removeAttachmentRefs(threadId, deleted.attachmentRefs);
+  }
+
+  async cleanupExpiredDrafts(): Promise<number> {
+    const expired = this.options.store.expireDrafts(this.now());
+    await Promise.all(
+      expired.map(({ threadId, attachmentRefs }) =>
+        this.removeAttachmentRefs(threadId, attachmentRefs),
+      ),
+    );
+    return expired.length;
+  }
+
+  async uploadAttachment(
+    threadId: string,
+    userId: string,
+    input: {
+      files: Array<{ name: string; relativePath: string; mimeType: string; content: Buffer }>;
+    },
+  ): Promise<DraftAttachment> {
+    const task = this.options.store.getTaskForUser(threadId, userId);
+    if (!task || task.lifecycleState === "EXPIRED") throw new Error("Thread not found");
+    if (task.archivedAt) throw new Error("Thread is archived");
+    if (input.files.length === 0) throw new Error("Missing attachment file");
+    if (input.files.length > MAX_FOLDER_FILES) throw new Error("Folder exceeds the 500 file limit");
+    const totalBytes = input.files.reduce((sum, file) => sum + file.content.byteLength, 0);
+    if (totalBytes > MAX_TURN_ATTACHMENT_BYTES) {
+      throw new Error("Attachments exceed the 200 MiB Turn limit");
+    }
+    const scanner = this.options.attachmentScanner ?? new BasicAttachmentScanner();
+    const scannedFiles = await Promise.all(
+      input.files.map(async (file) => {
+        const scan = await scanner.scan({
+          name: file.name,
+          relativePath: file.relativePath,
+          mimeType: file.mimeType,
+          sizeBytes: file.content.byteLength,
+          content: file.content,
+        });
+        if (scan.status !== "READY") throw new Error(scan.reason);
+        return { ...file, relativePath: scan.normalizedRelativePath };
+      }),
+    );
+    if (new Set(scannedFiles.map((file) => file.relativePath)).size !== scannedFiles.length) {
+      throw new Error("Duplicate attachment path");
+    }
+    const attachmentId = randomUUID();
+    const attachmentRoot = join(
+      this.options.dataDir,
+      "workspaces",
+      threadId,
+      ".codexplatform",
+      "attachments",
+      attachmentId,
+    );
+    const isFolder = scannedFiles.length > 1 || scannedFiles[0]?.relativePath.includes("/");
+    const commonRoot = commonAttachmentRoot(scannedFiles.map((file) => file.relativePath));
+    const relativePath = isFolder
+      ? join(".codexplatform", "attachments", attachmentId, ...(commonRoot ? [commonRoot] : []))
+      : join(
+          ".codexplatform",
+          "attachments",
+          attachmentId,
+          scannedFiles[0]?.relativePath as string,
+        );
+    try {
+      for (const file of scannedFiles) {
+        const absolutePath = join(attachmentRoot, file.relativePath);
+        await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
+        await chmod(attachmentRoot, 0o700);
+        await writeFile(absolutePath, file.content, { mode: 0o600, flag: "wx" });
+        await chmod(absolutePath, 0o600);
+      }
+      return this.options.store.createAttachment({
+        id: attachmentId,
+        threadId,
+        ownerId: userId,
+        kind: isFolder ? "FOLDER" : "FILE",
+        name: isFolder
+          ? (commonRoot ?? "attachments")
+          : basename(scannedFiles[0]?.relativePath as string),
+        relativePath,
+        mimeType: isFolder ? "application/x-directory" : (scannedFiles[0]?.mimeType as string),
+        sizeBytes: totalBytes,
+        fileCount: scannedFiles.length,
+        scanStatus: "READY",
+        now: this.now(),
+      });
+    } catch (error) {
+      await rm(attachmentRoot, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  async deleteAttachment(threadId: string, attachmentId: string, userId: string): Promise<void> {
+    const relativePath = this.options.store.deleteAttachment(attachmentId, threadId, userId);
+    await this.removeAttachmentRefs(threadId, [relativePath]);
   }
 
   async listTasks(userId: string, projectId?: string) {
@@ -477,7 +595,7 @@ export class LocalPlatformService implements PlatformApi {
 
   async getThread(threadId: string, userId: string): Promise<Thread | null> {
     const task = this.options.store.getTaskForUser(threadId, userId);
-    return task ? this.projectThread(task, userId) : null;
+    return task?.lifecycleState === "ACTIVE" ? this.projectThread(task, userId) : null;
   }
 
   async getAdminThread(threadId: string, adminUserId: string): Promise<Thread | null> {
@@ -488,7 +606,7 @@ export class LocalPlatformService implements PlatformApi {
     const owner = this.options.store.getUserIdentity(ownerId);
     if (owner.tenantKey !== admin.tenantKey) return null;
     const task = this.options.store.getTaskForUser(threadId, ownerId);
-    return task ? this.projectThread(task, ownerId) : null;
+    return task?.lifecycleState === "ACTIVE" ? this.projectThread(task, ownerId) : null;
   }
 
   async startThreadTurn(
@@ -496,8 +614,9 @@ export class LocalPlatformService implements PlatformApi {
     userId: string,
     prompt: string,
     config?: EffectiveConfigOverride,
+    attachmentIds: string[] = [],
   ) {
-    return this.startTurn(threadId, userId, prompt, config);
+    return this.startTurn(threadId, userId, prompt, config, attachmentIds);
   }
 
   async steerThread(threadId: string, userId: string, prompt: string) {
@@ -571,6 +690,7 @@ export class LocalPlatformService implements PlatformApi {
     userId: string,
     prompt: string,
     turnConfig?: EffectiveConfigOverride,
+    attachmentIds: string[] = [],
   ) {
     const task = this.requireTask(taskId, userId);
     if (task.threadId && !task.accountId) {
@@ -602,6 +722,7 @@ export class LocalPlatformService implements PlatformApi {
       prompt,
       status: "ALLOCATING",
       configSnapshot,
+      attachmentIds,
       now: this.now(),
     });
     const allocation = this.options.leases.acquireTurn({
@@ -1224,6 +1345,21 @@ export class LocalPlatformService implements PlatformApi {
     };
   }
 
+  private async removeAttachmentRefs(threadId: string, refs: string[]): Promise<void> {
+    const workspace = join(this.options.dataDir, "workspaces", threadId);
+    const roots = new Set(
+      refs.map((reference) => {
+        const segments = reference.split("/");
+        const attachmentId = segments[2];
+        if (segments[0] !== ".codexplatform" || segments[1] !== "attachments" || !attachmentId) {
+          throw new Error("Invalid attachment staging reference");
+        }
+        return join(workspace, ".codexplatform", "attachments", attachmentId);
+      }),
+    );
+    await Promise.all([...roots].map((root) => rm(root, { recursive: true, force: true })));
+  }
+
   private requireTask(taskId: string, userId: string) {
     const task = this.options.store.getTaskForUser(taskId, userId);
     if (!task) throw new Error("Task not found");
@@ -1605,6 +1741,14 @@ export class LocalPlatformService implements PlatformApi {
         existingThreadId: task.threadId,
         effectiveConfig,
         actorContext: this.actorContextFor(queuedTurn.ownerId),
+        attachments:
+          this.options.store
+            .getTurnInputSnapshot(allocation.turnId)
+            ?.attachments.map((attachment) => ({
+              name: attachment.name,
+              path: join(cwd, attachment.relativePath),
+              mimeType: attachment.mimeType,
+            })) ?? [],
       });
       this.schedulerTurnByRuntimeTurn.set(
         runtimeTurnKey(queuedTurn.taskId, started.turnId) as string,
@@ -1933,6 +2077,11 @@ function normalizeResetTimestamp(value: number): Date {
 
 function runtimeTurnKey(taskId: string, turnId: string | null): string | null {
   return turnId ? `${taskId}:${turnId}` : null;
+}
+
+function commonAttachmentRoot(paths: string[]): string | null {
+  const roots = paths.map((path) => path.split("/")[0]).filter(Boolean);
+  return roots.length > 0 && roots.every((root) => root === roots[0]) ? (roots[0] ?? null) : null;
 }
 
 function projectTurn(threadId: string, turn: TurnRecord): Thread["turns"][number] {

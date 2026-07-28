@@ -19,6 +19,7 @@ import type { ThreadResumeParams } from "./generated/v2/ThreadResumeParams.js";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse.js";
 import type { ThreadStartParams } from "./generated/v2/ThreadStartParams.js";
 import type { TurnStartParams } from "./generated/v2/TurnStartParams.js";
+import type { UserInput } from "./generated/v2/UserInput.js";
 
 export interface RpcPeer {
   request<T>(method: string, params?: unknown): Promise<T>;
@@ -181,14 +182,27 @@ export class CodexAppServerRuntime {
   async startTurn(
     threadId: string,
     prompt: string,
-    options?: { cwd: string; effectiveConfig: EffectiveThreadConfigSnapshot },
+    options?: {
+      cwd: string;
+      effectiveConfig: EffectiveThreadConfigSnapshot;
+      attachments?: Array<{ name: string; path: string; mimeType: string }>;
+    },
   ): Promise<unknown> {
     if (!this.memoryDisabledThreadIds.has(threadId)) {
       throw new Error("Thread native memory must be disabled before turn/start");
     }
+    const userInput: UserInput[] = [];
+    if (prompt.length > 0) userInput.push(textInput(prompt));
+    for (const attachment of options?.attachments ?? []) {
+      userInput.push(
+        attachment.mimeType.startsWith("image/")
+          ? { type: "localImage", path: attachment.path }
+          : { type: "mention", name: attachment.name, path: attachment.path },
+      );
+    }
     const params = {
       threadId,
-      input: [textInput(prompt)],
+      input: userInput,
       ...(options ? turnConfigParams(options.cwd, options.effectiveConfig) : {}),
     } satisfies TurnStartParams;
     return this.rpc.request("turn/start", params);
