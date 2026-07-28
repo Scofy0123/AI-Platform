@@ -233,8 +233,30 @@ export const steerInputSnapshots = sqliteTable("steer_input_snapshots", {
     .references(() => turns.id, { onDelete: "cascade" }),
   prompt: text("prompt").notNull(),
   attachmentsJson: text("attachments_json").notNull(),
+  deliveryStatus: text("delivery_status").notNull().default("PENDING"),
+  deliveryError: text("delivery_error"),
+  deliveredAt: integer("delivered_at", { mode: "timestamp_ms" }),
+  failedAt: integer("failed_at", { mode: "timestamp_ms" }),
   capturedAt: integer("captured_at", { mode: "timestamp_ms" }).notNull(),
 });
+
+export const attachmentCleanupJobs = sqliteTable(
+  "attachment_cleanup_jobs",
+  {
+    id: text("id").primaryKey(),
+    threadId: text("thread_id").notNull(),
+    attachmentId: text("attachment_id").notNull(),
+    relativePath: text("relative_path").notNull(),
+    status: text("status").notNull().default("PENDING"),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("last_error"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+    updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("attachment_cleanup_jobs_target_idx").on(table.threadId, table.attachmentId),
+  ],
+);
 
 export const taskEvents = sqliteTable(
   "task_events",

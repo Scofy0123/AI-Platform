@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { access, mkdir, readdir, rm, symlink } from "node:fs/promises";
+import { access, mkdir, readdir, rename, rm, symlink, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
   BootstrapSchema,
@@ -245,11 +245,74 @@ describe("LocalPlatformService", () => {
         prompt: "",
         attachments: [attachment],
         capturedAt: NOW.toISOString(),
+        deliveryStatus: "DELIVERED",
+        deliveryError: null,
+        deliveredAt: NOW.toISOString(),
+        failedAt: null,
       },
     ]);
     expect(() => store.deleteAttachment(attachment.id, task.id, "user-1")).toThrow(
       "Attachment is already claimed by a Turn",
     );
+  });
+
+  test("marks a rejected Steer failed and releases its attachment for a later delivery", async () => {
+    const project = await service.createProject("user-1", { name: "Steer retry" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Initial");
+    const platformTurnId = (
+      database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+        id: string;
+      }
+    ).id;
+    const attachment = store.createAttachment({
+      id: "steer-retry-attachment",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "retry.txt",
+      relativePath: ".codexplatform/attachments/steer-retry-attachment/retry.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    const deletable = store.createAttachment({
+      id: "steer-delete-after-failure",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "delete.txt",
+      relativePath: ".codexplatform/attachments/steer-delete-after-failure/delete.txt",
+      mimeType: "text/plain",
+      sizeBytes: 6,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    execution.steerTask.mockRejectedValueOnce(new Error("runtime timeout"));
+
+    await expect(
+      service.steerThread(task.id, "user-1", "", [attachment.id, deletable.id]),
+    ).rejects.toThrow("runtime timeout");
+    expect(store.listSteerInputSnapshots(platformTurnId)).toEqual([
+      expect.objectContaining({
+        deliveryStatus: "FAILED",
+        deliveryError: "runtime timeout",
+        deliveredAt: null,
+        failedAt: NOW.toISOString(),
+      }),
+    ]);
+    await service.deleteAttachment(task.id, deletable.id, "user-1");
+    expect(store.getAttachment(deletable.id, task.id, "user-1")).toBeNull();
+
+    await expect(
+      service.steerThread(task.id, "user-1", "", [attachment.id]),
+    ).resolves.toMatchObject({ status: "RUNNING" });
+    expect(
+      store.listSteerInputSnapshots(platformTurnId).map((snapshot) => snapshot.deliveryStatus),
+    ).toEqual(["FAILED", "DELIVERED"]);
   });
 
   test("allows Steer only for RUNNING or WAITING_APPROVAL tasks", async () => {
@@ -299,6 +362,50 @@ describe("LocalPlatformService", () => {
     expect(store.getTaskForUser(draft.id, "user-1")).toBeNull();
 
     await expect(service.runMaintenance(maintenanceAt)).resolves.toBeUndefined();
+  });
+
+  test("keeps a durable cleanup job when file deletion fails and maintenance retries it", async () => {
+    const project = await service.createProject("user-1", { name: "Cleanup retry" });
+    const draft = await service.createDraft("user-1", { projectId: project.id });
+    const attachment = await service.uploadAttachment(draft.id, "user-1", {
+      files: [
+        {
+          name: "notes.txt",
+          relativePath: "notes.txt",
+          mimeType: "text/plain",
+          content: Buffer.from("hello"),
+        },
+      ],
+    });
+    const workspace = join("/tmp/codexplatform-test", "workspaces", draft.id);
+    const privateRoot = join(workspace, ".codexplatform");
+    const backupRoot = join(workspace, ".codexplatform-backup");
+    const escapeRoot = join("/tmp", `codexplatform-cleanup-escape-${draft.id}`);
+    const attachmentRoot = join(privateRoot, "attachments", attachment.id);
+    await rename(privateRoot, backupRoot);
+    await mkdir(escapeRoot, { recursive: true });
+    await symlink(escapeRoot, privateRoot);
+
+    try {
+      await expect(
+        service.deleteAttachment(draft.id, attachment.id, "user-1"),
+      ).resolves.toBeUndefined();
+      expect(store.getAttachment(attachment.id, draft.id, "user-1")).toBeNull();
+      expect(store.listAttachmentCleanupJobs()).toEqual([
+        expect.objectContaining({ attachmentId: attachment.id, status: "FAILED", attempts: 1 }),
+      ]);
+      await access(join(backupRoot, "attachments", attachment.id));
+
+      await unlink(privateRoot);
+      await rename(backupRoot, privateRoot);
+      await service.runMaintenance(NOW);
+
+      await expect(access(attachmentRoot)).rejects.toThrow();
+      expect(store.listAttachmentCleanupJobs()).toEqual([]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+      await rm(escapeRoot, { recursive: true, force: true });
+    }
   });
 
   test("rejects a symlink in the staging ancestry without writing outside the workspace", async () => {

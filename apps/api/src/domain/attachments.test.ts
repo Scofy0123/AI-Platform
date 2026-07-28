@@ -19,6 +19,30 @@ describe("BasicAttachmentScanner", () => {
     });
   });
 
+  test("allows repeated dots inside a filename but rejects a parent-directory path segment", async () => {
+    await expect(
+      scanner.scan({
+        name: "report..md",
+        relativePath: "reports/report..md",
+        mimeType: "text/markdown",
+        sizeBytes: 4,
+        content: Buffer.from("safe"),
+      }),
+    ).resolves.toEqual({
+      status: "READY",
+      normalizedRelativePath: "reports/report..md",
+    });
+    await expect(
+      scanner.scan({
+        name: "secret.md",
+        relativePath: "reports/../secret.md",
+        mimeType: "text/markdown",
+        sizeBytes: 6,
+        content: Buffer.from("secret"),
+      }),
+    ).resolves.toEqual({ status: "BLOCKED", reason: "Unsafe attachment path" });
+  });
+
   test.each([
     ["../secret.txt", "text/plain", 1, "Unsafe attachment path"],
     ["/etc/passwd", "text/plain", 1, "Unsafe attachment path"],

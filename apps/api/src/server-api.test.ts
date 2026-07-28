@@ -1267,6 +1267,44 @@ describe("CodexPlatform HTTP API", () => {
     );
   });
 
+  test("maps attachment validation errors to 400 and size limits to 413", async () => {
+    const { auth, platform } = services();
+    platform.uploadAttachment
+      .mockRejectedValueOnce(new Error("Attachment root limit exceeded"))
+      .mockRejectedValueOnce(new Error("Attachments exceed the 200 MiB Turn limit"));
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const boundary = "codexplatform-error-boundary";
+    const payload = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="file"; filename="notes.txt"',
+      "Content-Type: text/plain",
+      "",
+      "hello",
+      `--${boundary}--`,
+      "",
+    ].join("\r\n");
+    const upload = () =>
+      app.inject({
+        method: "POST",
+        url: "/api/threads/draft-1/attachments",
+        cookies: { codexplatform_session: "valid-session" },
+        headers: {
+          "x-csrf-token": "valid-csrf",
+          "content-type": `multipart/form-data; boundary=${boundary}`,
+        },
+        payload,
+      });
+
+    const invalid = await upload();
+    const tooLarge = await upload();
+
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json()).toEqual({ error: "Attachment root limit exceeded" });
+    expect(tooLarge.statusCode).toBe(413);
+    expect(tooLarge.json()).toEqual({ error: "Attachments exceed the 200 MiB Turn limit" });
+  });
+
   test("preserves a multipart folder tree as one attachment root", async () => {
     const { auth, platform } = services();
     const app = buildApp({ auth, platform });

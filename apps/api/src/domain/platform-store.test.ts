@@ -240,6 +240,270 @@ describe("SQLitePlatformStore", () => {
     ).toThrow("Invalid Steer input");
   });
 
+  test("tracks Steer delivery and releases failed attachments without marking them delivered", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Steer delivery", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Steer delivery",
+      now: NOW,
+    });
+    const turn = store.createTurn({
+      id: "delivery-turn",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Initial",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    store.setTurnStatus(turn.id, "RUNNING");
+    store.setCurrentTurn(task.id, "runtime-delivery-turn", "RUNNING", NOW);
+    const attachment = store.createAttachment({
+      id: "delivery-attachment",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "retry.txt",
+      relativePath: ".codexplatform/attachments/delivery-attachment/retry.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+
+    store.claimSteerInput({
+      id: "steer-delivery-1",
+      taskId: task.id,
+      turnId: turn.id,
+      ownerId: "user-1",
+      prompt: "",
+      attachmentIds: [attachment.id],
+      now: NOW,
+    });
+    expect(store.listSteerInputSnapshots(turn.id)).toEqual([
+      expect.objectContaining({
+        deliveryStatus: "PENDING",
+        deliveryError: null,
+        deliveredAt: null,
+        failedAt: null,
+      }),
+    ]);
+
+    store.failSteerInputDelivery(
+      "steer-delivery-1",
+      "runtime rejected steer",
+      new Date(NOW.getTime() + 1),
+    );
+    expect(store.listSteerInputSnapshots(turn.id)).toEqual([
+      expect.objectContaining({
+        deliveryStatus: "FAILED",
+        deliveryError: "runtime rejected steer",
+        deliveredAt: null,
+        failedAt: new Date(NOW.getTime() + 1).toISOString(),
+      }),
+    ]);
+    expect(store.getReadyAttachments(task.id, "user-1", [attachment.id])).toEqual([attachment]);
+
+    store.claimSteerInput({
+      id: "steer-delivery-2",
+      taskId: task.id,
+      turnId: turn.id,
+      ownerId: "user-1",
+      prompt: "",
+      attachmentIds: [attachment.id],
+      now: new Date(NOW.getTime() + 2),
+    });
+    store.completeSteerInputDelivery("steer-delivery-2", new Date(NOW.getTime() + 3));
+    expect(store.listSteerInputSnapshots(turn.id).at(-1)).toEqual(
+      expect.objectContaining({
+        deliveryStatus: "DELIVERED",
+        deliveryError: null,
+        deliveredAt: new Date(NOW.getTime() + 3).toISOString(),
+        failedAt: null,
+      }),
+    );
+    expect(() =>
+      store.completeSteerInputDelivery("steer-delivery-2", new Date(NOW.getTime() + 4)),
+    ).toThrow("Steer input is not pending");
+  });
+
+  test("excludes attachments claimed by prior inputs from new Composer upload quotas", () => {
+    const project = store.createProject({
+      ownerId: "user-1",
+      name: "Current input quotas",
+      now: NOW,
+    });
+    const rootsTask = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Roots",
+      now: NOW,
+    });
+    const rootIds = Array.from({ length: 32 }, (_, index) => `claimed-root-${index}`);
+    for (const id of rootIds) {
+      store.createAttachment({
+        id,
+        threadId: rootsTask.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: `${id}.txt`,
+        relativePath: `.codexplatform/attachments/${id}/${id}.txt`,
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      });
+    }
+    store.createTurn({
+      id: "claimed-roots-turn",
+      taskId: rootsTask.id,
+      ownerId: "user-1",
+      prompt: "",
+      status: "ALLOCATING",
+      attachmentIds: rootIds,
+      now: NOW,
+    });
+    expect(
+      store.createAttachment({
+        id: "new-composer-root",
+        threadId: rootsTask.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: "new.txt",
+        relativePath: ".codexplatform/attachments/new-composer-root/new.txt",
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      }),
+    ).toMatchObject({ id: "new-composer-root" });
+
+    const bytesTask = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Bytes",
+      now: NOW,
+    });
+    const byteIds = Array.from({ length: 4 }, (_, index) => `claimed-bytes-${index}`);
+    for (const id of byteIds) {
+      store.createAttachment({
+        id,
+        threadId: bytesTask.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: `${id}.bin`,
+        relativePath: `.codexplatform/attachments/${id}/${id}.bin`,
+        mimeType: "application/octet-stream",
+        sizeBytes: 50 * 1024 * 1024,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      });
+    }
+    store.createTurn({
+      id: "claimed-bytes-turn",
+      taskId: bytesTask.id,
+      ownerId: "user-1",
+      prompt: "",
+      status: "ALLOCATING",
+      attachmentIds: byteIds,
+      now: NOW,
+    });
+    expect(
+      store.createAttachment({
+        id: "new-composer-bytes",
+        threadId: bytesTask.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: "new.bin",
+        relativePath: ".codexplatform/attachments/new-composer-bytes/new.bin",
+        mimeType: "application/octet-stream",
+        sizeBytes: 50 * 1024 * 1024,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      }),
+    ).toMatchObject({ id: "new-composer-bytes" });
+  });
+
+  test("persists cleanup jobs before Draft expiry, Draft deletion, or attachment deletion", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Cleanup outbox", now: NOW });
+    const deletedDraft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+    const expiredDraft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() - 1),
+    });
+    const activeTask = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Delete attachment",
+      now: NOW,
+    });
+    for (const [id, threadId] of [
+      ["cleanup-delete-draft", deletedDraft.id],
+      ["cleanup-expire-draft", expiredDraft.id],
+      ["cleanup-delete-attachment", activeTask.id],
+    ] as const) {
+      store.createAttachment({
+        id,
+        threadId,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: `${id}.txt`,
+        relativePath: `.codexplatform/attachments/${id}/${id}.txt`,
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      });
+    }
+
+    store.deleteDraft(deletedDraft.id, "user-1", NOW);
+    store.expireDrafts(NOW);
+    store.deleteAttachment("cleanup-delete-attachment", activeTask.id, "user-1", NOW);
+
+    expect(store.listAttachmentCleanupJobs()).toEqual([
+      expect.objectContaining({
+        threadId: deletedDraft.id,
+        attachmentId: "cleanup-delete-draft",
+        relativePath: ".codexplatform/attachments/cleanup-delete-draft/cleanup-delete-draft.txt",
+        status: "PENDING",
+        attempts: 0,
+      }),
+      expect.objectContaining({
+        threadId: expiredDraft.id,
+        attachmentId: "cleanup-expire-draft",
+        relativePath: ".codexplatform/attachments/cleanup-expire-draft/cleanup-expire-draft.txt",
+        status: "PENDING",
+        attempts: 0,
+      }),
+      expect.objectContaining({
+        threadId: activeTask.id,
+        attachmentId: "cleanup-delete-attachment",
+        relativePath:
+          ".codexplatform/attachments/cleanup-delete-attachment/cleanup-delete-attachment.txt",
+        status: "PENDING",
+        attempts: 0,
+      }),
+    ]);
+    const first = store.listAttachmentCleanupJobs()[0];
+    if (!first) throw new Error("Expected a cleanup job");
+    store.completeAttachmentCleanupJob(first.id);
+    store.completeAttachmentCleanupJob(first.id);
+    expect(store.listAttachmentCleanupJobs()).toHaveLength(2);
+  });
+
   test("enforces attachment root, aggregate-size, and folder-file limits", () => {
     const project = store.createProject({ ownerId: "user-1", name: "Limits", now: NOW });
     const thread = store.createTask({

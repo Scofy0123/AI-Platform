@@ -46,6 +46,7 @@ import { listComposerCapabilities as buildComposerCapabilities } from "./compose
 import type { LeasedTurn, SQLiteLeaseStore } from "./lease-store.js";
 import type {
   ApprovalTransportIdentity,
+  AttachmentCleanupJob,
   SQLitePlatformStore,
   TaskRecord,
   TurnRecord,
@@ -428,17 +429,13 @@ export class LocalPlatformService implements PlatformApi {
   }
 
   async deleteDraft(threadId: string, userId: string): Promise<void> {
-    const deleted = this.options.store.deleteDraft(threadId, userId);
-    await this.removeAttachmentRefs(threadId, deleted.attachmentRefs);
+    this.options.store.deleteDraft(threadId, userId, this.now());
+    await this.processAttachmentCleanupJobs(this.now());
   }
 
   async cleanupExpiredDrafts(now = this.now()): Promise<number> {
     const expired = this.options.store.expireDrafts(now);
-    await Promise.all(
-      expired.map(({ threadId, attachmentRefs }) =>
-        this.removeAttachmentRefs(threadId, attachmentRefs),
-      ),
-    );
+    await this.processAttachmentCleanupJobs(now);
     return expired.length;
   }
 
@@ -525,8 +522,8 @@ export class LocalPlatformService implements PlatformApi {
   }
 
   async deleteAttachment(threadId: string, attachmentId: string, userId: string): Promise<void> {
-    const relativePath = this.options.store.deleteAttachment(attachmentId, threadId, userId);
-    await this.removeAttachmentRefs(threadId, [relativePath]);
+    this.options.store.deleteAttachment(attachmentId, threadId, userId, this.now());
+    await this.processAttachmentCleanupJobs(this.now());
   }
 
   async listTasks(userId: string, projectId?: string) {
@@ -782,8 +779,9 @@ export class LocalPlatformService implements PlatformApi {
       task.currentTurnId,
     );
     if (!platformTurnId) throw new Error("Active Turn projection is unavailable");
+    const steerInputId = randomUUID();
     const inputSnapshot = this.options.store.claimSteerInput({
-      id: randomUUID(),
+      id: steerInputId,
       taskId,
       turnId: platformTurnId,
       ownerId: userId,
@@ -796,16 +794,33 @@ export class LocalPlatformService implements PlatformApi {
       path: join(this.options.dataDir, "workspaces", taskId, attachment.relativePath),
       mimeType: attachment.mimeType,
     }));
-    if (attachments.length > 0) {
-      await this.options.execution.steerTask(
-        task.threadId,
-        task.currentTurnId,
-        prompt,
-        attachments,
-      );
-    } else {
-      await this.options.execution.steerTask(task.threadId, task.currentTurnId, prompt);
+    try {
+      if (attachments.length > 0) {
+        await this.options.execution.steerTask(
+          task.threadId,
+          task.currentTurnId,
+          prompt,
+          attachments,
+        );
+      } else {
+        await this.options.execution.steerTask(task.threadId, task.currentTurnId, prompt);
+      }
+    } catch (error) {
+      try {
+        this.options.store.failSteerInputDelivery(
+          steerInputId,
+          error instanceof Error ? error.message : "Runtime Steer failed",
+          this.now(),
+        );
+      } catch (compensationError) {
+        throw new AggregateError(
+          [error, compensationError],
+          "Runtime Steer failed and attachment compensation failed",
+        );
+      }
+      throw error;
     }
+    this.options.store.completeSteerInputDelivery(steerInputId, this.now());
     const event = this.options.store.appendTaskEvent({
       taskId,
       threadId: task.threadId,
@@ -1381,22 +1396,30 @@ export class LocalPlatformService implements PlatformApi {
     };
   }
 
-  private async removeAttachmentRefs(threadId: string, refs: string[]): Promise<void> {
-    const attachmentIds = new Set(
-      refs.map((reference) => {
-        const segments = reference.split("/");
-        const attachmentId = segments[2];
-        if (segments[0] !== ".codexplatform" || segments[1] !== "attachments" || !attachmentId) {
-          throw new Error("Invalid attachment staging reference");
-        }
-        return attachmentId;
-      }),
-    );
-    await Promise.all(
-      [...attachmentIds].map((attachmentId) =>
-        removeSafeAttachmentRoot(this.options.dataDir, threadId, attachmentId),
-      ),
-    );
+  private async processAttachmentCleanupJobs(now: Date): Promise<void> {
+    const jobs = this.options.store.listAttachmentCleanupJobs();
+    await Promise.all(jobs.map((job) => this.processAttachmentCleanupJob(job, now)));
+  }
+
+  private async processAttachmentCleanupJob(job: AttachmentCleanupJob, now: Date): Promise<void> {
+    try {
+      const segments = job.relativePath.split("/");
+      if (
+        segments[0] !== ".codexplatform" ||
+        segments[1] !== "attachments" ||
+        segments[2] !== job.attachmentId
+      ) {
+        throw new Error("Invalid attachment staging reference");
+      }
+      await removeSafeAttachmentRoot(this.options.dataDir, job.threadId, job.attachmentId);
+      this.options.store.completeAttachmentCleanupJob(job.id);
+    } catch (error) {
+      this.options.store.failAttachmentCleanupJob(
+        job.id,
+        error instanceof Error ? error.message : "Attachment cleanup failed",
+        now,
+      );
+    }
   }
 
   private requireTask(taskId: string, userId: string) {

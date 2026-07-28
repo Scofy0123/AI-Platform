@@ -176,14 +176,22 @@ describe("migrateDatabase", () => {
     expect(
       database
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('draft_attachments', 'steer_input_snapshots', 'turn_input_snapshots') ORDER BY name",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('attachment_cleanup_jobs', 'draft_attachments', 'steer_input_snapshots', 'turn_input_snapshots') ORDER BY name",
         )
         .all(),
     ).toEqual([
+      { name: "attachment_cleanup_jobs" },
       { name: "draft_attachments" },
       { name: "steer_input_snapshots" },
       { name: "turn_input_snapshots" },
     ]);
+    expect(
+      (database.pragma("table_info(steer_input_snapshots)") as Array<{ name: string }>).map(
+        (column) => column.name,
+      ),
+    ).toEqual(
+      expect.arrayContaining(["delivery_status", "delivery_error", "delivered_at", "failed_at"]),
+    );
   });
 
   test("adds persistent session and Feishu connection state without deleting identities", () => {

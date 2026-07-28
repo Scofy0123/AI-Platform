@@ -212,11 +212,33 @@ CREATE TABLE IF NOT EXISTS steer_input_snapshots (
   turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
   prompt TEXT NOT NULL,
   attachments_json TEXT NOT NULL,
+  delivery_status TEXT NOT NULL DEFAULT 'PENDING'
+    CHECK(delivery_status IN ('PENDING', 'DELIVERED', 'FAILED')),
+  delivery_error TEXT,
+  delivered_at INTEGER,
+  failed_at INTEGER,
   captured_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS steer_input_snapshots_turn_idx
   ON steer_input_snapshots(turn_id, captured_at, id);
+
+CREATE TABLE IF NOT EXISTS attachment_cleanup_jobs (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  attachment_id TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PENDING'
+    CHECK(status IN ('PENDING', 'FAILED')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(thread_id, attachment_id)
+);
+
+CREATE INDEX IF NOT EXISTS attachment_cleanup_jobs_status_idx
+  ON attachment_cleanup_jobs(status, created_at, id);
 
 CREATE TABLE IF NOT EXISTS task_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -400,11 +422,38 @@ export function migrateDatabase(sqlite: Database.Database): void {
       turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
       prompt TEXT NOT NULL,
       attachments_json TEXT NOT NULL,
+      delivery_status TEXT NOT NULL DEFAULT 'PENDING',
+      delivery_error TEXT,
+      delivered_at INTEGER,
+      failed_at INTEGER,
       captured_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS steer_input_snapshots_turn_idx
       ON steer_input_snapshots(turn_id, captured_at, id);
+    CREATE TABLE IF NOT EXISTS attachment_cleanup_jobs (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      attachment_id TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(thread_id, attachment_id)
+    );
+    CREATE INDEX IF NOT EXISTS attachment_cleanup_jobs_status_idx
+      ON attachment_cleanup_jobs(status, created_at, id);
   `);
+  ensureColumn(
+    sqlite,
+    "steer_input_snapshots",
+    "delivery_status",
+    "TEXT NOT NULL DEFAULT 'PENDING'",
+  );
+  ensureColumn(sqlite, "steer_input_snapshots", "delivery_error", "TEXT");
+  ensureColumn(sqlite, "steer_input_snapshots", "delivered_at", "INTEGER");
+  ensureColumn(sqlite, "steer_input_snapshots", "failed_at", "INTEGER");
   ensureColumn(sqlite, "queue_entries", "required_account_id", "TEXT");
   ensureColumn(sqlite, "sessions", "persistent_at", "INTEGER");
   ensureColumn(sqlite, "feishu_credentials", "status", "TEXT NOT NULL DEFAULT 'CONNECTED'");
@@ -542,7 +591,8 @@ function ensureColumn(
     | "tasks"
     | "turns"
     | "sessions"
-    | "feishu_credentials",
+    | "feishu_credentials"
+    | "steer_input_snapshots",
   column:
     | "codex_home"
     | "quota_resets_at"
@@ -556,12 +606,17 @@ function ensureColumn(
     | "persistent_at"
     | "status"
     | "last_refresh_error_code"
-    | "reauth_required_at",
+    | "reauth_required_at"
+    | "delivery_status"
+    | "delivery_error"
+    | "delivered_at"
+    | "failed_at",
   definition:
     | "TEXT"
     | "INTEGER"
     | "TEXT NOT NULL DEFAULT 'CONNECTED'"
-    | "TEXT NOT NULL DEFAULT 'ACTIVE'",
+    | "TEXT NOT NULL DEFAULT 'ACTIVE'"
+    | "TEXT NOT NULL DEFAULT 'PENDING'",
 ): void {
   const columns = sqlite.pragma(`table_info(${table})`) as Array<{ name: string }>;
   if (columns.some((entry) => entry.name === column)) return;

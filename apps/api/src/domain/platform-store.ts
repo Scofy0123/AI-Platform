@@ -42,6 +42,25 @@ export interface ProjectRecord {
   updatedAt: string;
 }
 
+export interface SteerInputSnapshotRecord extends EffectiveTurnInputSnapshot {
+  deliveryStatus: "PENDING" | "DELIVERED" | "FAILED";
+  deliveryError: string | null;
+  deliveredAt: string | null;
+  failedAt: string | null;
+}
+
+export interface AttachmentCleanupJob {
+  id: string;
+  threadId: string;
+  attachmentId: string;
+  relativePath: string;
+  status: "PENDING" | "FAILED";
+  attempts: number;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface TaskRecord {
   id: string;
   projectId: string;
@@ -397,15 +416,16 @@ export class SQLitePlatformStore {
     return this.getTaskForUser(threadId, ownerId) as TaskRecord;
   }
 
-  deleteDraft(threadId: string, ownerId: string): { attachmentRefs: string[] } {
+  deleteDraft(threadId: string, ownerId: string, now = new Date()): { attachmentRefs: string[] } {
     return this.immediateTransaction(() => {
       const draft = this.sqlite
         .prepare("SELECT id FROM tasks WHERE id = ? AND owner_id = ? AND lifecycle_state = 'DRAFT'")
         .get(threadId, ownerId);
       if (!draft) throw new Error("Thread not found");
-      const attachmentRefs = this.attachmentRefs(threadId);
+      const attachments = this.attachmentRefs(threadId);
+      this.enqueueAttachmentCleanupJobs(threadId, attachments, now);
       this.sqlite.prepare("DELETE FROM tasks WHERE id = ?").run(threadId);
-      return { attachmentRefs };
+      return { attachmentRefs: attachments.map((attachment) => attachment.relativePath) };
     });
   }
 
@@ -417,10 +437,14 @@ export class SQLitePlatformStore {
            WHERE lifecycle_state = 'DRAFT' AND draft_expires_at IS NOT NULL AND draft_expires_at <= ?`,
         )
         .all(now.getTime()) as Array<{ id: string }>;
-      const expired = rows.map(({ id }) => ({
-        threadId: id,
-        attachmentRefs: this.attachmentRefs(id),
-      }));
+      const expired = rows.map(({ id }) => {
+        const attachments = this.attachmentRefs(id);
+        this.enqueueAttachmentCleanupJobs(id, attachments, now);
+        return {
+          threadId: id,
+          attachmentRefs: attachments.map((attachment) => attachment.relativePath),
+        };
+      });
       for (const { id } of rows) {
         this.sqlite.prepare("UPDATE tasks SET lifecycle_state = 'EXPIRED' WHERE id = ?").run(id);
         this.sqlite.prepare("DELETE FROM tasks WHERE id = ?").run(id);
@@ -454,7 +478,7 @@ export class SQLitePlatformStore {
       const aggregate = this.sqlite
         .prepare(
           `SELECT COUNT(*) AS roots, COALESCE(SUM(size_bytes), 0) AS bytes
-           FROM draft_attachments WHERE task_id = ?`,
+           FROM draft_attachments WHERE task_id = ? AND claimed_turn_id IS NULL`,
         )
         .get(input.threadId) as { roots: number; bytes: number };
       if (aggregate.roots >= MAX_ATTACHMENT_ROOTS)
@@ -519,7 +543,12 @@ export class SQLitePlatformStore {
     });
   }
 
-  deleteAttachment(attachmentId: string, threadId: string, ownerId: string): string {
+  deleteAttachment(
+    attachmentId: string,
+    threadId: string,
+    ownerId: string,
+    now = new Date(),
+  ): string {
     return this.immediateTransaction(() => {
       const row = this.sqlite
         .prepare(
@@ -531,6 +560,11 @@ export class SQLitePlatformStore {
         | undefined;
       if (!row) throw new Error("Attachment not found");
       if (row.claimed_turn_id) throw new Error("Attachment is already claimed by a Turn");
+      this.enqueueAttachmentCleanupJobs(
+        threadId,
+        [{ id: attachmentId, relativePath: row.relative_path }],
+        now,
+      );
       this.sqlite.prepare("DELETE FROM draft_attachments WHERE id = ?").run(attachmentId);
       return row.relative_path;
     });
@@ -784,8 +818,8 @@ export class SQLitePlatformStore {
       this.sqlite
         .prepare(
           `INSERT INTO steer_input_snapshots (
-            id, turn_id, prompt, attachments_json, captured_at
-           ) VALUES (?, ?, ?, ?, ?)`,
+            id, turn_id, prompt, attachments_json, delivery_status, captured_at
+           ) VALUES (?, ?, ?, ?, 'PENDING', ?)`,
         )
         .run(
           input.id,
@@ -814,24 +848,125 @@ export class SQLitePlatformStore {
     });
   }
 
-  listSteerInputSnapshots(turnId: string): EffectiveTurnInputSnapshot[] {
+  completeSteerInputDelivery(id: string, now: Date): void {
+    const result = this.sqlite
+      .prepare(
+        `UPDATE steer_input_snapshots
+         SET delivery_status = 'DELIVERED', delivery_error = NULL,
+             delivered_at = ?, failed_at = NULL
+         WHERE id = ? AND delivery_status = 'PENDING'`,
+      )
+      .run(now.getTime(), id);
+    if (result.changes !== 1) throw new Error("Steer input is not pending");
+  }
+
+  failSteerInputDelivery(id: string, error: string, now: Date): void {
+    this.immediateTransaction(() => {
+      const row = this.sqlite
+        .prepare(
+          `SELECT turn_id, attachments_json FROM steer_input_snapshots
+           WHERE id = ? AND delivery_status = 'PENDING'`,
+        )
+        .get(id) as { turn_id: string; attachments_json: string } | undefined;
+      if (!row) throw new Error("Steer input is not pending");
+      const attachments = EffectiveTurnInputSnapshotSchema.parse({
+        prompt: "",
+        attachments: JSON.parse(row.attachments_json),
+        capturedAt: now.toISOString(),
+      }).attachments;
+      this.sqlite
+        .prepare(
+          `UPDATE steer_input_snapshots
+           SET delivery_status = 'FAILED', delivery_error = ?,
+               delivered_at = NULL, failed_at = ?
+           WHERE id = ?`,
+        )
+        .run(error, now.getTime(), id);
+      if (attachments.length > 0) {
+        this.sqlite
+          .prepare(
+            `UPDATE draft_attachments SET claimed_turn_id = NULL, updated_at = ?
+             WHERE claimed_turn_id = ?
+               AND id IN (${attachments.map(() => "?").join(",")})`,
+          )
+          .run(now.getTime(), row.turn_id, ...attachments.map((attachment) => attachment.id));
+      }
+    });
+  }
+
+  listSteerInputSnapshots(turnId: string): SteerInputSnapshotRecord[] {
     const rows = this.sqlite
       .prepare(
-        `SELECT prompt, attachments_json, captured_at
-         FROM steer_input_snapshots WHERE turn_id = ? ORDER BY captured_at, id`,
+        `SELECT prompt, attachments_json, delivery_status, delivery_error,
+                delivered_at, failed_at, captured_at
+         FROM steer_input_snapshots WHERE turn_id = ? ORDER BY captured_at, rowid`,
       )
       .all(turnId) as Array<{
       prompt: string;
       attachments_json: string;
+      delivery_status: "PENDING" | "DELIVERED" | "FAILED";
+      delivery_error: string | null;
+      delivered_at: number | null;
+      failed_at: number | null;
       captured_at: number;
     }>;
-    return rows.map((row) =>
-      EffectiveTurnInputSnapshotSchema.parse({
+    return rows.map((row) => ({
+      ...EffectiveTurnInputSnapshotSchema.parse({
         prompt: row.prompt,
         attachments: JSON.parse(row.attachments_json),
         capturedAt: new Date(row.captured_at).toISOString(),
       }),
-    );
+      deliveryStatus: row.delivery_status,
+      deliveryError: row.delivery_error,
+      deliveredAt: row.delivered_at === null ? null : new Date(row.delivered_at).toISOString(),
+      failedAt: row.failed_at === null ? null : new Date(row.failed_at).toISOString(),
+    }));
+  }
+
+  listAttachmentCleanupJobs(limit = 100): AttachmentCleanupJob[] {
+    const rows = this.sqlite
+      .prepare(
+        `SELECT * FROM attachment_cleanup_jobs
+         WHERE status IN ('PENDING', 'FAILED')
+         ORDER BY created_at, rowid
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{
+      id: string;
+      thread_id: string;
+      attachment_id: string;
+      relative_path: string;
+      status: "PENDING" | "FAILED";
+      attempts: number;
+      last_error: string | null;
+      created_at: number;
+      updated_at: number;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      threadId: row.thread_id,
+      attachmentId: row.attachment_id,
+      relativePath: row.relative_path,
+      status: row.status,
+      attempts: row.attempts,
+      lastError: row.last_error,
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+    }));
+  }
+
+  completeAttachmentCleanupJob(id: string): void {
+    this.sqlite.prepare("DELETE FROM attachment_cleanup_jobs WHERE id = ?").run(id);
+  }
+
+  failAttachmentCleanupJob(id: string, error: string, now: Date): void {
+    this.sqlite
+      .prepare(
+        `UPDATE attachment_cleanup_jobs
+         SET status = 'FAILED', attempts = attempts + 1, last_error = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(error, now.getTime(), id);
   }
 
   getLatestTurnPrompt(taskId: string, ownerId: string): string | null {
@@ -2149,12 +2284,36 @@ export class SQLitePlatformStore {
     return row ? mapProject(row) : null;
   }
 
-  private attachmentRefs(taskId: string): string[] {
+  private attachmentRefs(taskId: string): Array<{ id: string; relativePath: string }> {
     return (
       this.sqlite
-        .prepare("SELECT relative_path FROM draft_attachments WHERE task_id = ?")
-        .all(taskId) as Array<{ relative_path: string }>
-    ).map((row) => row.relative_path);
+        .prepare("SELECT id, relative_path FROM draft_attachments WHERE task_id = ?")
+        .all(taskId) as Array<{ id: string; relative_path: string }>
+    ).map((row) => ({ id: row.id, relativePath: row.relative_path }));
+  }
+
+  private enqueueAttachmentCleanupJobs(
+    threadId: string,
+    attachments: Array<{ id: string; relativePath: string }>,
+    now: Date,
+  ): void {
+    const statement = this.sqlite.prepare(
+      `INSERT INTO attachment_cleanup_jobs (
+        id, thread_id, attachment_id, relative_path, status,
+        attempts, last_error, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, 'PENDING', 0, NULL, ?, ?)
+       ON CONFLICT(thread_id, attachment_id) DO NOTHING`,
+    );
+    for (const attachment of attachments) {
+      statement.run(
+        randomUUID(),
+        threadId,
+        attachment.id,
+        attachment.relativePath,
+        now.getTime(),
+        now.getTime(),
+      );
+    }
   }
 
   private getTaskRow(taskId: string): TaskRow {

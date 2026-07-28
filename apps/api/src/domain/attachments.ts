@@ -113,6 +113,7 @@ export function normalizeAttachmentPath(value: string): string | null {
   ) {
     return null;
   }
+  if (value.split("/").includes("..")) return null;
   const normalized = posix.normalize(value);
   if (
     normalized === "." ||

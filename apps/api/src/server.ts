@@ -322,7 +322,7 @@ function registerRoutes(
       );
       aggregateBytes += content.byteLength;
       if (file.file.truncated) {
-        return reply.code(400).send({ error: "Attachment exceeds the 50 MiB file limit" });
+        return reply.code(413).send({ error: "Attachment exceeds the 50 MiB file limit" });
       }
       files.push({
         name: file.filename.split("/").at(-1) ?? file.filename,
@@ -1090,7 +1090,7 @@ function objectValue(value: unknown): Record<string, unknown> {
 
 function classifyKnownError(
   message: string,
-): { statusCode: 400 | 403 | 404 | 409; message: string } | null {
+): { statusCode: 400 | 403 | 404 | 409 | 413; message: string } | null {
   if (/not found$/i.test(message)) return { statusCode: 404, message };
   if (/^OAuth (?:state|browser binding)\b/i.test(message)) {
     return { statusCode: 400, message };
@@ -1100,11 +1100,18 @@ function classifyKnownError(
   }
   if (/cannot be archived$/i.test(message)) return { statusCode: 409, message };
   if (/^Thread is archived$/i.test(message)) return { statusCode: 409, message };
-  if (/^Attachments exceed\b/i.test(message)) return { statusCode: 400, message };
+  if (/^Attachments? exceed\b/i.test(message)) return { statusCode: 413, message };
   if (/credential isolation|real codex multi-user execution is disabled/i.test(message)) {
     return { statusCode: 403, message };
   }
   if (/^(?:invalid|missing|unknown|unsupported)\b/i.test(message)) {
+    return { statusCode: 400, message };
+  }
+  if (
+    /^(?:Attachment root limit|Folder exceeds|Duplicate attachment path|Unsafe attachment|Executable attachment content|Attachment size does not match)/i.test(
+      message,
+    )
+  ) {
     return { statusCode: 400, message };
   }
   return null;
