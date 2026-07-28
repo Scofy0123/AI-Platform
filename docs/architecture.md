@@ -34,7 +34,7 @@ flowchart LR
 
 | 模块 | 1.1A 当前职责 |
 | --- | --- |
-| `apps/web` | 飞书登录、CODEX-only 用户工作区、连续 Thread、Settings、Subagents 可观测面、独立管理后台 |
+| `apps/web` | 飞书登录、CODEX-only 用户工作区、Transcript 投影、三个独立工作表面、模型/Effort 选择、Settings、Subagents 可观测面、独立管理后台 |
 | `apps/api/src/auth` | 飞书 OAuth、租户校验、用户/Session、Token 刷新 |
 | `apps/api/src/domain` | Project/Thread/Turn/Item 投影、用户设置、审批、账号状态、租约、排队、用量与审计 |
 | `apps/api/src/infra/codex` | JSONL RPC、账号级 App Server、协议类型、Thread/Turn/Item/Subagent 事件规范化 |
@@ -51,12 +51,15 @@ flowchart TB
     Login["飞书 OAuth"] --> Role{"角色"}
     Role -->|"MEMBER / ADMIN"| Workspace["用户端\nNew chat / Projects / Threads\nSettings / Archived"]
     Role -->|"ADMIN"| Console["管理后台\nAccounts / Policies / Connectors\nUsage / Audit / Runtime health"]
-    Workspace --> Thread["Codex 三栏工作区\nConversation + Composer\nPlan / Outputs / Subagents / Sources"]
-    Thread --> Inspector["按需详情\nTerminal / Changes / Files / Tool details"]
+    Workspace --> Thread["Codex 连续工作区\nTranscript + Composer"]
+    Thread --> Pinned["Pinned Summary\n浮层，不改变正文宽度"]
+    Thread --> Side["Side Panel\nPlan / Outputs / Subagents / Sources\nTool 与 Diff/文件详情\n打开时压缩正文"]
+    Thread --> Bottom["Bottom Panel\n仅 Terminal\n与 Side 可同时打开"]
 ```
 
 - 普通用户只能访问自己的 Project、Thread、Turn、Item、审批、Settings 和企业连接状态。
 - 管理员可以从用户端进入独立管理后台，但管理页面不嵌入个人 Settings。
+- Pinned Summary、Side Panel、Bottom Panel 使用独立状态；关闭任意一个不会连带关闭另外两个。它们不是同一个 Panel 的三种展示形态。
 - 1.1A 的 Users/Roles 目录、生产 Worker 管理和完整插件目录尚未接入，页面会明确显示不可用。
 - `GET /api/bootstrap` 当前只返回 `enabledModes: ["CODEX"]`；ChatGPT Chat / Work 没有 Runtime，因此不显示入口。
 
@@ -114,11 +117,12 @@ Settings 归属于飞书用户，不写入共享 Codex 账号目录。当前实�
 
 - General：语言、主题、默认 Project、通知均可持久化；只有默认 Project 已接入 New chat 流程，语言、主题和通知尚未全局生效。
 - Profile：飞书身份与角色只读展示。
-- Execution：Reasoning Effort、权限模式和固定为 `ASK` 的审批偏好进入有效配置；模型目录未接入，因此模型选择保持禁用。
+- Execution：模型、Reasoning Effort、权限模式和固定为 `ASK` 的审批偏好进入有效配置；模型与 Effort 只能从当前 Runtime 模型目录选择。
 - Personalization：Personality 和个人 Instructions 会进入有效配置。
 - Connections 与 Usage：只读用户视图。
 - Plugins：返回管理员批准目录的接口已保留，1.1A 目录为空且不允许安装。
-- Archived chats：仅保留导航与空状态，归档数据流尚未实现。
+- Archived chats：已支持 Thread 归档、归档列表、查看和恢复；归档只整理 CodexPlatform 历史，
+  不修改 Codex App Server Thread。
 
 1.1A 当前生效配置按以下顺序合并：
 
@@ -132,6 +136,35 @@ Settings 归属于飞书用户，不写入共享 Codex 账号目录。当前实�
 ```
 
 任何覆盖都不能突破组织策略。每个 Turn 保存不可变快照，后续修改个人 Settings 不会改写历史。Project 级执行设置和完整组织策略编辑是后续能力，当前不宣称已经生效。
+
+### Runtime 模型目录与 Effort 联动
+
+模型能力由运行账号的 App Server 返回，不在 Web 端维护静态模型常量：
+
+```mermaid
+sequenceDiagram
+    participant Web as Composer / Execution Settings
+    participant API as Platform API
+    participant Scheduler as Account Scheduler
+    participant Runtime as Codex Runtime
+    participant Store as SQLite
+
+    Web->>API: GET /api/models?threadId=...
+    API->>Scheduler: 新 Thread 取可调度账号交集\n已有 Thread 取绑定账号
+    Scheduler->>Runtime: model/list
+    Runtime-->>API: ModelOption + supportedReasoningEfforts
+    API-->>Web: 脱敏 ModelCatalog
+    Web->>Web: 切换模型时重置为该模型 default Effort
+    Web->>API: POST Turn { model, reasoningEffort }
+    API->>API: 再按账号目录校验模型与 Effort
+    API->>Store: 保存 EffectiveThreadConfigSnapshot
+```
+
+- 新 Thread 使用所有当前可调度账号模型能力的安全交集，避免先选模型后调度到不支持的账号。
+- 已绑定 Thread 只读取原账号目录，保持账号粘性。
+- 切换模型时 Effort 自动回到新模型的默认值；用户只能再选择该模型明确支持的 Effort。
+- 模型目录不可用、过期且刷新失败、账号被隔离或选择不再受支持时，提交 fail closed，不猜测模型名或沿用不兼容 Effort。
+- Turn 的 `model`、`effort` 与完整有效配置快照共同持久化；UI 文案不是执行生效证据。
 
 ## 身份、共享账号与 Tool 权限
 
@@ -165,6 +198,13 @@ sequenceDiagram
 
 ## 调度、账号粘性与排队
 
+运行模式边界：
+
+- **1.1A Fake**：允许多人调度、四用户槽、双 Turn 和 FIFO 的确定性模拟。
+- **1.1A Real**：共享账号 Runtime 仅允许指定 operator；多人真实执行仍被门禁拒绝。
+- **1.1B Real**：取得书面许可并通过独立 Worker、独立 `CODEX_HOME`、Credential Broker 和跨
+  用户哨兵后，才启用真实多人调度。
+
 账号预选不占槽；提交 Turn 时才在 SQLite `BEGIN IMMEDIATE` 事务中获取资源：
 
 - 每个账号最多 4 个不同用户槽。
@@ -190,10 +230,16 @@ sequenceDiagram
 - `@openai/codex@0.144.6`
 - `app-server --stdio --strict-config`
 - `cli_auth_credentials_store="file"`
+- 平台到 App Server 使用 stdio JSONL；App Server 到 OpenAI 使用内部
+  `codexplatform_openai_https` Provider，复用 ChatGPT 登录认证并设置
+  `supports_websockets=false`，避免当前网络先等待 Responses WebSocket 超时后才回退 HTTPS；Provider
+  ID 保持平台隔离，但名称保持官方 `OpenAI`，保留 Codex 的 OpenAI 专属远端压缩判定
 - `approvalPolicy: on-request`
 - `sandbox: workspace-write`
 
 使用 `thread/start/resume` 和 `turn/start/steer/interrupt`。协议类型锁定在仓库中，通过 `pnpm codex:verify-protocol` 检查漂移。
+HTTPS-only Provider 是当前固定 Codex 版本下的显式传输适配，不改变模型、账号或额度身份；Codex
+未来提供正式 transport 配置后再替换，替换前仍须通过模型目录、认证、额度和真实 Turn 合约回归。
 
 ### active Turn fail closed
 
@@ -232,8 +278,44 @@ Item 先写入 SQLite，再通过 `/api/threads/:id/events` 推送。断线后�
 - SSE 在 Session 到期/撤销时关闭，所有历史与实时读取都执行 owner ACL。
 - 用户端 Thread、旧 Task 兼容响应和实时 SSE 会移除账号别名、租约、transport identity、原始审批 RPC ID 和 Runtime Turn ID 等敏感运行标识；Subagent Thread ID 与部分 Item ID 仍作为受 owner ACL 保护的工作流关联标识返回。
 - `reasoning.summary` 可作为“执行思路”显示，但不属于审计证据。
-- `reasoningTextDelta`、原始 `content`、`encrypted_content`、凭证、租约 ID 和原始审批 RPC ID 不会进入用户浏览器。
-- 管理员审计可保留账号别名以支持责任追踪，但仍不返回凭证或 `CODEX_HOME`。
+- 服务端在事件写入、Thread REST 投影、历史 SSE 重放和实时 SSE 发送四个边界递归剥离
+  `reasoningTextDelta`、原始 `content` 与 `encrypted_content`；前端过滤只作纵深防御。
+- 账号 Runtime 目录、真实 `CODEX_HOME`、凭证、租约 ID 和原始审批 RPC ID 不进入用户持久化
+  Item、REST、SSE 或 DOM；历史数据在读取边界也要再次脱敏。
+- 管理员审计可保留账号别名以支持责任追踪，但仍不返回凭证或真实 Runtime / `CODEX_HOME`
+  路径。
+
+### Transcript 与三个工作表面的投影边界
+
+Transcript 不是 App Server 的独立协议对象，也不是把所有流式事件逐条渲染出来的日志。它是
+`Thread / Turn / Item` 的可读投影：
+
+```mermaid
+flowchart LR
+    Items["持久化 Item 流"] --> Guard["敏感字段与 raw reasoning 过滤"]
+    Guard --> Merge["按 threadId + turnId + itemId 合并"]
+    Merge --> Transcript["Transcript\n用户/Agent 消息\n执行思路摘要\nPlan 与活动摘要"]
+    Merge --> Pinned["Pinned Summary\n当前或最近 Turn 摘要"]
+    Merge --> Side["Side Panel\nPlan / Outputs / Subagents / Sources\nTool 与 Diff/文件详情"]
+    Merge --> Bottom["Bottom Panel\n仅 Terminal"]
+```
+
+投影规则：
+
+- Transcript 保留连续对话语义；命令、Tool、Diff、Subagent 只显示一行可操作摘要，不展示原始事件类型。
+- `COMMAND_OUTPUT` 和 `COMMAND_COMPLETED.aggregatedOutput` 只进入 Bottom Panel 的 Terminal；Transcript
+  的命令行只显示命令、状态和耗时。Terminal 按命令 Item 分块，禁止把多条命令拼成一段无边界日志。
+- Tool 活动行打开 Side Panel 的 Tool details；Diff/文件活动行打开 Side Panel 的 Changes 详情。Bottom Panel 不承载 Changes、Files 或 Tool details。
+- Pinned Summary 使用 `displayTurn = activeTurn ?? latestTurn`，不累计其他历史 Turn 的 Plan、
+  Output、Source 或 Subagent。
+- Outputs 只收录有稳定 `artifactId` 或 HTTPS locator 的真实产物；`artifactId` 在 1.1A 仅作为
+  元数据，缺少鉴权下载路由时不生成链接。Agent 消息、Diff 摘要和绝对文件路径不能伪装成
+  Output。
+- Sources 只收录 HTTPS URL 或经过路径清洗的 citation 元数据；Tool 名称本身不能伪装成 Source，
+  `file:`、`javascript:`、`data:` 与本机绝对路径全部拒绝。
+- 用户消息、Agent 正文和推理摘要通过同一个安全 Markdown 渲染器显示；禁用原始 HTML、危险 URI
+  和远程 Markdown 图片，避免把模型文本变成脚本或跟踪请求。
+- raw reasoning canary 在浏览器投影之前即被过滤；Web 不接收后再隐藏。可展示的 `reasoning.summary` 以“执行思路”出现，仍不作为审计证据。
 
 ## 1.1B 演进
 

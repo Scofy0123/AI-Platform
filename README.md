@@ -95,13 +95,13 @@ pnpm dev
 
    ```dotenv
    RUNTIME_MODE=real
-   DATABASE_PATH=../../.data/real-codexplatform.sqlite
-   RUNTIME_DATA_DIR=../../.data/real-runtime
+   DATABASE_PATH=/absolute/path/to/codexplatform/.data/real-codexplatform.sqlite
+   RUNTIME_DATA_DIR=/absolute/path/to/codexplatform/.data/real-runtime
    ```
 
-   并确认 `CODEX_BIN` 指向仓库锁定的 `node_modules/.bin/codex`。数据库与运行目录通过双向绑定标记组成同一存储环境；缺失、复制或混用时服务会 fail closed。
+   真实模式强制要求这两个值是绝对路径，防止切换 worktree 时意外连接新空数据库。并确认 `CODEX_BIN` 指向仓库锁定的 `node_modules/.bin/codex`。数据库与运行目录通过双向绑定标记组成同一存储环境；缺失、复制或混用时服务会 fail closed。
 3. 重新执行 `pnpm dev`。服务启动时会自动运行凭证隔离探针。
-4. 新数据库没有旧 Session，需要重新完成飞书 OAuth。
+4. 复用同一数据库时，30 天可信设备 Session 会保留；只有新数据库、Session 到期或主动退出时才需要重新完成飞书 OAuth。
 5. 首位管理员进入管理后台的 Accounts 页面，对预置 `Codex A` 点击“重新认证”，亲自在浏览器完成 ChatGPT/Codex 登录。
 6. 确认认证状态和周额度后，由首位管理员提交一个无外部写操作的小任务。
 

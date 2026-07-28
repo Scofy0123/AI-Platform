@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 export type RuntimeMode = "fake" | "real";
 export type LoopbackHost = "127.0.0.1" | "localhost" | "::1";
@@ -53,6 +53,11 @@ export function loadConfig(
   const host = parseHost(env.HOST);
   const port = parsePort(env.PORT);
   const runtimeMode = parseRuntimeMode(env.RUNTIME_MODE);
+  const databasePath = optionalText(env.DATABASE_PATH) ?? ".data/codexplatform.sqlite";
+  const runtimeDataDir = optionalText(env.RUNTIME_DATA_DIR) ?? ".data/runtime";
+  if (runtimeMode === "real" && (!isAbsolute(databasePath) || !isAbsolute(runtimeDataDir))) {
+    throw new ConfigurationError("real runtime storage paths must be absolute");
+  }
   const appId = requiredText(env.FEISHU_APP_ID, "FEISHU_APP_ID");
   const appSecret = requiredText(env.FEISHU_APP_SECRET, "FEISHU_APP_SECRET");
   const tenantKey = requiredText(env.FEISHU_TENANT_KEY, "FEISHU_TENANT_KEY");
@@ -66,14 +71,8 @@ export function loadConfig(
   return {
     server: { host, port, webOrigin },
     storage: {
-      databasePath: resolvePath(
-        workingDirectory,
-        optionalText(env.DATABASE_PATH) ?? ".data/codexplatform.sqlite",
-      ),
-      runtimeDataDir: resolvePath(
-        workingDirectory,
-        optionalText(env.RUNTIME_DATA_DIR) ?? ".data/runtime",
-      ),
+      databasePath: resolvePath(workingDirectory, databasePath),
+      runtimeDataDir: resolvePath(workingDirectory, runtimeDataDir),
     },
     runtime: {
       mode: runtimeMode,
@@ -160,10 +159,10 @@ function parseOAuthCallback(value: string): string {
 }
 
 function parseLoopbackOrigin(value: string): string {
-  const message = "WEB_ORIGIN must be a loopback HTTP origin";
+  const message = "WEB_ORIGIN must be a loopback HTTP or HTTPS origin";
   const url = parseUrl(value, message);
   if (
-    url.protocol !== "http:" ||
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
     !isLoopbackHostname(url.hostname) ||
     url.pathname !== "/" ||
     url.username !== "" ||

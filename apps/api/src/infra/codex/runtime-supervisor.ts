@@ -168,7 +168,25 @@ export class CodexRuntimeSupervisor extends EventEmitter {
 
     const child = this.spawnProcess(
       this.binaryPath,
-      ["app-server", "--stdio", "--strict-config", "-c", 'cli_auth_credentials_store="file"'],
+      [
+        "app-server",
+        "--stdio",
+        "--strict-config",
+        "-c",
+        'cli_auth_credentials_store="file"',
+        "-c",
+        'model_provider="codexplatform_openai_https"',
+        "-c",
+        'model_providers.codexplatform_openai_https.name="OpenAI"',
+        "-c",
+        'model_providers.codexplatform_openai_https.base_url="https://chatgpt.com/backend-api/codex"',
+        "-c",
+        'model_providers.codexplatform_openai_https.wire_api="responses"',
+        "-c",
+        "model_providers.codexplatform_openai_https.requires_openai_auth=true",
+        "-c",
+        "model_providers.codexplatform_openai_https.supports_websockets=false",
+      ],
       {
         env: environment,
         stdio: ["pipe", "pipe", "pipe"],

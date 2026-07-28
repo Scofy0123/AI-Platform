@@ -65,13 +65,13 @@ codex-cli 0.144.6
 
    ```dotenv
    RUNTIME_MODE=real
-   DATABASE_PATH=../../.data/real-codexplatform.sqlite
-   RUNTIME_DATA_DIR=../../.data/real-runtime
+   DATABASE_PATH=/absolute/path/to/codexplatform/.data/real-codexplatform.sqlite
+   RUNTIME_DATA_DIR=/absolute/path/to/codexplatform/.data/real-runtime
    ```
 
-   数据库与运行目录会通过数据库设置及权限为 `0600` 的 `.codexplatform-binding.json` 双向绑定；任一侧缺失、复制或混用时服务会 fail closed。升级前的本机数据库只在能够明确识别原 runtime mode 时自动收养，无法判断时要求使用新的成对路径。
+   真实模式拒绝相对路径，避免 worktree 改变后静默创建新身份环境。数据库与运行目录会通过数据库设置及权限为 `0600` 的 `.codexplatform-binding.json` 双向绑定；任一侧缺失、复制或混用时服务会 fail closed。升级前的本机数据库只在能够明确识别原 runtime mode 时自动收养，无法判断时要求使用新的成对路径。
 2. 执行 `pnpm dev`，等待 API 日志出现 ready；启动日志会同时记录探针状态。
-3. 新数据库没有旧 Session，重新完成飞书 OAuth。
+3. 复用同一数据库时保留现有 30 天可信设备 Session；新数据库没有旧 Session，需要重新完成飞书 OAuth。
 4. 用首位管理员飞书账号进入独立管理后台的 Accounts 页面：[http://127.0.0.1:5173/admin/accounts](http://127.0.0.1:5173/admin/accounts)。
 5. 预置账号 `Codex A` 初始为 `REAUTH_REQUIRED`。点击“重新认证”。
 6. 浏览器会转到 Codex 返回的 ChatGPT 登录 URL。由管理员亲自完成登录；不要复制 Cookie、Token 或授权 URL 给其他人。
@@ -102,7 +102,9 @@ codex-cli 0.144.6
 - API 和 Web 仅允许 loopback；配置会拒绝公网/LAN host 或 origin。
 - 飞书 access/refresh token 使用 AES-256-GCM 加密后保存，密钥只放在权限为 `0600` 的 `.env.local`。
 - Session token、CSRF token 和 OAuth state 在 SQLite 中只保存哈希。
-- Session Cookie 为 HttpOnly + SameSite Strict；写请求额外校验 CSRF。
+- Session Cookie 为 HttpOnly + SameSite Strict，CSRF Cookie 仅供同源前端读取；两者使用 30 天 `Max-Age`，生产 HTTPS 强制 `Secure`，写请求额外校验 CSRF。
+- 可信设备 Session 是 30 天绝对有效期，不按访问无限滚动；Profile 可主动撤销 Session 并清除 Cookie。
+- 飞书 access token 在距到期不足 10 分钟时按用户单飞刷新；刷新 token 与到期时间原子替换。飞书连接失效只将连接标为 `REAUTH_REQUIRED`，不会注销 CodexPlatform Session。
 - SSE 在 Session 到期时主动关闭，并在心跳时重新校验 Session；被撤销的既有连接不会无限继续接收 Thread 事件。
 - Project、Thread、Turn、Item、Subagent、Settings、事件和审批都按飞书用户 owner 过滤。
 - `threadId + turnId + account connection generation` 精确绑定当前 Actor；已结束、伪造或旧连接上的 Turn 不能重放 Tool。

@@ -1,12 +1,24 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import type { ActorContext, EffectiveThreadConfigSnapshot } from "@codexplatform/contracts";
+import type {
+  ActorContext,
+  EffectiveThreadConfigSnapshot,
+  ModelOption,
+} from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
 import type { TaskEventDraft, TaskExecutionAdapter } from "../../domain/platform-service.js";
 import type { WeeklyQuota } from "./codex-runtime.js";
 
 export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionAdapter {
   private readonly active = new Map<string, { taskId: string; turnId: string }>();
+
+  async listModels(_account: InternalAccount): Promise<ModelOption[]> {
+    return FAKE_MODEL_OPTIONS.map((model) => ({
+      ...model,
+      supportedReasoningEfforts: model.supportedReasoningEfforts.map((effort) => ({ ...effort })),
+      inputModalities: [...model.inputModalities],
+    }));
+  }
 
   async startTask(input: {
     accountId: string;
@@ -120,7 +132,13 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
         threadId,
         turnId,
         type: "COMMAND_COMPLETED",
-        payload: { itemId: item, command: "printf fake-codexplatform", exitCode: 0, durationMs: 2 },
+        payload: {
+          itemId: item,
+          command: "printf fake-codexplatform",
+          aggregatedOutput: "fake-codexplatform\n",
+          exitCode: 0,
+          durationMs: 2,
+        },
       },
       {
         taskId,
@@ -138,7 +156,12 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
         threadId,
         turnId,
         type: "TOOL_COMPLETED",
-        payload: { itemId: `tool-${item}`, tool: "demo_business_get", durationMs: 1 },
+        payload: {
+          itemId: `tool-${item}`,
+          tool: "demo_business_get",
+          result: null,
+          durationMs: 1,
+        },
       },
       {
         taskId,
@@ -158,6 +181,13 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
         taskId,
         threadId,
         turnId,
+        type: "AGENT_MESSAGE_PHASE",
+        payload: { itemId: `message-${item}`, phase: "final_answer" },
+      },
+      {
+        taskId,
+        threadId,
+        turnId,
         type: "TURN_COMPLETED",
         payload: { status: "completed", durationMs: 5 },
       },
@@ -166,3 +196,38 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
     this.active.delete(threadId);
   }
 }
+
+const FAKE_MODEL_OPTIONS = [
+  {
+    id: "fake-codex-standard",
+    model: "fake-codex-standard",
+    displayName: "Fake Standard",
+    description: "Deterministic local model fixture for standard test flows.",
+    hidden: false,
+    isDefault: true,
+    defaultReasoningEffort: "medium",
+    supportedReasoningEfforts: [
+      { value: "low", description: "Fast fixture response." },
+      { value: "medium", description: "Balanced fixture response." },
+      { value: "high", description: "Detailed fixture response." },
+    ],
+    inputModalities: ["text"],
+    supportsPersonality: true,
+  },
+  {
+    id: "fake-codex-deep",
+    model: "fake-codex-deep",
+    displayName: "Fake Deep",
+    description: "Deterministic local model fixture for deeper test flows.",
+    hidden: false,
+    isDefault: false,
+    defaultReasoningEffort: "high",
+    supportedReasoningEfforts: [
+      { value: "medium", description: "Balanced fixture response." },
+      { value: "high", description: "Detailed fixture response." },
+      { value: "xhigh", description: "Maximum-depth fixture response." },
+    ],
+    inputModalities: ["text"],
+    supportsPersonality: true,
+  },
+] as const satisfies readonly ModelOption[];

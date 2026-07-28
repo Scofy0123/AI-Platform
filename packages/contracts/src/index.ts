@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export * from "./composer.js";
+
 export const PLATFORM_VERSION = "0.1.0" as const;
 
 export const TaskStatusSchema = z.enum([
@@ -62,6 +64,73 @@ export const BootstrapSchema = z
   .strict();
 export type Bootstrap = z.infer<typeof BootstrapSchema>;
 
+export const ModelEffortOptionSchema = z
+  .object({
+    value: z.string().trim().min(1),
+    description: z.string(),
+  })
+  .strict();
+export type ModelEffortOption = z.infer<typeof ModelEffortOptionSchema>;
+
+export const ModelOptionSchema = z
+  .object({
+    id: z.string().trim().min(1),
+    model: z.string().trim().min(1),
+    displayName: z.string().trim().min(1),
+    description: z.string(),
+    hidden: z.boolean(),
+    isDefault: z.boolean(),
+    defaultReasoningEffort: z.string().trim().min(1),
+    supportedReasoningEfforts: z.array(ModelEffortOptionSchema).min(1),
+    // App Server owns this vocabulary; strings preserve forward compatibility.
+    inputModalities: z.array(z.string().trim().min(1)),
+    supportsPersonality: z.boolean(),
+  })
+  .strict()
+  .superRefine((model, context) => {
+    const effortValues = model.supportedReasoningEfforts.map((effort) => effort.value);
+    if (!effortValues.includes(model.defaultReasoningEffort)) {
+      context.addIssue({
+        code: "custom",
+        path: ["defaultReasoningEffort"],
+        message: "Default reasoning effort must be supported by the model",
+      });
+    }
+
+    const seenEfforts = new Set<string>();
+    for (const [index, effort] of model.supportedReasoningEfforts.entries()) {
+      if (seenEfforts.has(effort.value)) {
+        context.addIssue({
+          code: "custom",
+          path: ["supportedReasoningEfforts", index, "value"],
+          message: "Reasoning effort values must be unique",
+        });
+      }
+      seenEfforts.add(effort.value);
+    }
+  });
+export type ModelOption = z.infer<typeof ModelOptionSchema>;
+
+export const ModelCatalogSchema = z
+  .object({
+    models: z.array(ModelOptionSchema),
+    scope: z.enum(["SINGLE_ACCOUNT", "ELIGIBLE_ACCOUNT_INTERSECTION"]),
+    accountCount: z.number().int().positive(),
+    observedAt: z.iso.datetime(),
+    stale: z.boolean(),
+  })
+  .strict()
+  .superRefine((catalog, context) => {
+    if (catalog.scope === "SINGLE_ACCOUNT" && catalog.accountCount !== 1) {
+      context.addIssue({
+        code: "custom",
+        path: ["accountCount"],
+        message: "Single-account catalogs must represent exactly one account",
+      });
+    }
+  });
+export type ModelCatalog = z.infer<typeof ModelCatalogSchema>;
+
 export const TASK_EVENT_TYPES = [
   "TURN_STARTED",
   "TURN_COMPLETED",
@@ -69,6 +138,7 @@ export const TASK_EVENT_TYPES = [
   "TURN_INTERRUPTED",
   "USER_MESSAGE",
   "AGENT_MESSAGE_DELTA",
+  "AGENT_MESSAGE_PHASE",
   "REASONING_SUMMARY_DELTA",
   "PLAN_UPDATED",
   "COMMAND_STARTED",
@@ -85,9 +155,23 @@ export const TASK_EVENT_TYPES = [
   "RECOVERY_REQUIRED",
   "SUBAGENT_ACTIVITY",
   "TOKEN_USAGE_UPDATED",
+  "MODEL_REROUTED",
+  "RUNTIME_WARNING",
+  "CONTEXT_COMPACTED",
 ] as const;
 
 export type TaskEventType = (typeof TASK_EVENT_TYPES)[number];
+
+export const AgentMessagePhaseSchema = z.enum(["commentary", "final_answer"]);
+export type AgentMessagePhase = z.infer<typeof AgentMessagePhaseSchema>;
+
+export const RuntimeModelRerouteReasonSchema = z.enum([
+  "SAFETY_POLICY",
+  "AVAILABILITY",
+  "CAPABILITY",
+  "OTHER",
+]);
+export type RuntimeModelRerouteReason = z.infer<typeof RuntimeModelRerouteReasonSchema>;
 
 export const ReasoningPresentationSchema = z
   .object({
@@ -104,7 +188,14 @@ export const EffectiveThreadConfigSnapshotSchema = z
   .object({
     model: z.string().trim().min(1).nullable(),
     reasoningEffort: z.string().min(1),
-    permissionMode: z.enum(["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"]),
+    permissionMode: z.enum([
+      "DEFAULT",
+      "READ_ONLY",
+      "WORKSPACE_WRITE",
+      "ASK_FOR_APPROVAL",
+      "APPROVE_FOR_ME",
+      "FULL_ACCESS",
+    ]),
     approvalMode: z.literal("ASK"),
     personality: z.enum(["NONE", "FRIENDLY", "PRAGMATIC"]),
     instructions: z.string(),
@@ -183,6 +274,7 @@ export const ThreadSchema = z
     title: z.string().min(1),
     status: TaskStatusSchema,
     updatedAt: z.iso.datetime(),
+    archivedAt: z.iso.datetime().nullable(),
     currentTurn: TurnSchema.nullable(),
     turns: z.array(TurnSchema),
     queue: QueueStateSchema.nullable(),
@@ -243,7 +335,13 @@ export const UserExecutionSettingsSchema = z
   .object({
     model: z.string().min(1).nullable(),
     reasoningEffort: z.string().trim().min(1).max(64),
-    permissionMode: z.enum(["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"]),
+    permissionMode: z.enum([
+      "DEFAULT",
+      "READ_ONLY",
+      "WORKSPACE_WRITE",
+      "ASK_FOR_APPROVAL",
+      "APPROVE_FOR_ME",
+    ]),
     approvalPreference: z.literal("ASK"),
   })
   .strict();
@@ -311,6 +409,7 @@ export interface TaskEventPayloadMap {
   TURN_INTERRUPTED: { status: "interrupted" };
   USER_MESSAGE: { itemId: string; kind: "STEER"; text: string };
   AGENT_MESSAGE_DELTA: { itemId: string; delta: string };
+  AGENT_MESSAGE_PHASE: { itemId: string; phase: AgentMessagePhase | null };
   REASONING_SUMMARY_DELTA: { itemId: string; delta: string };
   PLAN_UPDATED: { explanation: string | null; plan: unknown[] };
   COMMAND_STARTED: { itemId: string; command: string; cwd: string };
@@ -318,11 +417,17 @@ export interface TaskEventPayloadMap {
   COMMAND_COMPLETED: {
     itemId: string;
     command: string;
+    aggregatedOutput: string | null;
     exitCode: number | null;
     durationMs: number | null;
   };
   TOOL_STARTED: { itemId: string; tool: string; arguments: unknown };
-  TOOL_COMPLETED: { itemId: string; tool: string; durationMs: number | null };
+  TOOL_COMPLETED: {
+    itemId: string;
+    tool: string;
+    result: unknown | null;
+    durationMs: number | null;
+  };
   TOOL_FAILED: { itemId: string; tool: string; error: string | null };
   DIFF_UPDATED: { diff: string };
   APPROVAL_REQUESTED: {
@@ -357,6 +462,13 @@ export interface TaskEventPayloadMap {
     last: TokenUsageBreakdown;
     modelContextWindow: number | null;
   };
+  MODEL_REROUTED: {
+    fromModel: string;
+    toModel: string;
+    reason: RuntimeModelRerouteReason;
+  };
+  RUNTIME_WARNING: { message: string };
+  CONTEXT_COMPACTED: { status: "completed" };
 }
 
 export interface TaskEventEnvelope {

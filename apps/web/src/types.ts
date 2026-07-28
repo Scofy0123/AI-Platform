@@ -1,6 +1,8 @@
 import type {
   Bootstrap,
+  ComposerCapability,
   EffectiveConfigOverride,
+  ModelCatalog,
   SubagentThread,
   SubagentThreadDetail,
   TaskDetail as TaskDetailDto,
@@ -13,6 +15,9 @@ import type {
 
 export type {
   Bootstrap,
+  ComposerCapability,
+  ModelCatalog,
+  ModelOption,
   SubagentThread,
   SubagentThreadDetail,
   TaskEvent,
@@ -27,6 +32,9 @@ export type UserRole = "ADMIN" | "MEMBER";
 
 export interface Session {
   authenticated: boolean;
+  expiresAt: string;
+  persistent: boolean;
+  feishuConnectionStatus: "CONNECTED" | "REFRESHING" | "REAUTH_REQUIRED";
   user: {
     id: string;
     name: string;
@@ -60,8 +68,10 @@ export interface AccountSummary {
   activeUsers: number;
   maxUsers: number;
   weeklyRemainingPercent: number | null;
+  authStatus?: "AUTHENTICATED" | "UNAUTHENTICATED" | "EXPIRED";
   health: number;
   quotaUpdatedAt?: string | null;
+  quotaResetsAt?: string | null;
 }
 
 export interface AuditEntry {
@@ -162,7 +172,10 @@ export interface RuntimeHealth {
 
 export interface PlatformApi {
   getSession(): Promise<Session>;
+  logout?(): Promise<void>;
   getBootstrap?(): Promise<Bootstrap>;
+  listModels?(threadId?: string): Promise<ModelCatalog>;
+  listComposerCapabilities?(threadId?: string): Promise<ComposerCapability[]>;
   listProjects(): Promise<ProjectSummary[]>;
   createProject(name: string): Promise<{ id: string }>;
   listTasks(): Promise<TaskSummary[]>;
@@ -172,6 +185,7 @@ export interface PlatformApi {
   taskAction(taskId: string, action: "interrupt" | "steer", input?: string): Promise<unknown>;
   decideApproval(approvalId: string, decision: "accept" | "decline"): Promise<unknown>;
   listThreads?(projectId?: string): Promise<Thread[]>;
+  listArchivedThreads?(): Promise<Thread[]>;
   getThread?(threadId: string): Promise<Thread>;
   getAdminThread?(threadId: string): Promise<Thread>;
   createThread?(input: {
@@ -185,6 +199,8 @@ export interface PlatformApi {
     config?: EffectiveConfigOverride,
   ): Promise<unknown>;
   threadAction?(threadId: string, action: "interrupt" | "steer", input?: string): Promise<unknown>;
+  archiveThread?(threadId: string): Promise<{ ok: true }>;
+  unarchiveThread?(threadId: string): Promise<{ ok: true }>;
   listSubagents?(threadId: string): Promise<SubagentThread[]>;
   getSubagent?(threadId: string): Promise<SubagentThreadDetail>;
   getMySettings?(): Promise<UserSettingsView>;
@@ -200,7 +216,7 @@ export interface PlatformApi {
   addAccount(alias: string): Promise<{ id: string }>;
   accountAction(
     accountId: string,
-    action: "login" | "drain" | "quarantine" | "restore",
+    action: "login" | "drain" | "quarantine" | "restore" | "refresh-quota",
   ): Promise<unknown>;
   listAudit(): Promise<AuditEntry[]>;
 }

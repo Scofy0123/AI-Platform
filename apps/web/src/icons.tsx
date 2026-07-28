@@ -2,6 +2,7 @@ import type { SVGProps } from "react";
 
 export type IconName =
   | "activity"
+  | "approval-terminal"
   | "arrow"
   | "audit"
   | "bot"
@@ -12,6 +13,7 @@ export type IconName =
   | "database"
   | "file"
   | "grid"
+  | "hand"
   | "home"
   | "pause"
   | "play"
@@ -21,6 +23,7 @@ export type IconName =
   | "send"
   | "settings"
   | "shield"
+  | "shield-alert"
   | "spark"
   | "terminal"
   | "tool"
@@ -28,6 +31,12 @@ export type IconName =
 
 const paths: Record<IconName, React.ReactNode> = {
   activity: <path d="M3 12h4l2.5-7 5 14 2.5-7h4" />,
+  "approval-terminal": (
+    <>
+      <path d="M12 2.5 20 7v10l-8 4.5L4 17V7z" />
+      <path d="m8 10 2 2-2 2M12.5 14H16" />
+    </>
+  ),
   arrow: (
     <>
       <path d="m9 18 6-6-6-6" />
@@ -80,6 +89,14 @@ const paths: Record<IconName, React.ReactNode> = {
       <rect x="14" y="14" width="7" height="7" rx="1" />
     </>
   ),
+  hand: (
+    <>
+      <path d="M7.5 11V5.5a1.5 1.5 0 0 1 3 0V10" />
+      <path d="M10.5 9V4.5a1.5 1.5 0 0 1 3 0V10" />
+      <path d="M13.5 9V5.5a1.5 1.5 0 0 1 3 0V11" />
+      <path d="M16.5 10V8a1.5 1.5 0 0 1 3 0v5c0 5-2.8 8-7.5 8-3.4 0-5.5-1.7-7-4.5L3.6 14a1.7 1.7 0 0 1 2.8-1.9L7.5 13.5" />
+    </>
+  ),
   home: (
     <>
       <path d="m3 11 9-8 9 8" />
@@ -121,6 +138,12 @@ const paths: Record<IconName, React.ReactNode> = {
     <>
       <path d="M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5z" />
       <path d="m9 12 2 2 4-5" />
+    </>
+  ),
+  "shield-alert": (
+    <>
+      <path d="M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5z" />
+      <path d="M12 8v5M12 17h.01" />
     </>
   ),
   spark: (

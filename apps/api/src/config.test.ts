@@ -36,6 +36,12 @@ describe("loadConfig", () => {
     expect(loadConfig(validEnv({ HOST: host })).server.host).toBe(host);
   });
 
+  test("allows HTTPS on a loopback web origin so production cookies can be Secure", () => {
+    expect(loadConfig(validEnv({ WEB_ORIGIN: "https://localhost:5173" })).server.webOrigin).toBe(
+      "https://localhost:5173",
+    );
+  });
+
   test("validates the TCP port without echoing the supplied value", () => {
     const secretPort = "99999-sensitive";
 
@@ -48,13 +54,33 @@ describe("loadConfig", () => {
   });
 
   test.each(["fake", "real"] as const)("accepts %s runtime mode", (mode) => {
-    expect(loadConfig(validEnv({ RUNTIME_MODE: mode })).runtime.mode).toBe(mode);
+    const paths =
+      mode === "real"
+        ? {
+            DATABASE_PATH: "/private/var/codexplatform.sqlite",
+            RUNTIME_DATA_DIR: "/private/var/codexplatform-runtime",
+          }
+        : {};
+    expect(loadConfig(validEnv({ RUNTIME_MODE: mode, ...paths })).runtime.mode).toBe(mode);
   });
 
   test("rejects an unknown runtime mode", () => {
     expect(() => loadConfig(validEnv({ RUNTIME_MODE: "staging" }))).toThrow(
       "RUNTIME_MODE must be fake or real",
     );
+  });
+
+  test("rejects worktree-relative storage paths in real runtime mode", () => {
+    expect(() =>
+      loadConfig(
+        validEnv({
+          RUNTIME_MODE: "real",
+          DATABASE_PATH: "../../.data/real-codexplatform.sqlite",
+          RUNTIME_DATA_DIR: "../../.data/real-runtime",
+        }),
+        "/workspace/worktrees/feature/apps/api",
+      ),
+    ).toThrow("real runtime storage paths must be absolute");
   });
 
   test("resolves storage and Codex binary paths against the supplied working directory", () => {

@@ -4,8 +4,12 @@ import {
   type TaskEventType,
   TokenUsageBreakdownSchema,
 } from "@codexplatform/contracts";
+import {
+  type RuntimePathRedactionContext,
+  sanitizeRuntimePathTransport,
+} from "../../event-payload-safety.js";
 
-interface NormalizerContext {
+interface NormalizerContext extends RuntimePathRedactionContext {
   taskId: string;
   now?: () => Date;
 }
@@ -118,6 +122,30 @@ export class CodexEventNormalizer {
           }),
         ];
       }
+      case "model/rerouted": {
+        const fromModel = nonEmptyString(params.fromModel);
+        const toModel = nonEmptyString(params.toModel);
+        if (!threadId || !turnId || !fromModel || !toModel) return [];
+        return [
+          this.event("MODEL_REROUTED", threadId, turnId, {
+            fromModel,
+            toModel,
+            reason: normalizeModelRerouteReason(params.reason),
+          }),
+        ];
+      }
+      case "warning": {
+        const message = nonEmptyString(params.message, 4_000);
+        if (!message) return [];
+        return [this.event("RUNTIME_WARNING", threadId, null, { message })];
+      }
+      case "thread/compacted":
+        if (!threadId || !turnId) return [];
+        return [
+          this.event("CONTEXT_COMPACTED", threadId, turnId, {
+            status: "completed",
+          }),
+        ];
       case "item/started":
         return this.normalizeItemStarted(item, threadId, turnId);
       case "item/completed":
@@ -139,14 +167,8 @@ export class CodexEventNormalizer {
     if (!approvalType || message.id === undefined || !itemId) return null;
 
     this.sequence += 1;
-    return {
-      taskId: this.context.taskId,
-      threadId: stringOrNull(params.threadId),
-      turnId: stringOrNull(params.turnId),
-      sequence: this.sequence,
-      timestamp: this.now().toISOString(),
-      type: "APPROVAL_REQUESTED",
-      payload: {
+    const payload = sanitizeRuntimePathTransport(
+      {
         itemId,
         approvalType,
         reason: stringOrNull(params.reason),
@@ -154,6 +176,16 @@ export class CodexEventNormalizer {
           ? { command: stringOrNull(params.command), cwd: stringOrNull(params.cwd) }
           : {}),
       },
+      this.context,
+    ) as Omit<TaskEventPayloadMap["APPROVAL_REQUESTED"], "approvalId">;
+    return {
+      taskId: this.context.taskId,
+      threadId: stringOrNull(params.threadId),
+      turnId: stringOrNull(params.turnId),
+      sequence: this.sequence,
+      timestamp: this.now().toISOString(),
+      type: "APPROVAL_REQUESTED",
+      payload,
     };
   }
 
@@ -163,6 +195,14 @@ export class CodexEventNormalizer {
     turnId: string | null,
   ): TaskEvent[] {
     if (!stableItemId(item.id)) return [];
+    if (item.type === "agentMessage") {
+      return [
+        this.event("AGENT_MESSAGE_PHASE", threadId, turnId, {
+          itemId: stringOrEmpty(item.id),
+          phase: normalizeAgentMessagePhase(item.phase),
+        }),
+      ];
+    }
     if (item.type === "commandExecution") {
       return [
         this.event("COMMAND_STARTED", threadId, turnId, {
@@ -193,11 +233,20 @@ export class CodexEventNormalizer {
     turnId: string | null,
   ): TaskEvent[] {
     if (!stableItemId(item.id)) return [];
+    if (item.type === "agentMessage") {
+      return [
+        this.event("AGENT_MESSAGE_PHASE", threadId, turnId, {
+          itemId: stringOrEmpty(item.id),
+          phase: normalizeAgentMessagePhase(item.phase),
+        }),
+      ];
+    }
     if (item.type === "commandExecution") {
       return [
         this.event("COMMAND_COMPLETED", threadId, turnId, {
           itemId: stringOrEmpty(item.id),
           command: stringOrEmpty(item.command),
+          aggregatedOutput: stringOrNull(item.aggregatedOutput),
           exitCode: numberOrNull(item.exitCode),
           durationMs: numberOrNull(item.durationMs),
         }),
@@ -210,6 +259,14 @@ export class CodexEventNormalizer {
           ? this.event("TOOL_COMPLETED", threadId, turnId, {
               itemId: stringOrEmpty(item.id),
               tool: stringOrEmpty(item.tool),
+              result:
+                item.type === "dynamicToolCall"
+                  ? Array.isArray(item.contentItems)
+                    ? item.contentItems
+                    : null
+                  : item.result === undefined
+                    ? null
+                    : item.result,
               durationMs: numberOrNull(item.durationMs),
             })
           : this.event("TOOL_FAILED", threadId, turnId, {
@@ -295,7 +352,11 @@ export class CodexEventNormalizer {
     payload: TaskEventPayloadMap[Type],
   ): Extract<TaskEvent, { type: Type }> {
     this.sequence += 1;
-    const record = payload as Record<string, unknown>;
+    const safePayload = sanitizeRuntimePathTransport(
+      payload,
+      this.context,
+    ) as TaskEventPayloadMap[Type];
+    const record = safePayload as Record<string, unknown>;
     const itemId =
       typeof record.itemId === "string" && record.itemId.length > 0
         ? record.itemId
@@ -310,7 +371,7 @@ export class CodexEventNormalizer {
       sequence: this.sequence,
       timestamp: this.now().toISOString(),
       type,
-      payload,
+      payload: safePayload,
     } as Extract<TaskEvent, { type: Type }>;
   }
 }
@@ -325,6 +386,12 @@ function stringOrNull(value: unknown): string | null {
 
 function stringOrEmpty(value: unknown): string {
   return stringOrNull(value) ?? "";
+}
+
+function nonEmptyString(value: unknown, maxLength = 256): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized.slice(0, maxLength) : null;
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -370,4 +437,21 @@ function normalizeSubagentStatus(
   if (toolStatus === "completed") return "DONE";
   if (toolStatus === "failed") return "FAILED";
   return "UNKNOWN";
+}
+
+function normalizeAgentMessagePhase(
+  value: unknown,
+): TaskEventPayloadMap["AGENT_MESSAGE_PHASE"]["phase"] {
+  return value === "commentary" || value === "final_answer" ? value : null;
+}
+
+function normalizeModelRerouteReason(
+  value: unknown,
+): TaskEventPayloadMap["MODEL_REROUTED"]["reason"] {
+  if (value === "highRiskCyberActivity") return "SAFETY_POLICY";
+  if (value === "availability" || value === "capacity" || value === "rateLimit") {
+    return "AVAILABILITY";
+  }
+  if (value === "capability") return "CAPABILITY";
+  return "OTHER";
 }

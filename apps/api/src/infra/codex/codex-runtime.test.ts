@@ -1,7 +1,80 @@
 import { describe, expect, test, vi } from "vitest";
-import { CodexAppServerRuntime, type RpcPeer } from "./codex-runtime.js";
+import { CodexAppServerRuntime, codexPermissionParams, type RpcPeer } from "./codex-runtime.js";
+import type { Model } from "./generated/v2/Model.js";
 
 describe("CodexAppServerRuntime", () => {
+  test("maps Ask for approval to workspace sandbox and user review", () => {
+    expect(
+      codexPermissionParams({ mode: "ASK_FOR_APPROVAL", profileId: null }, "/workspace"),
+    ).toEqual({
+      thread: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        sandbox: "workspace-write",
+      },
+      turn: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: ["/workspace"],
+          networkAccess: false,
+          excludeTmpdirEnvVar: true,
+          excludeSlashTmp: true,
+        },
+      },
+    });
+  });
+
+  test("maps Approve for me to auto review without widening the sandbox", () => {
+    expect(
+      codexPermissionParams({ mode: "APPROVE_FOR_ME", profileId: null }, "/workspace"),
+    ).toMatchObject({
+      thread: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "auto_review",
+        sandbox: "workspace-write",
+      },
+      turn: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "auto_review",
+        sandboxPolicy: { type: "workspaceWrite", networkAccess: false },
+      },
+    });
+  });
+
+  test("maps Full access to danger-full-access without routine approval", () => {
+    expect(codexPermissionParams({ mode: "FULL_ACCESS", profileId: null }, "/workspace")).toEqual({
+      thread: {
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandbox: "danger-full-access",
+      },
+      turn: {
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandboxPolicy: { type: "dangerFullAccess" },
+      },
+    });
+  });
+
+  test("maps Custom to a permission profile without a sandbox policy", () => {
+    expect(
+      codexPermissionParams({ mode: "CUSTOM", profileId: "restricted-network" }, "/workspace"),
+    ).toEqual({
+      thread: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        permissions: "restricted-network",
+      },
+      turn: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        permissions: "restricted-network",
+      },
+    });
+  });
+
   test("performs the initialize then initialized handshake with experimental APIs enabled", async () => {
     const rpc = new FakeRpc({
       initialize: {
@@ -71,6 +144,43 @@ describe("CodexAppServerRuntime", () => {
     });
   });
 
+  test("prefers the codex weekly bucket when multiple seven-day limits are returned", async () => {
+    const rpc = new FakeRpc({
+      "account/rateLimits/read": {
+        rateLimits: {
+          limitId: "legacy",
+          primary: { usedPercent: 100, windowDurationMins: 10_080, resetsAt: 1 },
+          secondary: null,
+        },
+        rateLimitsByLimitId: {
+          other: {
+            limitId: "other",
+            limitName: "Other product",
+            primary: { usedPercent: 100, windowDurationMins: 10_080, resetsAt: 2 },
+            secondary: null,
+          },
+          codex: {
+            limitId: "codex",
+            limitName: "Codex",
+            primary: { usedPercent: 42, windowDurationMins: 10_080, resetsAt: 3 },
+            secondary: null,
+          },
+        },
+        rateLimitResetCredits: null,
+      },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await expect(runtime.readWeeklyQuota()).resolves.toEqual({
+      status: "KNOWN",
+      limitId: "codex",
+      usedPercent: 42,
+      remainingPercent: 58,
+      windowDurationMins: 10_080,
+      resetsAt: 3,
+    });
+  });
+
   test("returns WEEKLY_QUOTA_UNKNOWN rather than substituting a short window", async () => {
     const rpc = new FakeRpc({
       "account/rateLimits/read": {
@@ -88,6 +198,55 @@ describe("CodexAppServerRuntime", () => {
     await expect(runtime.readWeeklyQuota()).resolves.toEqual({ status: "WEEKLY_QUOTA_UNKNOWN" });
   });
 
+  test("reads every visible model page in runtime order", async () => {
+    const modelA = runtimeModel("model-a");
+    const hiddenModel = runtimeModel("hidden-model", { hidden: true });
+    const modelB = runtimeModel("model-b");
+    const rpc = new FakeRpc({
+      "model/list": (params: unknown) =>
+        (params as { cursor: string | null }).cursor === null
+          ? { data: [modelA], nextCursor: "page-2" }
+          : { data: [hiddenModel, modelB], nextCursor: null },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await expect(runtime.listModels()).resolves.toEqual([modelA, modelB]);
+    expect(rpc.requests).toEqual([
+      {
+        method: "model/list",
+        params: { cursor: null, limit: 100, includeHidden: false },
+      },
+      {
+        method: "model/list",
+        params: { cursor: "page-2", limit: 100, includeHidden: false },
+      },
+    ]);
+  });
+
+  test("fails closed when model pagination repeats a cursor", async () => {
+    const rpc = new FakeRpc({
+      "model/list": { data: [runtimeModel("model-a")], nextCursor: "repeat" },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await expect(runtime.listModels()).rejects.toThrow("repeated pagination cursor");
+    expect(rpc.requests).toHaveLength(2);
+  });
+
+  test("fails closed when model pagination exceeds its page budget", async () => {
+    let page = 0;
+    const rpc = new FakeRpc({
+      "model/list": () => {
+        page += 1;
+        return { data: [], nextCursor: page <= 100 ? `page-${page}` : null };
+      },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await expect(runtime.listModels()).rejects.toThrow("exceeded 100 pages");
+    expect(rpc.requests).toHaveLength(100);
+  });
+
   test("starts a thread with dynamic tools and starts, steers, then interrupts a turn", async () => {
     const rpc = new FakeRpc({
       "thread/start": { thread: { id: "thread-1" }, model: "gpt-5", cwd: "/workspace" },
@@ -95,6 +254,22 @@ describe("CodexAppServerRuntime", () => {
       "turn/start": { turn: { id: "turn-1" } },
       "turn/steer": { turnId: "turn-1" },
       "turn/interrupt": {},
+      "thread/backgroundTerminals/list": {
+        data: [
+          {
+            itemId: "command-1",
+            processId: "process-1",
+            command: "long-running-command",
+            cwd: "/workspace",
+            osPid: 123,
+            cpuPercent: 0,
+            rssKb: null,
+          },
+        ],
+        nextCursor: null,
+      },
+      "thread/backgroundTerminals/terminate": { terminated: true },
+      "thread/backgroundTerminals/clean": {},
     });
     const runtime = new CodexAppServerRuntime(rpc);
     const tools = [
@@ -150,7 +325,114 @@ describe("CodexAppServerRuntime", () => {
         },
       },
       { method: "turn/interrupt", params: { threadId: "thread-1", turnId: "turn-1" } },
+      {
+        method: "thread/backgroundTerminals/list",
+        params: { threadId: "thread-1", cursor: null, limit: 100 },
+      },
+      {
+        method: "thread/backgroundTerminals/terminate",
+        params: { threadId: "thread-1", processId: "process-1" },
+      },
+      {
+        method: "thread/backgroundTerminals/clean",
+        params: { threadId: "thread-1" },
+      },
     ]);
+  });
+
+  test("terminates background terminals across every pagination page after an interrupt", async () => {
+    const rpc = new FakeRpc({
+      "turn/interrupt": {},
+      "thread/backgroundTerminals/list": (params: unknown) =>
+        (params as { cursor: string | null }).cursor === null
+          ? {
+              data: [
+                {
+                  itemId: "command-1",
+                  processId: "process-1",
+                  command: "first",
+                  cwd: "/workspace",
+                  osPid: 1,
+                  cpuPercent: null,
+                  rssKb: null,
+                },
+              ],
+              nextCursor: "page-2",
+            }
+          : {
+              data: [
+                {
+                  itemId: "command-2",
+                  processId: "process-2",
+                  command: "second",
+                  cwd: "/workspace",
+                  osPid: 2,
+                  cpuPercent: null,
+                  rssKb: null,
+                },
+              ],
+              nextCursor: null,
+            },
+      "thread/backgroundTerminals/terminate": { terminated: true },
+      "thread/backgroundTerminals/clean": {},
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await runtime.interruptTurn("thread-1", "turn-1");
+
+    expect(rpc.requests.slice(1)).toEqual([
+      {
+        method: "thread/backgroundTerminals/list",
+        params: { threadId: "thread-1", cursor: null, limit: 100 },
+      },
+      {
+        method: "thread/backgroundTerminals/terminate",
+        params: { threadId: "thread-1", processId: "process-1" },
+      },
+      {
+        method: "thread/backgroundTerminals/list",
+        params: { threadId: "thread-1", cursor: "page-2", limit: 100 },
+      },
+      {
+        method: "thread/backgroundTerminals/terminate",
+        params: { threadId: "thread-1", processId: "process-2" },
+      },
+      {
+        method: "thread/backgroundTerminals/clean",
+        params: { threadId: "thread-1" },
+      },
+    ]);
+  });
+
+  test("fails closed when Codex reports that a background terminal survived termination", async () => {
+    const rpc = new FakeRpc({
+      "turn/interrupt": {},
+      "thread/backgroundTerminals/list": {
+        data: [
+          {
+            itemId: "command-1",
+            processId: "process-1",
+            command: "still-running",
+            cwd: "/workspace",
+            osPid: 123,
+            cpuPercent: null,
+            rssKb: null,
+          },
+        ],
+        nextCursor: null,
+      },
+      "thread/backgroundTerminals/terminate": { terminated: false },
+      "thread/backgroundTerminals/clean": {},
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await expect(runtime.interruptTurn("thread-1", "turn-1")).rejects.toThrow(
+      "process-1 was not terminated",
+    );
+    expect(rpc.requests).not.toContainEqual({
+      method: "thread/backgroundTerminals/clean",
+      params: { threadId: "thread-1" },
+    });
   });
 
   test("propagates a native memory disable failure without issuing a Turn request", async () => {
@@ -333,11 +615,14 @@ class FakeRpc implements RpcPeer {
   readonly requests: Array<{ method: string; params: unknown }> = [];
   readonly notifications: Array<{ method: string; params: unknown }> = [];
 
-  constructor(private readonly responses: Record<string, unknown>) {}
+  constructor(
+    private readonly responses: Record<string, unknown | ((params: unknown) => unknown)>,
+  ) {}
 
   async request<T>(method: string, params?: unknown): Promise<T> {
     this.requests.push({ method, params });
-    const response = this.responses[method];
+    const configured = this.responses[method];
+    const response = typeof configured === "function" ? configured(params) : configured;
     if (response instanceof Error) throw response;
     return response as T;
   }
@@ -360,4 +645,26 @@ function deferred<T>(): {
 
 async function nextTick(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function runtimeModel(id: string, overrides: Partial<Model> = {}): Model {
+  return {
+    id,
+    model: id,
+    upgrade: null,
+    upgradeInfo: null,
+    availabilityNux: null,
+    displayName: id,
+    description: "",
+    hidden: false,
+    supportedReasoningEfforts: [{ reasoningEffort: "medium", description: "" }],
+    defaultReasoningEffort: "medium",
+    inputModalities: ["text"],
+    supportsPersonality: false,
+    additionalSpeedTiers: [],
+    serviceTiers: [],
+    defaultServiceTier: null,
+    isDefault: false,
+    ...overrides,
+  };
 }

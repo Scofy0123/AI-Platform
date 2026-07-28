@@ -43,6 +43,9 @@ export const seededFixture = {
   turnId: "e2e-private-turn",
   queuedThreadId: "e2e-queued-thread",
   queuedTurnId: "e2e-queued-turn",
+  runningThreadId: "e2e-running-thread",
+  runningTurnId: "e2e-running-turn",
+  runningRuntimeThreadId: "e2e-running-runtime-thread",
   activeSubagentId: "e2e-subagent-active",
   doneSubagentId: "e2e-subagent-done",
 } as const;

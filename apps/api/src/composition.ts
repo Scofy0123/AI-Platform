@@ -82,7 +82,9 @@ export async function createApplication(
   });
   const leases = new SQLiteLeaseStore(database.sqlite);
   const accounts = new AccountAdminStore(database.sqlite);
-  const platformStore = new SQLitePlatformStore(database.sqlite);
+  const platformStore = new SQLitePlatformStore(database.sqlite, {
+    runtimeDataDir: config.storage.runtimeDataDir,
+  });
   seedPrimaryAccount(config, leases, accounts);
 
   const actors = new ActorRegistry();
@@ -94,12 +96,12 @@ export async function createApplication(
       const actor = actors.resolve(binding);
       if (!actor) return null;
       let credentials = authStore.getCredentials(actor.actorContext.userId);
-      if (!credentials) return null;
-      if (credentials.accessExpiresAt.getTime() <= Date.now() + 60_000) {
+      if (!credentials || credentials.status === "REAUTH_REQUIRED") return null;
+      if (credentials.accessExpiresAt.getTime() <= Date.now() + 10 * 60_000) {
         await auth.refreshUserCredentials(actor.actorContext.userId);
         credentials = authStore.getCredentials(actor.actorContext.userId);
       }
-      return credentials
+      return credentials?.status === "CONNECTED"
         ? {
             taskId: actor.taskId,
             ...actor.actorContext,
@@ -131,9 +133,14 @@ export async function createApplication(
     dataDir: config.storage.runtimeDataDir,
   });
   service.recoverInterruptedTurns();
-  const app = buildApp({ auth, platform: service, webOrigin: config.server.webOrigin });
+  const app = buildApp({
+    auth,
+    platform: service,
+    webOrigin: config.server.webOrigin,
+    runtimeDataDir: config.storage.runtimeDataDir,
+  });
   const maintenance = setInterval(() => {
-    void service.runMaintenance().catch(() => undefined);
+    void Promise.allSettled([service.runMaintenance(), auth.refreshExpiringCredentials()]);
   }, MAINTENANCE_INTERVAL_MS);
   maintenance.unref();
 
@@ -491,6 +498,7 @@ function createExecutionAdapter(
     supervisor: new CodexRuntimeSupervisor({ binaryPath: config.runtime.codexBinary }),
     actors,
     tools,
+    runtimeDataDir: config.storage.runtimeDataDir,
   });
 }
 

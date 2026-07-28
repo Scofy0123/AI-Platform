@@ -97,8 +97,9 @@ pnpm dev
 3. 同企业其他用户可以登录，但看不到管理页面。
 4. 非配置 Tenant Key 的用户在回调时被拒绝。
 5. 用户 A 直接访问用户 B 的任务 URL 或事件接口时得到 404/拒绝，而不是任务数据。
+6. 首次授权后关闭并重新打开浏览器、或重启 API，30 天内仍直接进入工作台；Profile 中可主动退出。
 
-平台保存的是加密后的用户 Token：加密密钥仅在 `.env.local`，Session Cookie 为 HttpOnly + SameSite Strict；写接口还要求 CSRF Token。
+平台保存的是加密后的用户 Token：加密密钥仅在 `.env.local`。Session Cookie 为 HttpOnly + SameSite Strict 并持久 30 天；写接口还要求 CSRF Token。飞书 Token 失效时平台登录仍有效，只有飞书 Tool/Connection 要求重新连接。
 
 ## 5. 验证飞书知识权限
 

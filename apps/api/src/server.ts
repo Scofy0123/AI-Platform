@@ -1,6 +1,7 @@
 import {
   EffectiveConfigOverrideSchema,
   type TaskEvent,
+  type Thread,
   UserSettingsPatchSchema,
 } from "@codexplatform/contracts";
 import cookie from "@fastify/cookie";
@@ -8,26 +9,43 @@ import cors from "@fastify/cors";
 import sensible from "@fastify/sensible";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
-import type { PlatformUser } from "./auth/auth-store.js";
-import { ThreadResumeSafetyError } from "./domain/platform-service.js";
+import type { FeishuConnectionStatus, PlatformUser } from "./auth/auth-store.js";
+import {
+  AllocatedModelSelectionChangedError,
+  ModelCatalogUnavailableError,
+  ThreadResumeSafetyError,
+} from "./domain/platform-service.js";
+import {
+  type RuntimePathRedactionContext,
+  sanitizeEventTransport,
+} from "./event-payload-safety.js";
 import type { AuthApi, PlatformApi } from "./web-api.js";
 
 interface BuildAppOptions {
   auth?: AuthApi;
   platform?: PlatformApi;
   webOrigin?: string;
+  runtimeDataDir?: string;
 }
 
 interface ActorSession {
   user: PlatformUser;
   csrfHash: string;
   expiresAt: Date;
+  persistent: boolean;
+  feishuConnectionStatus: FeishuConnectionStatus;
 }
 
 const OAUTH_BINDING_COOKIE = "codexplatform_oauth_binding";
 const OAUTH_BINDING_COOKIE_PATH = "/api/auth/feishu/callback";
+const SESSION_COOKIE = "codexplatform_session";
+const CSRF_COOKIE = "codexplatform_csrf";
+const TRUSTED_DEVICE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
+  const runtimePathContext: RuntimePathRedactionContext = options.runtimeDataDir
+    ? { runtimeDataDir: options.runtimeDataDir }
+    : {};
   const app = Fastify({
     logger: process.env.NODE_ENV !== "test",
   });
@@ -43,6 +61,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     if (error instanceof z.ZodError) {
       return reply.code(400).send({ error: "Invalid request", issues: error.issues });
     }
+    if (error instanceof ModelCatalogUnavailableError) {
+      return reply.code(503).send({
+        error: "MODEL_CATALOG_UNAVAILABLE",
+        message: "Runtime model catalog is unavailable",
+      });
+    }
+    if (error instanceof AllocatedModelSelectionChangedError) {
+      return reply.code(409).send({
+        error: "MODEL_SELECTION_CHANGED",
+        message: error.message,
+      });
+    }
     const threadResumeError = publicThreadResumeError(error);
     if (threadResumeError) {
       return reply.code(409).send({
@@ -56,7 +86,10 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     const message = error instanceof Error ? error.message : "Unexpected server error";
     const known = classifyKnownError(message);
     if (known) return reply.code(known.statusCode).send({ error: known.message });
-    app.log.error({ error: redact(message) }, "Request failed");
+    app.log.error(
+      { error: sanitizeEventTransport(redact(message), runtimePathContext) },
+      "Request failed",
+    );
     return reply.code(500).send({ error: "Internal server error" });
   });
 
@@ -71,6 +104,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       options.auth,
       options.platform,
       options.webOrigin ?? "http://127.0.0.1:5173",
+      runtimePathContext,
     );
   }
 
@@ -82,8 +116,27 @@ function registerRoutes(
   auth: AuthApi,
   platform: PlatformApi,
   webOrigin: string,
+  runtimePathContext: RuntimePathRedactionContext,
 ): void {
+  const secureCookies = new URL(webOrigin).protocol === "https:";
   app.get("/api/bootstrap", async () => platform.getBootstrap());
+
+  app.get("/api/models", async (request, reply) => {
+    const actor = requireSession(request, reply, auth);
+    if (!actor) return;
+    const query = z.object({ threadId: z.string().min(1).optional() }).parse(request.query);
+    return platform.listModels(actor.user.id, query.threadId);
+  });
+
+  app.get("/api/composer/capabilities", async (request, reply) => {
+    const actor = requireSession(request, reply, auth);
+    if (!actor) return;
+    const query = z.object({ threadId: z.string().min(1).optional() }).parse(request.query);
+    if (query.threadId && !(await platform.getThread(query.threadId, actor.user.id))) {
+      return reply.code(404).send({ error: "Thread not found" });
+    }
+    return platform.listComposerCapabilities(actor.user.id, query.threadId);
+  });
 
   app.get("/api/auth/feishu/start", async (_request, reply) => {
     const login = auth.startLogin();
@@ -114,25 +167,41 @@ function registerRoutes(
       state: query.data.state,
       browserBinding,
     });
-    reply.setCookie("codexplatform_session", result.sessionToken, {
-      path: "/",
-      httpOnly: true,
-      sameSite: "strict",
-      secure: false,
-    });
-    reply.setCookie("codexplatform_csrf", result.csrfToken, {
-      path: "/",
-      httpOnly: false,
-      sameSite: "strict",
-      secure: false,
-    });
+    setAuthCookies(reply, result.sessionToken, result.csrfToken, secureCookies);
     return reply.redirect(webOrigin);
   });
 
   app.get("/api/auth/session", async (request, reply) => {
     const session = requireSession(request, reply, auth);
     if (!session) return;
-    return { user: session.user };
+    return serializeSession(session);
+  });
+
+  app.post("/api/auth/session/persist", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const sessionToken = request.cookies[SESSION_COOKIE];
+    const csrfToken = request.cookies[CSRF_COOKIE];
+    if (!sessionToken || !csrfToken) {
+      clearAuthCookies(reply, secureCookies);
+      return reply.code(401).send({ error: "Authentication required" });
+    }
+    const persisted = auth.persistSession(sessionToken);
+    if (!persisted) {
+      clearAuthCookies(reply, secureCookies);
+      return reply.code(401).send({ error: "Authentication required" });
+    }
+    setAuthCookies(reply, sessionToken, csrfToken, secureCookies);
+    return serializeSession(persisted);
+  });
+
+  app.post("/api/auth/logout", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const sessionToken = request.cookies[SESSION_COOKIE];
+    if (sessionToken) auth.revokeSession(sessionToken);
+    clearAuthCookies(reply, secureCookies);
+    return reply.code(204).send();
   });
 
   app.get("/api/projects", async (request, reply) => {
@@ -157,7 +226,17 @@ function registerRoutes(
     const actor = requireSession(request, reply, auth);
     if (!actor) return;
     const query = z.object({ projectId: z.string().optional() }).parse(request.query);
-    return platform.listThreads(actor.user.id, query.projectId);
+    return (await platform.listThreads(actor.user.id, query.projectId)).map((thread) =>
+      projectBrowserThread(thread, runtimePathContext),
+    );
+  });
+
+  app.get("/api/threads/archived", async (request, reply) => {
+    const actor = requireSession(request, reply, auth);
+    if (!actor) return;
+    return (await platform.listArchivedThreads(actor.user.id)).map((thread) =>
+      projectBrowserThread(thread, runtimePathContext),
+    );
   });
 
   app.post("/api/threads", async (request, reply) => {
@@ -174,11 +253,14 @@ function registerRoutes(
     );
     if (!body) return;
     return reply.code(201).send(
-      await platform.createThread(actor.user.id, {
-        projectId: body.projectId,
-        title: body.title,
-        ...(body.config ? { config: body.config } : {}),
-      }),
+      projectBrowserThread(
+        await platform.createThread(actor.user.id, {
+          projectId: body.projectId,
+          title: body.title,
+          ...(body.config ? { config: body.config } : {}),
+        }),
+        runtimePathContext,
+      ),
     );
   });
 
@@ -187,7 +269,23 @@ function registerRoutes(
     if (!actor) return;
     const { id } = request.params as { id: string };
     const thread = await platform.getThread(id, actor.user.id);
-    return thread ? thread : reply.code(404).send({ error: "Thread not found" });
+    return thread
+      ? projectBrowserThread(thread, runtimePathContext)
+      : reply.code(404).send({ error: "Thread not found" });
+  });
+
+  app.post("/api/threads/:id/archive", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    return platform.archiveThread(id, actor.user.id);
+  });
+
+  app.post("/api/threads/:id/unarchive", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    return platform.unarchiveThread(id, actor.user.id);
   });
 
   app.post("/api/threads/:id/turns", async (request, reply) => {
@@ -243,7 +341,7 @@ function registerRoutes(
     if (!String(request.headers.accept ?? "").includes("text/event-stream")) {
       const replay = await platform.listThreadEvents(id, actor.user.id, afterSequence);
       return (
-        replay?.map((event) => projectTaskEvent(event, true)) ??
+        replay?.map((event) => projectTaskEvent(event, true, runtimePathContext)) ??
         reply.code(404).send({ error: "Thread not found" })
       );
     }
@@ -261,6 +359,9 @@ function registerRoutes(
         return current?.user.id === actor.user.id;
       },
       hideAccountAlias: true,
+      ...(runtimePathContext.runtimeDataDir
+        ? { runtimeDataDir: runtimePathContext.runtimeDataDir }
+        : {}),
     });
   });
 
@@ -382,7 +483,7 @@ function registerRoutes(
     if (!String(request.headers.accept ?? "").includes("text/event-stream")) {
       const replay = await platform.listTaskEvents(id, actor.user.id, afterSequence);
       return (
-        replay?.map((event) => projectTaskEvent(event, true)) ??
+        replay?.map((event) => projectTaskEvent(event, true, runtimePathContext)) ??
         reply.code(404).send({ error: "Task not found" })
       );
     }
@@ -400,6 +501,9 @@ function registerRoutes(
         return current?.user.id === actor.user.id;
       },
       hideAccountAlias: true,
+      ...(runtimePathContext.runtimeDataDir
+        ? { runtimeDataDir: runtimePathContext.runtimeDataDir }
+        : {}),
     });
   });
 
@@ -451,6 +555,13 @@ function registerRoutes(
     return platform.loginAccount(id, actor.user.id);
   });
 
+  app.post("/api/admin/accounts/:id/refresh-quota", async (request, reply) => {
+    const actor = requireAdminWrite(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    return platform.refreshAccountQuotaNow(id, actor.user.id);
+  });
+
   app.post("/api/admin/accounts/:id/:action", async (request, reply) => {
     const actor = requireAdminWrite(request, reply, auth);
     if (!actor) return;
@@ -476,7 +587,9 @@ function registerRoutes(
     if (!actor) return;
     const { id } = request.params as { id: string };
     const thread = await platform.getAdminThread(id, actor.user.id);
-    return thread ? thread : reply.code(404).send({ error: "Thread not found" });
+    return thread
+      ? projectBrowserThread(thread, runtimePathContext)
+      : reply.code(404).send({ error: "Thread not found" });
   });
 
   app.get("/api/admin/policies", async (request, reply) => {
@@ -512,6 +625,9 @@ function requireSession(
   const token = request.cookies.codexplatform_session;
   const session = token ? auth.resolveSession(token) : null;
   if (!session) {
+    if (token || request.cookies.codexplatform_csrf) {
+      clearAuthCookies(reply, request.protocol === "https");
+    }
     reply.code(401).send({ error: "Authentication required" });
     return null;
   }
@@ -589,6 +705,7 @@ export async function streamTaskEvents(
     sessionExpiresAt: Date;
     isSessionValid: () => boolean;
     hideAccountAlias?: boolean;
+    runtimeDataDir?: string;
   },
 ): Promise<void> {
   reply.hijack();
@@ -612,6 +729,17 @@ export async function streamTaskEvents(
     cleanup();
     if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.end();
   };
+  const scheduleExpiry = () => {
+    if (closed) return;
+    const remaining = input.sessionExpiresAt.getTime() - Date.now();
+    if (remaining <= 0) {
+      expire();
+      return;
+    }
+    // Node timers use a signed 32-bit delay. A 30 day trusted-device
+    // session must therefore be checked in bounded segments.
+    expiry = setTimeout(scheduleExpiry, Math.min(remaining, 2_147_000_000));
+  };
   heartbeat = setInterval(() => {
     let valid = false;
     try {
@@ -625,14 +753,21 @@ export async function streamTaskEvents(
     }
     reply.raw.write(": heartbeat\n\n");
   }, 15_000);
-  expiry = setTimeout(expire, Math.max(0, input.sessionExpiresAt.getTime() - Date.now()));
+  scheduleExpiry();
   reply.raw.once("close", cleanup);
   try {
     unsubscribe = await subscribeWithReplay({
       afterSequence: input.afterSequence,
       loadReplay: input.loadReplay,
       subscribe: input.subscribe,
-      emit: (event) => reply.raw.write(encodeSse(event, input.hideAccountAlias ?? true)),
+      emit: (event) =>
+        reply.raw.write(
+          encodeSse(
+            event,
+            input.hideAccountAlias ?? true,
+            input.runtimeDataDir ? { runtimeDataDir: input.runtimeDataDir } : {},
+          ),
+        ),
     });
     if (closed) unsubscribe();
   } catch (error) {
@@ -676,13 +811,21 @@ export async function subscribeWithReplay<T extends { sequence: number }>(input:
   }
 }
 
-export function encodeSse(event: TaskEvent, hideAccountAlias = true): string {
-  const projected = projectTaskEvent(event, hideAccountAlias);
+export function encodeSse(
+  event: TaskEvent,
+  hideAccountAlias = true,
+  runtimePathContext: RuntimePathRedactionContext = {},
+): string {
+  const projected = projectTaskEvent(event, hideAccountAlias, runtimePathContext);
   return `id: ${projected.sequence}\nevent: ${projected.type}\ndata: ${JSON.stringify(projected)}\n\n`;
 }
 
-function projectTaskEvent(event: TaskEvent, hideAccountAlias = false): TaskEvent {
-  const payload = sanitizeBrowserEventPayload(event, hideAccountAlias);
+function projectTaskEvent(
+  event: TaskEvent,
+  hideAccountAlias = false,
+  runtimePathContext: RuntimePathRedactionContext = {},
+): TaskEvent {
+  const payload = sanitizeBrowserEventPayload(event, hideAccountAlias, runtimePathContext);
   delete payload.requestId;
   delete payload.leaseId;
   delete payload.ticket;
@@ -692,37 +835,52 @@ function projectTaskEvent(event: TaskEvent, hideAccountAlias = false): TaskEvent
 function sanitizeBrowserEventPayload(
   event: TaskEvent,
   hideAccountAlias: boolean,
+  runtimePathContext: RuntimePathRedactionContext = {},
 ): Record<string, unknown> {
   const source = objectValue(event.payload);
   if (event.type === "REASONING_SUMMARY_DELTA") {
-    return {
-      ...(typeof source.itemId === "string" ? { itemId: source.itemId } : {}),
-      ...(typeof source.delta === "string" ? { delta: source.delta } : {}),
-    };
+    return sanitizeEventTransport(
+      {
+        ...(typeof source.itemId === "string" ? { itemId: source.itemId } : {}),
+        ...(typeof source.delta === "string" ? { delta: source.delta } : {}),
+      },
+      runtimePathContext,
+    ) as Record<string, unknown>;
   }
   if (event.type === "RECOVERY_REQUIRED") {
-    return typeof source.reason === "string" ? { reason: source.reason } : {};
+    return sanitizeEventTransport(
+      typeof source.reason === "string" ? { reason: source.reason } : {},
+      runtimePathContext,
+    ) as Record<string, unknown>;
   }
   if (event.type === "LEASE_ACQUIRED" && hideAccountAlias) return {};
-  return stripReasoningTransportFields(source) as Record<string, unknown>;
+  return sanitizeEventTransport(source, runtimePathContext) as Record<string, unknown>;
 }
 
-function stripReasoningTransportFields(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripReasoningTransportFields);
-  if (!value || typeof value !== "object") return value;
-  const clean: Record<string, unknown> = {};
-  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-    if (
-      key === "reasoningTextDelta" ||
-      key === "reasoning_text_delta" ||
-      key === "encrypted_content" ||
-      key === "encryptedContent"
-    ) {
-      continue;
-    }
-    clean[key] = stripReasoningTransportFields(nested);
-  }
-  return clean;
+function projectBrowserThread(
+  thread: Thread,
+  runtimePathContext: RuntimePathRedactionContext = {},
+): Thread {
+  return {
+    ...thread,
+    items: thread.items.map((item) => ({
+      ...item,
+      payload: sanitizeBrowserEventPayload(
+        {
+          taskId: thread.id,
+          threadId: item.threadId,
+          turnId: item.turnId,
+          itemId: item.id,
+          sequence: item.sequence,
+          timestamp: item.timestamp,
+          type: item.type,
+          payload: item.payload,
+        } as TaskEvent,
+        true,
+        runtimePathContext,
+      ),
+    })),
+  };
 }
 
 function projectStartTurnResult(value: unknown): Record<string, unknown> {
@@ -812,6 +970,8 @@ function classifyKnownError(
   if (/already (?:decided|used|has an active Turn)/i.test(message)) {
     return { statusCode: 409, message };
   }
+  if (/cannot be archived$/i.test(message)) return { statusCode: 409, message };
+  if (/^Thread is archived$/i.test(message)) return { statusCode: 409, message };
   if (/credential isolation|real codex multi-user execution is disabled/i.test(message)) {
     return { statusCode: 403, message };
   }
@@ -853,6 +1013,54 @@ function clearOAuthBindingCookie(reply: FastifyReply): void {
     sameSite: "lax",
     secure: false,
   });
+}
+
+function setAuthCookies(
+  reply: FastifyReply,
+  sessionToken: string,
+  csrfToken: string,
+  secure: boolean,
+): void {
+  reply.setCookie(SESSION_COOKIE, sessionToken, {
+    path: "/",
+    maxAge: TRUSTED_DEVICE_MAX_AGE_SECONDS,
+    httpOnly: true,
+    sameSite: "strict",
+    secure,
+  });
+  reply.setCookie(CSRF_COOKIE, csrfToken, {
+    path: "/",
+    maxAge: TRUSTED_DEVICE_MAX_AGE_SECONDS,
+    httpOnly: false,
+    sameSite: "strict",
+    secure,
+  });
+}
+
+function clearAuthCookies(reply: FastifyReply, secure: boolean): void {
+  reply.setCookie(SESSION_COOKIE, "", {
+    path: "/",
+    maxAge: 0,
+    httpOnly: true,
+    sameSite: "strict",
+    secure,
+  });
+  reply.setCookie(CSRF_COOKIE, "", {
+    path: "/",
+    maxAge: 0,
+    httpOnly: false,
+    sameSite: "strict",
+    secure,
+  });
+}
+
+function serializeSession(session: ActorSession) {
+  return {
+    user: session.user,
+    expiresAt: session.expiresAt.toISOString(),
+    persistent: session.persistent,
+    feishuConnectionStatus: session.feishuConnectionStatus,
+  };
 }
 
 function once(callback: () => void): () => void {

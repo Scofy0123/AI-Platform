@@ -93,6 +93,106 @@ describe("migrateDatabase", () => {
     ).toEqual({ name: "thread_token_usage" });
   });
 
+  test("adds nullable local archive state to legacy tasks without changing existing rows", () => {
+    const database = new Database(":memory:");
+    databases.push(database);
+    database.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        queue_ticket INTEGER,
+        account_id TEXT,
+        account_alias TEXT,
+        lease_id TEXT,
+        thread_id TEXT,
+        current_turn_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO tasks (
+        id, project_id, owner_id, title, status, created_at, updated_at
+      ) VALUES ('task-1', 'project-1', 'user-1', 'Existing thread', 'COMPLETED', 1, 2);
+    `);
+
+    migrateDatabase(database);
+    migrateDatabase(database);
+
+    const columns = database.pragma("table_info(tasks)") as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toContain("archived_at");
+    expect(database.prepare("SELECT id, archived_at FROM tasks").all()).toEqual([
+      { id: "task-1", archived_at: null },
+    ]);
+  });
+
+  test("adds persistent session and Feishu connection state without deleting identities", () => {
+    const database = new Database(":memory:");
+    databases.push(database);
+    database.exec(`
+      CREATE TABLE users (
+        id TEXT PRIMARY KEY,
+        tenant_key TEXT NOT NULL,
+        open_id TEXT NOT NULL,
+        union_id TEXT,
+        name TEXT NOT NULL,
+        avatar_url TEXT,
+        role TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        csrf_hash TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        revoked_at INTEGER
+      );
+      CREATE TABLE feishu_credentials (
+        user_id TEXT PRIMARY KEY,
+        access_token_encrypted TEXT NOT NULL,
+        refresh_token_encrypted TEXT NOT NULL,
+        access_expires_at INTEGER NOT NULL,
+        refresh_expires_at INTEGER NOT NULL,
+        scopes TEXT NOT NULL,
+        token_type TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO users VALUES (
+        'user-1', 'tenant-1', 'ou-1', NULL, 'User', NULL, 'ADMIN', 1, 1
+      );
+      INSERT INTO sessions VALUES (
+        'session-1', 'token-hash', 'csrf-hash', 'user-1', 1, 2, NULL
+      );
+      INSERT INTO feishu_credentials VALUES (
+        'user-1', 'access', 'refresh', 2, 3, '[]', 'Bearer', 1
+      );
+    `);
+
+    migrateDatabase(database);
+    migrateDatabase(database);
+
+    const sessionColumns = database.pragma("table_info(sessions)") as Array<{ name: string }>;
+    const credentialColumns = database.pragma("table_info(feishu_credentials)") as Array<{
+      name: string;
+    }>;
+    expect(sessionColumns.map((column) => column.name)).toContain("persistent_at");
+    expect(credentialColumns.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["status", "last_refresh_error_code", "reauth_required_at"]),
+    );
+    expect(
+      database.prepare("SELECT id, persistent_at FROM sessions WHERE id = 'session-1'").get(),
+    ).toEqual({ id: "session-1", persistent_at: null });
+    expect(
+      database
+        .prepare("SELECT user_id, status FROM feishu_credentials WHERE user_id = 'user-1'")
+        .get(),
+    ).toEqual({ user_id: "user-1", status: "CONNECTED" });
+  });
+
   test("adds nullable required account affinity to legacy queue entries idempotently", () => {
     const database = new Database(":memory:");
     databases.push(database);

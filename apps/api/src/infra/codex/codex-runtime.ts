@@ -1,7 +1,18 @@
-import type { EffectiveThreadConfigSnapshot } from "@codexplatform/contracts";
+import type {
+  EffectiveThreadConfigSnapshot,
+  ExecutionPermissionSelection,
+} from "@codexplatform/contracts";
 import type { Personality } from "./generated/Personality.js";
 import type { JsonValue } from "./generated/serde_json/JsonValue.js";
+import type { ApprovalsReviewer } from "./generated/v2/ApprovalsReviewer.js";
+import type { AskForApproval } from "./generated/v2/AskForApproval.js";
+import type { Model } from "./generated/v2/Model.js";
+import type { ModelListParams } from "./generated/v2/ModelListParams.js";
+import type { ModelListResponse } from "./generated/v2/ModelListResponse.js";
+import type { SandboxMode } from "./generated/v2/SandboxMode.js";
 import type { SandboxPolicy } from "./generated/v2/SandboxPolicy.js";
+import type { ThreadBackgroundTerminalsListResponse } from "./generated/v2/ThreadBackgroundTerminalsListResponse.js";
+import type { ThreadBackgroundTerminalsTerminateResponse } from "./generated/v2/ThreadBackgroundTerminalsTerminateResponse.js";
 import type { ThreadMemoryModeSetParams } from "./generated/v2/ThreadMemoryModeSetParams.js";
 import type { ThreadMemoryModeSetResponse } from "./generated/v2/ThreadMemoryModeSetResponse.js";
 import type { ThreadResumeParams } from "./generated/v2/ThreadResumeParams.js";
@@ -39,8 +50,9 @@ interface RateLimitWindow {
   resetsAt: number | null;
 }
 
-interface RateLimitSnapshot {
+export interface RateLimitSnapshot {
   limitId: string | null;
+  limitName?: string | null;
   primary: RateLimitWindow | null;
   secondary: RateLimitWindow | null;
 }
@@ -49,6 +61,8 @@ interface RateLimitsResponse {
   rateLimits: RateLimitSnapshot;
   rateLimitsByLimitId: Record<string, RateLimitSnapshot | undefined> | null;
 }
+
+const MAX_MODEL_CATALOG_PAGES = 100;
 
 export class CodexAppServerRuntime {
   private readonly memoryDisabledThreadIds = new Set<string>();
@@ -95,24 +109,54 @@ export class CodexAppServerRuntime {
   async readWeeklyQuota(): Promise<WeeklyQuota> {
     const response = await this.rpc.request<RateLimitsResponse>("account/rateLimits/read");
     const snapshots = response.rateLimitsByLimitId
-      ? Object.values(response.rateLimitsByLimitId).filter(isRateLimitSnapshot)
+      ? Object.entries(response.rateLimitsByLimitId)
+          .filter((entry): entry is [string, RateLimitSnapshot] => isRateLimitSnapshot(entry[1]))
+          .sort(([leftKey, left], [rightKey, right]) => {
+            return codexBucketPriority(rightKey, right) - codexBucketPriority(leftKey, left);
+          })
+          .map(([, snapshot]) => snapshot)
       : [response.rateLimits];
 
     for (const snapshot of snapshots) {
-      for (const window of [snapshot.primary, snapshot.secondary]) {
-        if (window?.windowDurationMins !== 10_080) continue;
-        const usedPercent = clamp(window.usedPercent, 0, 100);
-        return {
-          status: "KNOWN",
-          limitId: snapshot.limitId,
-          usedPercent,
-          remainingPercent: 100 - usedPercent,
-          windowDurationMins: 10_080,
-          resetsAt: window.resetsAt,
-        };
-      }
+      const quota = weeklyQuotaFromRateLimitSnapshot(snapshot);
+      if (quota.status === "KNOWN") return quota;
     }
     return { status: "WEEKLY_QUOTA_UNKNOWN" };
+  }
+
+  async listModels(): Promise<Model[]> {
+    const models: Model[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    let pageCount = 0;
+
+    do {
+      if (pageCount >= MAX_MODEL_CATALOG_PAGES) {
+        throw new Error(`Codex model/list exceeded ${MAX_MODEL_CATALOG_PAGES} pages`);
+      }
+      pageCount += 1;
+
+      const params: ModelListParams = {
+        cursor,
+        limit: 100,
+        includeHidden: false,
+      };
+      const page: ModelListResponse = await this.rpc.request<ModelListResponse>(
+        "model/list",
+        params,
+      );
+      models.push(...page.data.filter((model) => !model.hidden));
+
+      if (page.nextCursor !== null) {
+        if (seenCursors.has(page.nextCursor)) {
+          throw new Error("Codex model/list returned a repeated pagination cursor");
+        }
+        seenCursors.add(page.nextCursor);
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+
+    return models;
   }
 
   async startThread(input: {
@@ -174,8 +218,27 @@ export class CodexAppServerRuntime {
     });
   }
 
-  interruptTurn(threadId: string, turnId: string): Promise<unknown> {
-    return this.rpc.request("turn/interrupt", { threadId, turnId });
+  async interruptTurn(threadId: string, turnId: string): Promise<void> {
+    await this.rpc.request("turn/interrupt", { threadId, turnId });
+    let cursor: string | null = null;
+    do {
+      const page: ThreadBackgroundTerminalsListResponse =
+        await this.rpc.request<ThreadBackgroundTerminalsListResponse>(
+          "thread/backgroundTerminals/list",
+          { threadId, cursor, limit: 100 },
+        );
+      for (const terminal of page.data) {
+        const result = await this.rpc.request<ThreadBackgroundTerminalsTerminateResponse>(
+          "thread/backgroundTerminals/terminate",
+          { threadId, processId: terminal.processId },
+        );
+        if (!result.terminated) {
+          throw new Error(`Codex background terminal ${terminal.processId} was not terminated`);
+        }
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+    await this.rpc.request("thread/backgroundTerminals/clean", { threadId });
   }
 
   async resumeThread(
@@ -196,8 +259,112 @@ export class CodexAppServerRuntime {
   }
 }
 
+export function weeklyQuotaFromRateLimitSnapshot(snapshot: RateLimitSnapshot): WeeklyQuota {
+  for (const window of [snapshot.primary, snapshot.secondary]) {
+    if (window?.windowDurationMins !== 10_080) continue;
+    const usedPercent = clamp(window.usedPercent, 0, 100);
+    return {
+      status: "KNOWN",
+      limitId: snapshot.limitId,
+      usedPercent,
+      remainingPercent: 100 - usedPercent,
+      windowDurationMins: 10_080,
+      resetsAt: window.resetsAt,
+    };
+  }
+  return { status: "WEEKLY_QUOTA_UNKNOWN" };
+}
+
+function codexBucketPriority(key: string, snapshot: RateLimitSnapshot): number {
+  const candidates = [key, snapshot.limitId, snapshot.limitName]
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => value.trim().toLowerCase());
+  if (candidates.includes("codex")) return 2;
+  if (candidates.some((value) => value.includes("codex"))) return 1;
+  return 0;
+}
+
 function textInput(text: string) {
   return { type: "text" as const, text, text_elements: [] };
+}
+
+export function codexPermissionParams(
+  selection: ExecutionPermissionSelection,
+  cwd: string,
+):
+  | {
+      thread: {
+        approvalPolicy: AskForApproval;
+        approvalsReviewer: ApprovalsReviewer;
+        sandbox: SandboxMode;
+      };
+      turn: {
+        approvalPolicy: AskForApproval;
+        approvalsReviewer: ApprovalsReviewer;
+        sandboxPolicy: SandboxPolicy;
+      };
+    }
+  | {
+      thread: {
+        approvalPolicy: AskForApproval;
+        approvalsReviewer: ApprovalsReviewer;
+        permissions: string;
+      };
+      turn: {
+        approvalPolicy: AskForApproval;
+        approvalsReviewer: ApprovalsReviewer;
+        permissions: string;
+      };
+    } {
+  if (selection.mode === "CUSTOM") {
+    return {
+      thread: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        permissions: selection.profileId,
+      },
+      turn: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        permissions: selection.profileId,
+      },
+    };
+  }
+
+  if (selection.mode === "FULL_ACCESS") {
+    return {
+      thread: {
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandbox: "danger-full-access",
+      },
+      turn: {
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandboxPolicy: { type: "dangerFullAccess" },
+      },
+    };
+  }
+
+  const approvalsReviewer = selection.mode === "APPROVE_FOR_ME" ? "auto_review" : "user";
+  return {
+    thread: {
+      approvalPolicy: "on-request",
+      approvalsReviewer,
+      sandbox: "workspace-write",
+    },
+    turn: {
+      approvalPolicy: "on-request",
+      approvalsReviewer,
+      sandboxPolicy: {
+        type: "workspaceWrite",
+        writableRoots: [cwd],
+        networkAccess: false,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true,
+      },
+    },
+  };
 }
 
 function extractResponseThreadId(value: unknown): string | null {
@@ -218,53 +385,61 @@ function isEmptyJsonObject(value: unknown): value is Record<string, never> {
 }
 
 function threadConfigParams(config: EffectiveThreadConfigSnapshot) {
+  if (config.permissionMode === "READ_ONLY") {
+    return {
+      model: config.model,
+      approvalPolicy: "on-request" as const,
+      approvalsReviewer: "user" as const,
+      sandbox: "read-only" as const,
+      developerInstructions: config.instructions,
+      personality: personality(config),
+    } satisfies Partial<ThreadStartParams & ThreadResumeParams>;
+  }
+  const permission = codexPermissionParams(selectionFromConfig(config), "");
   return {
     model: config.model,
-    approvalPolicy: approvalPolicy(config),
-    approvalsReviewer: "user" as const,
-    sandbox: sandboxMode(config),
+    ...permission.thread,
     developerInstructions: config.instructions,
     personality: personality(config),
   } satisfies Partial<ThreadStartParams & ThreadResumeParams>;
 }
 
 function turnConfigParams(cwd: string, config: EffectiveThreadConfigSnapshot) {
+  if (config.permissionMode === "READ_ONLY") {
+    return {
+      model: config.model,
+      effort: config.reasoningEffort.toLowerCase(),
+      summary: "auto" as const,
+      approvalPolicy: "on-request" as const,
+      approvalsReviewer: "user" as const,
+      sandboxPolicy: { type: "readOnly" as const, networkAccess: false },
+      personality: personality(config),
+    } satisfies Partial<TurnStartParams>;
+  }
+  const permission = codexPermissionParams(selectionFromConfig(config), cwd);
   return {
     model: config.model,
     effort: config.reasoningEffort.toLowerCase(),
     summary: "auto" as const,
-    approvalPolicy: approvalPolicy(config),
-    approvalsReviewer: "user" as const,
-    sandboxPolicy: sandboxPolicy(cwd, config),
+    ...permission.turn,
     personality: personality(config),
   } satisfies Partial<TurnStartParams>;
 }
 
-function approvalPolicy(config: EffectiveThreadConfigSnapshot): "on-request" {
+function selectionFromConfig(config: EffectiveThreadConfigSnapshot): ExecutionPermissionSelection {
   if (config.approvalMode !== "ASK") throw new Error("Unsupported approval mode");
-  return "on-request";
-}
-
-function sandboxMode(config: EffectiveThreadConfigSnapshot): "read-only" | "workspace-write" {
-  if (config.permissionMode === "READ_ONLY") return "read-only";
-  if (config.permissionMode === "DEFAULT" || config.permissionMode === "WORKSPACE_WRITE") {
-    return "workspace-write";
+  if (config.permissionMode === "APPROVE_FOR_ME") {
+    return { mode: "APPROVE_FOR_ME", profileId: null };
   }
-  throw new Error("Unsupported permission mode");
-}
-
-function sandboxPolicy(cwd: string, config: EffectiveThreadConfigSnapshot): SandboxPolicy {
-  if (config.permissionMode === "READ_ONLY") {
-    return { type: "readOnly", networkAccess: false };
+  if (config.permissionMode === "FULL_ACCESS") {
+    return { mode: "FULL_ACCESS", profileId: null };
   }
-  if (config.permissionMode === "DEFAULT" || config.permissionMode === "WORKSPACE_WRITE") {
-    return {
-      type: "workspaceWrite",
-      writableRoots: [cwd],
-      networkAccess: false,
-      excludeTmpdirEnvVar: true,
-      excludeSlashTmp: true,
-    };
+  if (
+    config.permissionMode === "DEFAULT" ||
+    config.permissionMode === "WORKSPACE_WRITE" ||
+    config.permissionMode === "ASK_FOR_APPROVAL"
+  ) {
+    return { mode: "ASK_FOR_APPROVAL", profileId: null };
   }
   throw new Error("Unsupported permission mode");
 }
@@ -277,6 +452,23 @@ function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
-function isRateLimitSnapshot(value: RateLimitSnapshot | undefined): value is RateLimitSnapshot {
-  return value !== undefined;
+export function isRateLimitSnapshot(value: unknown): value is RateLimitSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const snapshot = value as Record<string, unknown>;
+  return (
+    (snapshot.limitId === null || typeof snapshot.limitId === "string") &&
+    isRateLimitWindow(snapshot.primary) &&
+    isRateLimitWindow(snapshot.secondary)
+  );
+}
+
+function isRateLimitWindow(value: unknown): value is RateLimitWindow | null {
+  if (value === null) return true;
+  if (!value || typeof value !== "object") return false;
+  const window = value as Record<string, unknown>;
+  return (
+    typeof window.usedPercent === "number" &&
+    (window.windowDurationMins === null || typeof window.windowDurationMins === "number") &&
+    (window.resetsAt === null || typeof window.resetsAt === "number")
+  );
 }

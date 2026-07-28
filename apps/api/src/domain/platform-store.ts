@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { basename, dirname, join } from "node:path";
 import {
   type EffectiveConfigOverride,
   EffectiveConfigOverrideSchema,
@@ -18,6 +19,10 @@ import {
   UserSettingsSchema,
 } from "@codexplatform/contracts";
 import type Database from "better-sqlite3";
+import {
+  type RuntimePathRedactionContext,
+  sanitizeEventTransport,
+} from "../event-payload-safety.js";
 
 export interface ProjectRecord {
   id: string;
@@ -41,6 +46,7 @@ export interface TaskRecord {
   threadId: string | null;
   currentTurnId: string | null;
   threadConfig: EffectiveConfigOverride | null;
+  archivedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -123,7 +129,7 @@ export interface UserConnectionRecord {
   managed: true;
   connected: boolean;
   scopes: string[];
-  status: "CONNECTED" | "NOT_CONNECTED";
+  status: "CONNECTED" | "REFRESHING" | "REAUTH_REQUIRED" | "NOT_CONNECTED";
 }
 
 interface ProjectRow {
@@ -148,6 +154,7 @@ interface TaskRow {
   thread_id: string | null;
   current_turn_id: string | null;
   thread_config_json: string | null;
+  archived_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -230,7 +237,10 @@ interface ThreadTokenUsageRow {
 }
 
 export class SQLitePlatformStore {
-  constructor(private readonly sqlite: Database.Database) {}
+  constructor(
+    private readonly sqlite: Database.Database,
+    private readonly options: { runtimeDataDir?: string } = {},
+  ) {}
 
   createProject(input: { ownerId: string; name: string; now: Date }): ProjectRecord {
     const id = randomUUID();
@@ -288,12 +298,29 @@ export class SQLitePlatformStore {
     const rows = projectId
       ? (this.sqlite
           .prepare(
-            "SELECT * FROM tasks WHERE owner_id = ? AND project_id = ? ORDER BY updated_at DESC",
+            `SELECT * FROM tasks
+             WHERE owner_id = ? AND project_id = ? AND archived_at IS NULL
+             ORDER BY updated_at DESC`,
           )
           .all(ownerId, projectId) as TaskRow[])
       : (this.sqlite
-          .prepare("SELECT * FROM tasks WHERE owner_id = ? ORDER BY updated_at DESC")
+          .prepare(
+            `SELECT * FROM tasks
+             WHERE owner_id = ? AND archived_at IS NULL
+             ORDER BY updated_at DESC`,
+          )
           .all(ownerId) as TaskRow[]);
+    return rows.map(mapTask);
+  }
+
+  listArchivedTasks(ownerId: string): TaskRecord[] {
+    const rows = this.sqlite
+      .prepare(
+        `SELECT * FROM tasks
+         WHERE owner_id = ? AND archived_at IS NOT NULL
+         ORDER BY archived_at DESC, id`,
+      )
+      .all(ownerId) as TaskRow[];
     return rows.map(mapTask);
   }
 
@@ -302,6 +329,66 @@ export class SQLitePlatformStore {
       .prepare("SELECT * FROM tasks WHERE id = ? AND owner_id = ?")
       .get(taskId, ownerId) as TaskRow | undefined;
     return row ? mapTask(row) : null;
+  }
+
+  archiveThread(input: { threadId: string; ownerId: string; now: Date }): TaskRecord {
+    return this.immediateTransaction(() => {
+      const row = this.sqlite
+        .prepare("SELECT * FROM tasks WHERE id = ? AND owner_id = ?")
+        .get(input.threadId, input.ownerId) as TaskRow | undefined;
+      if (!row) throw new Error("Thread not found");
+      if (row.archived_at !== null) return mapTask(row);
+
+      const activeTurn = this.sqlite
+        .prepare(
+          `SELECT 1 FROM turns
+           WHERE task_id = ?
+             AND status IN ('ALLOCATING', 'QUEUED', 'RUNNING', 'WAITING_APPROVAL')
+           LIMIT 1`,
+        )
+        .get(input.threadId);
+      if (activeTurn || ["QUEUED", "RUNNING", "WAITING_APPROVAL"].includes(row.status)) {
+        throw new Error("Thread has active work and cannot be archived");
+      }
+
+      this.sqlite
+        .prepare("UPDATE tasks SET archived_at = ?, updated_at = ? WHERE id = ?")
+        .run(input.now.getTime(), input.now.getTime(), input.threadId);
+      this.insertAudit({
+        actorUserId: input.ownerId,
+        taskId: input.threadId,
+        threadId: row.thread_id,
+        action: "THREAD_ARCHIVED",
+        outcome: "SUCCESS",
+        summary: "Thread archived in CodexPlatform",
+        now: input.now,
+      });
+      return this.getTaskForUser(input.threadId, input.ownerId) as TaskRecord;
+    });
+  }
+
+  unarchiveThread(input: { threadId: string; ownerId: string; now: Date }): TaskRecord {
+    return this.immediateTransaction(() => {
+      const row = this.sqlite
+        .prepare("SELECT * FROM tasks WHERE id = ? AND owner_id = ?")
+        .get(input.threadId, input.ownerId) as TaskRow | undefined;
+      if (!row) throw new Error("Thread not found");
+      if (row.archived_at === null) return mapTask(row);
+
+      this.sqlite
+        .prepare("UPDATE tasks SET archived_at = NULL, updated_at = ? WHERE id = ?")
+        .run(input.now.getTime(), input.threadId);
+      this.insertAudit({
+        actorUserId: input.ownerId,
+        taskId: input.threadId,
+        threadId: row.thread_id,
+        action: "THREAD_UNARCHIVED",
+        outcome: "SUCCESS",
+        summary: "Thread unarchived in CodexPlatform",
+        now: input.now,
+      });
+      return this.getTaskForUser(input.threadId, input.ownerId) as TaskRecord;
+    });
   }
 
   getTaskOwnerId(taskId: string): string | null {
@@ -580,6 +667,19 @@ export class SQLitePlatformStore {
     if (result.changes !== 1) throw new Error("Turn not found");
   }
 
+  updateTurnConfigSnapshot(id: string, config: EffectiveThreadConfigSnapshot): void {
+    const result = this.sqlite
+      .prepare(
+        `UPDATE turns
+         SET config_snapshot_json = ?
+         WHERE id = ? AND status IN ('ALLOCATING', 'QUEUED')`,
+      )
+      .run(JSON.stringify(EffectiveThreadConfigSnapshotSchema.parse(config)), id);
+    if (result.changes !== 1) {
+      throw new Error("Turn config can only be finalized before Runtime start");
+    }
+  }
+
   bindTurnRuntime(id: string, codexTurnId: string, now: Date): void {
     const result = this.sqlite
       .prepare(
@@ -756,7 +856,8 @@ export class SQLitePlatformStore {
     now: Date;
   }): TaskEvent {
     return this.immediateTransaction(() => {
-      const payload = sanitizeTaskEventPayload(input.type, input.payload);
+      const pathContext = this.runtimePathContextForTask(input.taskId);
+      const payload = sanitizeTaskEventPayload(input.type, input.payload, pathContext);
       const itemId = deriveEventItemId(input.taskId, input.turnId, input.type, payload);
       const sequenceRow = this.sqlite
         .prepare(
@@ -794,10 +895,13 @@ export class SQLitePlatformStore {
 
   listTaskEvents(taskId: string, ownerId: string, afterSequence = 0): TaskEvent[] | null {
     if (!this.getTaskForUser(taskId, ownerId)) return null;
+    const pathContext = this.runtimePathContextForTask(taskId);
     const rows = this.sqlite
       .prepare("SELECT * FROM task_events WHERE task_id = ? AND sequence > ? ORDER BY sequence")
       .all(taskId, afterSequence) as EventRow[];
-    return rows.map((row) => mapEvent(row, this.resolvePlatformTurnId(row.task_id, row.turn_id)));
+    return rows.map((row) =>
+      mapEvent(row, this.resolvePlatformTurnId(row.task_id, row.turn_id), pathContext),
+    );
   }
 
   getUserSettings(userId: string, now: Date): UserSettings {
@@ -873,16 +977,21 @@ export class SQLitePlatformStore {
   getUserConnections(userId: string): UserConnectionRecord[] {
     this.requireUser(userId);
     const row = this.sqlite
-      .prepare("SELECT scopes FROM feishu_credentials WHERE user_id = ?")
-      .get(userId) as { scopes: string } | undefined;
+      .prepare("SELECT scopes, status FROM feishu_credentials WHERE user_id = ?")
+      .get(userId) as
+      | {
+          scopes: string;
+          status: "CONNECTED" | "REFRESHING" | "REAUTH_REQUIRED";
+        }
+      | undefined;
     return [
       {
         id: "feishu",
         name: "飞书",
         managed: true,
-        connected: Boolean(row),
+        connected: Boolean(row && row.status !== "REAUTH_REQUIRED"),
         scopes: row ? safeStringArray(row.scopes) : [],
-        status: row ? "CONNECTED" : "NOT_CONNECTED",
+        status: row?.status ?? "NOT_CONNECTED",
       },
     ];
   }
@@ -1128,7 +1237,8 @@ export class SQLitePlatformStore {
         .prepare("SELECT parent_task_id FROM subagent_threads WHERE thread_id = ?")
         .get(input.threadId) as { parent_task_id: string } | undefined;
       if (!subagent) throw new Error("Subagent not found");
-      const payload = sanitizeTaskEventPayload(input.type, input.payload);
+      const pathContext = this.runtimePathContextForTask(subagent.parent_task_id);
+      const payload = sanitizeTaskEventPayload(input.type, input.payload, pathContext);
       const itemId = deriveEventItemId(subagent.parent_task_id, input.turnId, input.type, payload);
       const sequenceRow = this.sqlite
         .prepare(
@@ -1172,8 +1282,34 @@ export class SQLitePlatformStore {
     return {
       ...summary,
       items: rows.map((row) =>
-        mapSubagentEvent(row, this.resolvePlatformTurnId(summary.parentThreadId, row.turn_id)),
+        mapSubagentEvent(
+          row,
+          this.resolvePlatformTurnId(summary.parentThreadId, row.turn_id),
+          this.runtimePathContextForTask(summary.parentThreadId),
+        ),
       ),
+    };
+  }
+
+  private runtimePathContextForTask(taskId: string): RuntimePathRedactionContext {
+    const row = this.sqlite
+      .prepare(
+        `SELECT a.codex_home
+         FROM tasks t
+         LEFT JOIN codex_accounts a ON a.id = t.account_id
+         WHERE t.id = ?`,
+      )
+      .get(taskId) as { codex_home: string | null } | undefined;
+    const codexHome = row?.codex_home ?? null;
+    const inferredRuntimeDir =
+      codexHome && basename(dirname(codexHome)) === "codex-accounts"
+        ? dirname(dirname(codexHome))
+        : null;
+    const runtimeDataDir = this.options.runtimeDataDir ?? inferredRuntimeDir;
+    return {
+      runtimeDataDir,
+      codexHome,
+      workspaceDir: runtimeDataDir ? join(runtimeDataDir, "workspaces", taskId) : null,
     };
   }
 
@@ -1722,6 +1858,7 @@ function mapTask(row: TaskRow): TaskRecord {
     threadConfig: row.thread_config_json
       ? EffectiveConfigOverrideSchema.parse(JSON.parse(row.thread_config_json))
       : null,
+    archivedAt: row.archived_at === null ? null : new Date(row.archived_at).toISOString(),
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
   };
@@ -1744,11 +1881,16 @@ function mapTurn(row: TurnRow): TurnRecord {
   };
 }
 
-function mapEvent(row: EventRow, platformTurnId: string | null): TaskEvent {
+function mapEvent(
+  row: EventRow,
+  platformTurnId: string | null,
+  pathContext: RuntimePathRedactionContext,
+): TaskEvent {
   const payload = sanitizeRuntimeTurnIdentifier(
     sanitizeTaskEventPayload(
       row.type,
       JSON.parse(row.payload_json) as TaskEventPayloadMap[TaskEventType],
+      pathContext,
     ),
     row.turn_id,
     platformTurnId,
@@ -1814,8 +1956,15 @@ function mapSubagent(
   };
 }
 
-function mapSubagentEvent(row: SubagentEventRow, platformTurnId: string | null): ThreadItem {
-  const rawPayload = JSON.parse(row.payload_json) as Record<string, unknown>;
+function mapSubagentEvent(
+  row: SubagentEventRow,
+  platformTurnId: string | null,
+  pathContext: RuntimePathRedactionContext,
+): ThreadItem {
+  const rawPayload = sanitizeEventTransport(
+    JSON.parse(row.payload_json) as Record<string, unknown>,
+    pathContext,
+  ) as Record<string, unknown>;
   const payload = sanitizeRuntimeTurnIdentifier(rawPayload, row.turn_id, platformTurnId);
   const itemId =
     row.turn_id && row.item_id.includes(row.turn_id)
@@ -1875,13 +2024,14 @@ const PUBLIC_EVENT_PAYLOAD_KEYS = {
   TURN_INTERRUPTED: ["status"],
   USER_MESSAGE: ["itemId", "kind", "text"],
   AGENT_MESSAGE_DELTA: ["itemId", "delta"],
+  AGENT_MESSAGE_PHASE: ["itemId", "phase"],
   REASONING_SUMMARY_DELTA: ["itemId", "delta"],
   PLAN_UPDATED: ["explanation", "plan"],
   COMMAND_STARTED: ["itemId", "command", "cwd"],
   COMMAND_OUTPUT: ["itemId", "delta"],
-  COMMAND_COMPLETED: ["itemId", "command", "exitCode", "durationMs"],
+  COMMAND_COMPLETED: ["itemId", "command", "aggregatedOutput", "exitCode", "durationMs"],
   TOOL_STARTED: ["itemId", "tool", "arguments"],
-  TOOL_COMPLETED: ["itemId", "tool", "durationMs"],
+  TOOL_COMPLETED: ["itemId", "tool", "result", "durationMs"],
   TOOL_FAILED: ["itemId", "tool", "error"],
   DIFF_UPDATED: ["diff"],
   APPROVAL_REQUESTED: [
@@ -1911,11 +2061,15 @@ const PUBLIC_EVENT_PAYLOAD_KEYS = {
     "resultSummary",
   ],
   TOKEN_USAGE_UPDATED: ["total", "last", "modelContextWindow"],
+  MODEL_REROUTED: ["fromModel", "toModel", "reason"],
+  RUNTIME_WARNING: ["message"],
+  CONTEXT_COMPACTED: ["status"],
 } as const satisfies Record<TaskEventType, readonly string[]>;
 
 function sanitizeTaskEventPayload<Type extends TaskEventType>(
   type: Type,
   payload: TaskEventPayloadMap[Type],
+  pathContext: RuntimePathRedactionContext = {},
 ): TaskEventPayloadMap[Type] {
   const source =
     payload && typeof payload === "object" && !Array.isArray(payload)
@@ -1930,7 +2084,7 @@ function sanitizeTaskEventPayload<Type extends TaskEventType>(
   const projected: Record<string, unknown> = {};
   for (const key of PUBLIC_EVENT_PAYLOAD_KEYS[type]) {
     if (!(key in source)) continue;
-    projected[key] = stripDangerousReasoningKeys(source[key]);
+    projected[key] = sanitizeEventTransport(source[key], pathContext);
   }
   return projected as TaskEventPayloadMap[Type];
 }
@@ -1938,6 +2092,7 @@ function sanitizeTaskEventPayload<Type extends TaskEventType>(
 const EVENT_TYPES_REQUIRING_STABLE_ITEM_ID = new Set<TaskEventType>([
   "USER_MESSAGE",
   "AGENT_MESSAGE_DELTA",
+  "AGENT_MESSAGE_PHASE",
   "REASONING_SUMMARY_DELTA",
   "COMMAND_STARTED",
   "COMMAND_OUTPUT",
@@ -1962,24 +2117,6 @@ const DEFAULT_EFFECTIVE_CONFIG_SNAPSHOT: EffectiveThreadConfigSnapshot =
 
 function isTerminalSubagentStatus(status: SubagentStatus): boolean {
   return status === "DONE" || status === "FAILED" || status === "INTERRUPTED";
-}
-
-function stripDangerousReasoningKeys(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripDangerousReasoningKeys);
-  if (!value || typeof value !== "object") return value;
-  const clean: Record<string, unknown> = {};
-  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-    if (
-      key === "reasoningTextDelta" ||
-      key === "reasoning_text_delta" ||
-      key === "encrypted_content" ||
-      key === "encryptedContent"
-    ) {
-      continue;
-    }
-    clean[key] = stripDangerousReasoningKeys(nested);
-  }
-  return clean;
 }
 
 function mapApproval(row: Record<string, unknown>): ApprovalRecord {

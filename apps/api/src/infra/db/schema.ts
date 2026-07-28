@@ -122,6 +122,9 @@ export const feishuCredentials = sqliteTable("feishu_credentials", {
   refreshExpiresAt: integer("refresh_expires_at", { mode: "timestamp_ms" }).notNull(),
   scopes: text("scopes").notNull(),
   tokenType: text("token_type").notNull(),
+  status: text("status").notNull().default("CONNECTED"),
+  lastRefreshErrorCode: text("last_refresh_error_code"),
+  reauthRequiredAt: integer("reauth_required_at", { mode: "timestamp_ms" }),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });
 
@@ -141,6 +144,7 @@ export const sessions = sqliteTable("sessions", {
     .references(() => users.id, { onDelete: "cascade" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
+  persistentAt: integer("persistent_at", { mode: "timestamp_ms" }),
   revokedAt: integer("revoked_at", { mode: "timestamp_ms" }),
 });
 
@@ -171,6 +175,7 @@ export const tasks = sqliteTable("tasks", {
   threadId: text("thread_id"),
   currentTurnId: text("current_turn_id"),
   threadConfigJson: text("thread_config_json"),
+  archivedAt: integer("archived_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });

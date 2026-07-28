@@ -3,9 +3,77 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { httpApi } from "./api.js";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  Reflect.set(document, "cookie", "codexplatform_csrf=; Max-Age=0; Path=/");
+});
 
 describe("HTTP API adapter", () => {
+  test("upgrades an existing non-persistent session once without another OAuth login", async () => {
+    Reflect.set(document, "cookie", "codexplatform_csrf=csrf-1; Path=/");
+    const session = {
+      user: { id: "user-1", name: "林可", role: "ADMIN", avatarUrl: null },
+      expiresAt: "2026-07-21T22:00:00.000Z",
+      persistent: false,
+      feishuConnectionStatus: "CONNECTED",
+    };
+    const persisted = {
+      ...session,
+      expiresAt: "2026-08-20T10:00:00.000Z",
+      persistent: true,
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(session))
+      .mockResolvedValueOnce(jsonResponse(persisted));
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(httpApi.getSession()).resolves.toMatchObject({
+      authenticated: true,
+      persistent: true,
+      expiresAt: "2026-08-20T10:00:00.000Z",
+    });
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/auth/session",
+      "/api/auth/session/persist",
+    ]);
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({ method: "POST" });
+  });
+
+  test("revokes the server session when the user logs out", async () => {
+    Reflect.set(document, "cookie", "codexplatform_csrf=csrf-1; Path=/");
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await httpApi.logout?.();
+
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/auth/logout",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+      }),
+    );
+  });
+
+  test("reads account-independent model catalogs for new and bound Threads", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ models: [], stale: false }))
+      .mockResolvedValueOnce(jsonResponse({ models: [], stale: false }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await httpApi.listModels?.();
+    await httpApi.listModels?.("thread / 1");
+
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/models",
+      "/api/models?threadId=thread%20%2F%201",
+    ]);
+  });
+
   test("uses the actor-aware 1.1 Thread, settings and Subagent endpoints", async () => {
     const fetcher = vi
       .fn<typeof fetch>()
@@ -65,6 +133,35 @@ describe("HTTP API adapter", () => {
     ]);
   });
 
+  test("uses the platform-owned Thread archive endpoints", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse([]))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetcher);
+    const archiveApi = httpApi as typeof httpApi & {
+      listArchivedThreads(): Promise<unknown>;
+      archiveThread(threadId: string): Promise<unknown>;
+      unarchiveThread(threadId: string): Promise<unknown>;
+    };
+
+    expect(archiveApi.listArchivedThreads).toBeTypeOf("function");
+    expect(archiveApi.archiveThread).toBeTypeOf("function");
+    expect(archiveApi.unarchiveThread).toBeTypeOf("function");
+    await archiveApi.listArchivedThreads();
+    await archiveApi.archiveThread("thread / 1");
+    await archiveApi.unarchiveThread("thread / 1");
+
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/threads/archived",
+      "/api/threads/thread%20%2F%201/archive",
+      "/api/threads/thread%20%2F%201/unarchive",
+    ]);
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({ method: "POST" });
+    expect(fetcher.mock.calls[2]?.[1]).toMatchObject({ method: "POST" });
+  });
+
   test("normalizes the real API session and account shapes for the UI", async () => {
     const fetcher = vi
       .fn<typeof fetch>()
@@ -81,7 +178,9 @@ describe("HTTP API adapter", () => {
             maxActiveUsers: 4,
             weeklyRemaining: 73,
             healthScore: 98,
-            quotaUpdatedAt: null,
+            authStatus: "AUTHENTICATED",
+            quotaUpdatedAt: "2026-07-21T12:00:00.000Z",
+            quotaResetsAt: "2026-07-28T12:00:00.000Z",
           },
         ]),
       );
@@ -89,7 +188,13 @@ describe("HTTP API adapter", () => {
 
     await expect(httpApi.getSession()).resolves.toMatchObject({ authenticated: true });
     await expect(httpApi.listAccounts()).resolves.toEqual([
-      expect.objectContaining({ maxUsers: 4, weeklyRemainingPercent: 73, health: 98 }),
+      expect.objectContaining({
+        maxUsers: 4,
+        weeklyRemainingPercent: 73,
+        authStatus: "AUTHENTICATED",
+        quotaUpdatedAt: "2026-07-21T12:00:00.000Z",
+        quotaResetsAt: "2026-07-28T12:00:00.000Z",
+      }),
     ]);
   });
 

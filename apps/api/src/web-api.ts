@@ -1,6 +1,8 @@
 import type {
   Bootstrap,
+  ComposerCapability,
   EffectiveConfigOverride,
+  ModelCatalog,
   SubagentThread,
   SubagentThreadDetail,
   TaskDetail,
@@ -10,7 +12,7 @@ import type {
   UserSettingsPatch,
   UserSettingsView,
 } from "@codexplatform/contracts";
-import type { PlatformUser } from "./auth/auth-store.js";
+import type { PlatformUser, ResolvedAuthSession } from "./auth/auth-store.js";
 
 export interface AuthApi {
   startLogin(): { state: string; browserBinding: string; authorizationUrl: string };
@@ -19,14 +21,17 @@ export interface AuthApi {
     sessionToken: string;
     csrfToken: string;
   }>;
-  resolveSession(
-    sessionToken: string,
-  ): { user: PlatformUser; csrfHash: string; expiresAt: Date } | null;
+  resolveSession(sessionToken: string): ResolvedAuthSession | null;
   verifyCsrf(expectedHash: string, providedToken: string): boolean;
+  persistSession(sessionToken: string): ResolvedAuthSession | null;
+  revokeSession(sessionToken: string): void;
+  refreshExpiringCredentials(): Promise<void>;
 }
 
 export interface PlatformApi {
   getBootstrap(): Promise<Bootstrap>;
+  listModels(userId: string, threadId?: string): Promise<ModelCatalog>;
+  listComposerCapabilities(userId: string, threadId?: string): Promise<ComposerCapability[]>;
   createProject(userId: string, input: { name: string }): Promise<unknown>;
   listProjects(userId: string): Promise<unknown>;
   createTask(userId: string, input: { projectId: string; title: string }): Promise<unknown>;
@@ -37,6 +42,9 @@ export interface PlatformApi {
     input: { projectId: string; title: string; config?: EffectiveConfigOverride },
   ): Promise<Thread>;
   listThreads(userId: string, projectId?: string): Promise<Thread[]>;
+  listArchivedThreads(userId: string): Promise<Thread[]>;
+  archiveThread(threadId: string, userId: string): Promise<{ ok: true }>;
+  unarchiveThread(threadId: string, userId: string): Promise<{ ok: true }>;
   getThread(threadId: string, userId: string): Promise<Thread | null>;
   getAdminThread(threadId: string, adminUserId: string): Promise<Thread | null>;
   startThreadTurn(
@@ -74,6 +82,7 @@ export interface PlatformApi {
   listAccounts(): Promise<unknown>;
   addAccount(input: { alias: string }, adminUserId: string): Promise<unknown>;
   loginAccount(accountId: string, adminUserId: string): Promise<unknown>;
+  refreshAccountQuotaNow(accountId: string, adminUserId: string): Promise<unknown>;
   setAccountState(
     accountId: string,
     state: "DRAINING" | "QUARANTINED" | "AVAILABLE",

@@ -5,10 +5,14 @@
 - 调度与安全规则先用无外部凭证的确定性测试验证。
 - 产品流程用 `RUNTIME_MODE=fake` 验证，但明确标记为模拟。
 - 1.1 验收对象是 `Project → Thread → Turn → Item` 的连续工作区，不再以旧版静态任务时间线作为通过标准。
+- Transcript 是 Item 事件流的可读产品投影，不是原始事件日志：命令只能在正文显示活动摘要，完整 stdout/stderr 只能进入 Bottom Panel；Tool 与 Diff/文件详情由活动行打开 Side Panel。
+- Pinned Summary、Side Panel 和 Bottom Panel 是三个相互独立的工作表面；能分别打开、共存和关闭才算通过。Pinned 使用 `displayTurn = activeTurn ?? latestTurn`，不能把其他历史 Turn 的 Output/Source 误报成当前进展。
 - 用户端、个人 Settings 和管理后台分别验收；管理员能看到的数据不能据此推断普通用户也能看到。
 - 可展示的推理摘要与原始 reasoning 分开验收：摘要可以出现，`reasoningTextDelta`、原始 `content` 和 `encrypted_content` 不得进入浏览器、事件、日志或审计。
 - 真实 Codex、真实飞书 API 和真实 Feishu Tool 分开验收，避免把某一层成功误当成全链路成功。
 - 任何真实外部测试只有在操作者本机实际执行并保留输出后才能记为“通过”。本文档不宣称这些外部测试已经执行成功。
+- 1.1A Fake 可模拟多人调度；1.1A Real 仅允许指定 operator；真实多人只属于通过全部门禁后的
+  1.1B，三类证据不得混写。
 
 ## 基础验证
 
@@ -19,6 +23,49 @@ pnpm verify
 ```
 
 `pnpm verify` 覆盖 lint、typecheck、单元/集成测试、Playwright fake 产品流程、Codex 协议漂移检查和 build；它不会自动启用需要真实凭证的 smoke。
+
+### 2026-07-27 自动基线与真实页面复读
+
+- 代码基线：`02b44fe`（Runtime 路径脱敏）+ `026722b`（Codex 工作区收敛）。
+- `pnpm verify`：PASS；450 项 Vitest 通过、2 项条件跳过，11 项 Playwright 通过，协议校验与
+  Production Build 通过。
+- 已认证的 1.1A Real 页面复读：真实模型目录包含 GPT-5.6-Sol / Terra 与对应 Effort；Pinned
+  Summary、Side Panel、Bottom Terminal 同时存在；Subagent Active/Done 与独立 Transcript 可读。
+- 旧历史命令中的账号 Runtime 路径已在 DOM 中替换为 `[CODEX_HOME]`，未检测到
+  `.data/real-runtime`、`codex-accounts` 或真实账号目录。
+- 本次没有启动第二个 App Server，因此没有重复执行 `REAL_CODEX_E2E=1`；这避免两个进程争用同一
+  `CODEX_HOME`。Real Smoke 与凭证隔离探针仍按下表保持“未执行”。
+
+### 2026-07-27 Real HTTPS 传输回归
+
+- 复现任务 `3b21f413-77cc-46c0-8dfb-6833ca711184` 的 Turn 用时 124.4 秒；事件明确记录
+  `Falling back from WebSockets to HTTPS transport. request timed out`，首个模型输出在约 110 秒后出现。
+- Runtime 改为 HTTPS-only Provider 后，最终配置回归任务
+  `e1d5f48e-3734-4d0e-9481-fff24562d199` 使用 GPT-5.6-Sol 正常返回
+  `REAL_HTTPS_COMPACTION_OK`；Turn 用时 8.25 秒，首个文本约 7.2 秒出现。
+- 最终 Provider ID 为 `codexplatform_openai_https`，名称保持官方精确值 `OpenAI`，避免关闭长 Turn
+  所需的 OpenAI 远端上下文压缩判定。
+- 回归任务事件包含 Lease、Turn、Agent Delta、Token Usage 和完成事件，不包含 WebSocket 回退；
+  浏览器 DOM 显示真实模型、完成状态和最终回复。
+- 该回归证明当前单操作者真实链路的 transport 修复，不替代完整 `REAL_CODEX_E2E=1`、
+  凭证隔离探针或真实多人门禁。
+
+### 2026-07-28 Composer 权限与能力注册表纵切
+
+- `pnpm verify`：PASS；510 项 Vitest 通过、2 项条件跳过，12 项 Playwright 通过，协议校验与
+  Production Build 通过。
+- `ASK_FOR_APPROVAL`、`APPROVE_FOR_ME`、`FULL_ACCESS` 和 `CUSTOM` 已有统一契约；App Server
+  参数映射由 Runtime 单测逐字段核验。当前组织策略只开放前两档，`FULL_ACCESS` 与 `CUSTOM`
+  在 Composer 中可见但不可选，并显示门禁原因。
+- `GET /api/composer/capabilities` 按当前飞书用户和 Thread 返回服务端能力真值；浏览器不能自行把
+  `Files and folders`、Goal、Plan mode 或 Record a skill 标记成可用。
+- 当前四个 Add 能力尚未完成端到端实现，全部显示为禁用；这证明产品不会用可点击空壳伪装能力，
+  不代表附件、Goal、Plan 或 Skill 已交付。
+- Playwright 已验证权限菜单选择 `Approve for me` 后，保存的 Turn 配置快照为
+  `permissionMode=APPROVE_FOR_ME`；同时验证 Full access 与四个 Add 能力的禁用状态。
+- 视觉 UAT 产物名为 `composer-add-menu.png` 和 `composer-permissions.png`，由
+  `CODEXPLATFORM_CAPTURE_UAT=1` 生成在 Playwright 输出目录；截图只证明 Fake Runtime 页面结构，
+  不替代真实飞书登录和 Real Runtime Smoke。
 
 关键生命周期回归可单独运行：
 
@@ -42,9 +89,13 @@ pnpm exec vitest run apps/api/src/infra/codex/app-server-execution-adapter.test.
 ```bash
 pnpm exec vitest run \
   apps/web/src/v11-app.test.tsx \
+  apps/web/src/components/thread/SafeMarkdown.test.tsx \
+  apps/web/src/thread-presentation.test.ts \
   apps/web/src/thread-events.test.ts \
   apps/web/src/api.test.ts \
-  apps/api/src/server-api.test.ts
+  apps/api/src/server-api.test.ts \
+  apps/api/src/domain/platform-store.test.ts \
+  apps/api/src/infra/codex/event-normalizer.test.ts
 
 pnpm test:e2e
 ```
@@ -55,29 +106,73 @@ pnpm test:e2e
 组合后的自动证据验证：
 
 1. `/api/bootstrap` 仅开放 `CODEX`；用户端不出现 ChatGPT Chat / Work 空壳。
-2. 已认证 Session 进入 Codex 用户工作区后，存在 New chat、Projects、历史、Settings、连续对话 Composer、右侧详情区和按需 Inspector。
+2. 已认证 Session 进入 Codex 用户工作区后，存在 New chat、Projects、历史、Settings、连续 Transcript 与 Composer；Pinned Summary、Side Panel、Bottom Panel 可独立打开。
 3. 第 2 个 Prompt 在同一 Thread 中形成新的 Turn，旧 Turn 和执行证据仍可见。
 4. 组件测试验证 legacy `/tasks/:id` 跳转到 `/threads/:id`。
-5. Playwright 验证 Plan、命令、Tool、Diff 和结果 Item；组件/API 测试验证审批 Item；事件测试验证 SSE 增量只在相同 `threadId + turnId + itemId + type` 内合并。
-6. Subagents 展示 Active / Done，能打开独立只读详情，其他用户不能读取。
-7. Settings 使用批准的 8 个个人分组并按测试用户保存；只读和占位分组不会伪装为已接入能力。
-8. 管理后台使用独立壳和导航；普通成员没有入口，直接访问管理 API 返回拒绝。
-9. 服务/Adapter 测试验证 active Turn 恢复冲突会拒绝 Prompt 并隔离账号；组件测试验证排队或请求 pending 时不能重复提交。
-10. 普通用户 Thread、SSE 和兼容 Task 响应中没有共享账号别名、凭证、`CODEX_HOME` 或 raw reasoning。
+5. Playwright 选择 Runtime 返回的模型和该模型支持的 Effort，并从保存后的 Turn 配置快照核对
+   `model` / `effort`；权限菜单选择 `Approve for me` 后同样从快照核对
+   `permissionMode=APPROVE_FOR_ME`，不以按钮文案代替生效证据。
+6. Playwright 验证 Plan、命令、Tool、Diff 和结果 Item；Transcript 不出现命令原始输出，命令活动行打开 Bottom Panel Terminal，且多条命令按 Item 分块而不是拼接；Tool 与 Diff/文件活动行打开带标题和返回入口的 Side Panel 详情。
+7. 组件/API 测试验证审批 Item；事件测试验证 SSE 增量只在相同 `threadId + turnId + itemId + type` 内合并。
+8. Subagents 在 Side Panel 展示 Active / Done，能打开独立只读 Transcript；其完整命令输出仍只进入 Bottom Terminal，其他用户不能读取。
+9. Settings 使用批准的 8 个个人分组并按测试用户保存；只读和占位分组不会伪装为已接入能力。
+10. 管理后台使用独立壳和导航；普通成员没有入口，直接访问管理 API 返回拒绝。
+11. 服务/Adapter 测试验证 active Turn 恢复冲突会拒绝 Prompt 并隔离账号；组件测试验证排队或请求 pending 时不能重复提交。
+12. 普通用户 Thread、SSE、DOM、浏览器控制台和兼容 Task 响应中没有共享账号别名、凭证、`CODEX_HOME` 绝对路径或 raw reasoning canary；该断言必须使用真实路径形态哨兵，而不能只搜索字符串键名。
+13. 用户、Agent 和推理摘要的粗体、列表、代码块、表格能够按安全 Markdown 呈现；原始 HTML、`javascript:` 链接和远程 Markdown 图片不会执行或加载。
+14. 不存在下载路由的 `/api/artifacts/*` 不显示为可点击链接；Output/Source 名称、URI 和 citation
+    不得暴露任意本机绝对路径。
+15. 不存在独立 Continue 按钮或自动固定 Prompt；终态后的后续执行必须来自用户 Composer 输入。
 
 ### 手工产品 UAT
 
 使用 `RUNTIME_MODE=fake` 启动后：
 
 1. 用飞书登录，确认直接进入 `/threads/new`。
-2. 从 New chat 提交一个包含 Plan、命令、Tool 和文件修改的 Prompt。
-3. 等待 fake Turn 完成，在同一 Composer 提交第 2 个 Prompt，确认 URL 和 Thread 不变、两轮内容连续。
-4. 切换 Plan、Outputs、Subagents、Sources，再打开 Terminal、Changes、Files、Tool details。
-5. 进入 Settings，修改 Theme 或 Reasoning Effort，保存并刷新，确认值仍属于当前用户。
-6. 管理员进入独立 `/admin/accounts`，检查 Accounts、Policies、Connectors、Usage、Audit 和 Runtime health；再返回用户工作区。
-7. 在浏览器 Network 中检查 `/api/threads/:id` 和 SSE：用户侧不得出现账号别名或 raw reasoning；管理员审计可出现账号别名但不能出现凭证。
+2. 打开 “Add files and more”，确认 Files、Goal、Plan、Record skill 均显示真实禁用原因；当前阶段
+   不应允许点击。
+3. 打开权限菜单，确认 Ask for approval 与 Approve for me 可选，Full access 与 Custom 禁用；选择
+   `Approve for me`。
+4. 打开 Composer 的 Model / Effort 选择器：选择 `Fake Deep` 后默认 Effort 应切换到 `high`，再选择 `xhigh` 并提交。
+5. Turn 完成后读取 `/api/threads/:id`，确认该 Turn 的 `model=fake-codex-deep`、`effort=xhigh`、
+   `configSnapshot.permissionMode=APPROVE_FOR_ME`；只看选择器文案不能判定通过。
+6. 确认 Transcript 连续展示用户消息、Plan 更新、命令/Tool/Diff 活动摘要和最终回复；Markdown 粗体与代码应正确渲染，正文中不得出现独立的 `fake-codexplatform` 原始输出。
+7. 点击命令活动行打开 Bottom Panel 的 Terminal，确认其中能看到 `fake-codexplatform`；Bottom Panel 不出现 Changes、Files 或 Tool details 标签。
+8. 依次打开 Pinned Summary、Side Panel 和 Bottom Panel，确认三者同时可见；单独关闭 Pinned Summary 后，Side 与 Bottom 仍保持打开。
+9. Side Panel 切换 Plan、Outputs、Subagents、Sources；再分别点击 Transcript 的 Tool 与 Diff/文件活动行，确认 Side Panel 进入对应详情并能返回父 Tab。Pinned Summary 打开时不改变正文宽度，Side Panel 打开时才压缩正文。
+10. 在同一 Composer 提交第 2 个 Prompt，确认 URL 和 Thread 不变、两轮内容连续。
+11. 进入 Settings，修改 Theme 或默认 Model / Effort，保存并刷新，确认值仍属于当前飞书用户。
+12. 管理员进入独立 `/admin/accounts`，检查 Accounts、Policies、Connectors、Usage、Audit 和 Runtime health；再返回用户工作区。
+13. 在浏览器 Network 中检查 `/api/threads/:id` 和 SSE：用户侧不得出现账号别名、raw reasoning、`.data/real-runtime/codex-accounts/` 或真实 `CODEX_HOME` 路径；管理员审计可出现账号别名但不能出现凭证路径。
 
 fake UAT 证明的是交互和投影，不证明真实 Codex、多用户凭证隔离或真实飞书 Tool 已通过。
+
+### P0 浏览器验收快速命令
+
+```bash
+pnpm exec playwright test tests/e2e/workspace.spec.ts \
+  --grep "governed Composer capabilities|Pinned, Side, and Bottom|reasoning canaries"
+```
+
+该 Playwright 快速命令覆盖以下 P0 门禁：
+
+1. 模型选择与 Effort 联动真实进入 Turn 配置快照。
+2. Pinned / Side / Bottom 三表面独立共存。
+3. 命令原始输出不进入 Transcript、仅在 Bottom Panel Terminal 可见；Tool 与 Diff/文件详情进入 Side Panel。
+4. Thread JSON、SSE replay、实时 SSE、DOM 和浏览器消息均不含 raw reasoning canary。
+
+安全 Markdown、Output/Source URI、raw reasoning 持久化和 Runtime 路径历史回放由上方列出的
+`SafeMarkdown.test.tsx`、`thread-presentation.test.ts`、`platform-store.test.ts`、
+`event-normalizer.test.ts` 与 `server-api.test.ts` 验证，不能把未包含这些用例的 Playwright
+grep 结果当作相应证据。
+
+需要保留浏览器截图时运行：
+
+```bash
+CODEXPLATFORM_CAPTURE_UAT=1 pnpm test:e2e
+```
+
+截图只能作为交互证据；模型与 Effort 仍以 API 配置快照为准，raw reasoning 仍以自动 canary 断言为准。
 
 ## Thread、Settings 与 Subagent 数据边界
 
@@ -288,22 +383,40 @@ unset FEISHU_E2E_USER_ACCESS_TOKEN
 
 完成后清理 Shell 环境和终端滚屏。测试通过只证明该 Token 的 Feishu Client 链路，不证明 Codex Dynamic Tool、另一名用户权限隔离或真实共享账号已通过。
 
+真实 Refresh Token 轮换使用同一命令的独立门禁。先停止 API，避免与后台刷新循环竞争，然后复用平台真实数据库和 `.env.local`：
+
+```bash
+export REAL_FEISHU_REFRESH_E2E=1
+export DATABASE_PATH=/absolute/path/to/real-codexplatform.sqlite
+pnpm test:real-feishu
+```
+
+该 Smoke 不输出或导出 Token；它通过平台 AES-GCM SecretStore 解密当前活跃用户凭证，调用飞书刷新接口，并在同一数据库事务中验证新 Refresh Token、到期时间和 `CONNECTED` 状态。完成后重新启动 API。
+
 ## 验收记录模板
 
 | 项目 | Runtime | 执行时间 | 操作者 | 结果 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| CODEX-only 用户端 / 连续 2 Turn | fake |  |  | 未执行 | Playwright / 截图 |
-| 用户 Settings 隔离与持久化 | fake + 自动测试 |  |  | 未执行 | 测试输出 / 截图 |
-| Subagent Active/Done / 详情 / ACL | fake + 自动测试 |  |  | 未执行 | 测试输出 / 截图 |
-| 独立管理后台与成员拒绝 | fake + 自动测试 |  |  | 未执行 | 测试输出 / 截图 |
-| 用户侧账号别名 / raw reasoning 脱敏 | 自动测试 |  |  | 未执行 | 测试输出 |
-| active Turn fail-closed | 自动测试 |  |  | 未执行 | adapter/service 测试输出 |
-| 5 人争抢 / 第 5 人排队 | fake + 自动测试 |  |  | 未执行 | 测试输出 / 截图 |
-| 同用户 3 Turn | 自动测试 |  |  | 未执行 | 测试输出 |
+| CODEX-only 用户端 / 连续 2 Turn | fake | 2026-07-27 | Codex | 自动通过 | Playwright |
+| Runtime 模型 / Effort 联动与配置快照 | fake + real 页面复读 | 2026-07-27 | Codex | 通过 | Playwright + 真实 DOM |
+| Pinned / Side / Bottom 独立共存 | fake + real 页面复读 | 2026-07-27 | Codex | 通过 | Playwright + 真实 DOM |
+| Transcript 摘要 / Terminal 原始输出 / Side 详情隔离 | fake + 自动测试 | 2026-07-27 | Codex | 自动通过 | Playwright / Vitest |
+| 用户 Settings 隔离与持久化 | fake + 自动测试 | 2026-07-27 | Codex | 自动通过 | Playwright |
+| Subagent Active/Done / 详情 / ACL | fake + real 页面复读 | 2026-07-27 | Codex | 通过 | 自动测试 + 真实 DOM |
+| 独立管理后台与成员拒绝 | fake + 自动测试 | 2026-07-27 | Codex | 自动通过 | Playwright |
+| 用户侧账号别名 / raw reasoning 脱敏 | 自动测试 | 2026-07-27 | Codex | 自动通过 | API / SSE / DOM canary |
+| Runtime / `CODEX_HOME` 路径持久化与回放脱敏 | 自动测试 + real 页面复读 | 2026-07-27 | Codex | 通过 | store / API / SSE 哨兵 + 真实 DOM |
+| Real Codex HTTPS-only 首包与完成 | real / 单 operator | 2026-07-27 | Codex | 通过 | 真实 DOM + SQLite 事件时间戳 |
+| Output / Source URI 与本机路径安全 | 自动测试 | 2026-07-27 | Codex | 自动通过 | projection 测试 |
+| Token 不进入 SQLite / 日志 / 异常 | 自动测试 | 2026-07-27 | Codex | 自动通过 | secret canary 测试 |
+| 1.1A Real 非 operator 拒绝 | real gate + 自动测试 | 2026-07-27 | Codex | 自动通过 | composition / safety gate 测试 |
+| active Turn fail-closed | 自动测试 | 2026-07-27 | Codex | 自动通过 | adapter / service 测试 |
+| 5 人争抢 / 第 5 人排队 | fake + 自动测试 | 2026-07-27 | Codex | 自动通过 | lease / service 测试 |
+| 同用户 3 Turn | 自动测试 | 2026-07-27 | Codex | 自动通过 | lease / service 测试 |
 | 飞书 OAuth | fake/real 共用 |  |  | 未执行 | 回调与角色截图 |
 | Feishu Tool 搜索/读取 | real |  |  | 未执行 | Tool 时间线 + 审计 |
 | Real Codex Smoke | real / 单 operator |  |  | 未执行 | 完整命令输出 |
 | Real Feishu Smoke | direct client |  |  | 未执行 | 脱敏命令输出 |
-| 凭证隔离探针 | real gate |  |  | 当前为 READABLE | 探针 JSON |
+| 凭证隔离探针 | real gate |  |  | 未执行 | 带时间与 commit 的脱敏探针 JSON |
 
 证据中不得包含 App Secret、Token、Cookie、授权 URL、`CODEX_HOME` 内文件或飞书私密正文。

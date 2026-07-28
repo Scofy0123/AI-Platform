@@ -38,7 +38,25 @@ describe("CodexRuntimeSupervisor", () => {
     expect(spawnProcess).toHaveBeenCalledTimes(1);
     expect(spawnProcess).toHaveBeenCalledWith(
       "/opt/codex",
-      ["app-server", "--stdio", "--strict-config", "-c", 'cli_auth_credentials_store="file"'],
+      [
+        "app-server",
+        "--stdio",
+        "--strict-config",
+        "-c",
+        'cli_auth_credentials_store="file"',
+        "-c",
+        'model_provider="codexplatform_openai_https"',
+        "-c",
+        'model_providers.codexplatform_openai_https.name="OpenAI"',
+        "-c",
+        'model_providers.codexplatform_openai_https.base_url="https://chatgpt.com/backend-api/codex"',
+        "-c",
+        'model_providers.codexplatform_openai_https.wire_api="responses"',
+        "-c",
+        "model_providers.codexplatform_openai_https.requires_openai_auth=true",
+        "-c",
+        "model_providers.codexplatform_openai_https.supports_websockets=false",
+      ],
       expect.objectContaining({
         env: expect.objectContaining({ CODEX_HOME: codexHome }),
       }),

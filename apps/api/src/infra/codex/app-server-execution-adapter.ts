@@ -1,5 +1,10 @@
 import { EventEmitter } from "node:events";
-import type { ActorContext, EffectiveThreadConfigSnapshot } from "@codexplatform/contracts";
+import {
+  type ActorContext,
+  type EffectiveThreadConfigSnapshot,
+  type ModelOption,
+  ModelOptionSchema,
+} from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
 import type {
   ApprovalDraft,
@@ -15,10 +20,16 @@ import {
 import type { ApprovalTransportIdentity } from "../../domain/platform-store.js";
 import type { ActorRegistry } from "../../tools/actor-registry.js";
 import type { DynamicToolCall, DynamicToolResponse } from "../../tools/tool-runtime.js";
-import type { DynamicToolDefinition, WeeklyQuota } from "./codex-runtime.js";
+import {
+  type DynamicToolDefinition,
+  isRateLimitSnapshot,
+  type WeeklyQuota,
+  weeklyQuotaFromRateLimitSnapshot,
+} from "./codex-runtime.js";
 import { CodexEventNormalizer } from "./event-normalizer.js";
 import type { CommandExecutionRequestApprovalResponse } from "./generated/v2/CommandExecutionRequestApprovalResponse.js";
 import type { FileChangeRequestApprovalResponse } from "./generated/v2/FileChangeRequestApprovalResponse.js";
+import type { Model } from "./generated/v2/Model.js";
 import type { PermissionsRequestApprovalResponse } from "./generated/v2/PermissionsRequestApprovalResponse.js";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse.js";
 
@@ -47,6 +58,7 @@ interface RuntimePort {
   interruptTurn(threadId: string, turnId: string): Promise<unknown>;
   startChatGptLogin(): Promise<{ loginId: string; authUrl: string }>;
   readWeeklyQuota(): Promise<WeeklyQuota>;
+  listModels(): Promise<Model[]>;
 }
 
 export interface ManagedRuntimePort {
@@ -78,6 +90,7 @@ interface AdapterOptions {
   supervisor: RuntimeSupervisorPort;
   tools: ToolRuntimePort;
   actors: ActorRegistry;
+  runtimeDataDir?: string;
 }
 
 interface ThreadContext {
@@ -123,6 +136,14 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
   constructor(private readonly options: AdapterOptions) {
     super();
     options.supervisor.on?.("accountCrashed", (event) => this.handleAccountCrash(event));
+  }
+
+  async listModels(account: InternalAccount): Promise<ModelOption[]> {
+    const managed = await this.options.supervisor.startAccount({
+      accountId: account.id,
+      codexHome: account.codexHome,
+    });
+    return (await managed.runtime.listModels()).map(mapRuntimeModel);
   }
 
   async startTask(input: {
@@ -204,7 +225,15 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       actorContext: cloneActorContext(input.actorContext),
     });
     this.runtimeByThread.set(threadId, managed.runtime);
-    this.normalizerByTask.set(input.taskId, new CodexEventNormalizer({ taskId: input.taskId }));
+    this.normalizerByTask.set(
+      input.taskId,
+      new CodexEventNormalizer({
+        taskId: input.taskId,
+        codexHome: input.codexHome,
+        workspaceDir: input.cwd,
+        ...(this.options.runtimeDataDir ? { runtimeDataDir: this.options.runtimeDataDir } : {}),
+      }),
+    );
     const startingSignals: BufferedRpcSignal[] = [];
     this.startingSignalsByThread.set(contextKey, startingSignals);
     try {
@@ -445,6 +474,12 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       this.emit(params.success === true ? "accountAuthenticated" : "accountAuthFailed", {
         accountId,
       });
+      return;
+    }
+    if (message.method === "account/rateLimits/updated") {
+      if (!isRateLimitSnapshot(params.rateLimits)) return;
+      const quota = weeklyQuotaFromRateLimitSnapshot(params.rateLimits);
+      if (quota.status === "KNOWN") this.emit("accountQuotaUpdated", { accountId, quota });
       return;
     }
     const threadId = stringValue(params.threadId);
@@ -740,6 +775,24 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       }
     }
   }
+}
+
+function mapRuntimeModel(model: Model): ModelOption {
+  return ModelOptionSchema.parse({
+    id: model.id,
+    model: model.model,
+    displayName: model.displayName,
+    description: model.description,
+    hidden: model.hidden,
+    isDefault: model.isDefault,
+    defaultReasoningEffort: model.defaultReasoningEffort,
+    supportedReasoningEfforts: model.supportedReasoningEfforts.map((effort) => ({
+      value: effort.reasoningEffort,
+      description: effort.description,
+    })),
+    inputModalities: model.inputModalities,
+    supportsPersonality: model.supportsPersonality,
+  });
 }
 
 function connectionThreadKey(accountId: string, generation: number, threadId: string): string {

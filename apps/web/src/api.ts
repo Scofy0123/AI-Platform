@@ -4,7 +4,9 @@ import type {
   AdminPolicies,
   AdminUsage,
   Bootstrap,
+  ComposerCapability,
   ConnectionSummary,
+  ModelCatalog,
   PlatformApi,
   PluginSummary,
   ProjectSummary,
@@ -21,6 +23,9 @@ import type {
 
 interface RawSession {
   user: Session["user"];
+  expiresAt?: string;
+  persistent?: boolean;
+  feishuConnectionStatus?: Session["feishuConnectionStatus"];
 }
 
 interface RawProject extends Omit<ProjectSummary, "taskCount"> {
@@ -35,7 +40,9 @@ interface RawAccount {
   maxActiveUsers: number;
   weeklyRemaining: number | null;
   healthScore: number;
+  authStatus?: AccountSummary["authStatus"];
   quotaUpdatedAt?: string | null;
+  quotaResetsAt?: string | null;
 }
 
 interface RawAudit {
@@ -109,10 +116,31 @@ function readCookie(name: string): string | null {
 
 export const httpApi: PlatformApi = {
   getSession: async () => {
-    const session = await request<RawSession>("/api/auth/session");
-    return { authenticated: true, user: session.user };
+    let session = await request<RawSession>("/api/auth/session");
+    if (session.persistent === false) {
+      session = await request<RawSession>("/api/auth/session/persist", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    }
+    return normalizeSession(session);
   },
+  logout: () =>
+    request<void>("/api/auth/logout", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
   getBootstrap: () => request<Bootstrap>("/api/bootstrap"),
+  listModels: (threadId) =>
+    request<ModelCatalog>(
+      threadId ? `/api/models?threadId=${encodeURIComponent(threadId)}` : "/api/models",
+    ),
+  listComposerCapabilities: (threadId) =>
+    request<ComposerCapability[]>(
+      threadId
+        ? `/api/composer/capabilities?threadId=${encodeURIComponent(threadId)}`
+        : "/api/composer/capabilities",
+    ),
   listProjects: async () => {
     const projects = await request<RawProject[]>("/api/projects");
     return projects.map((project) => ({ ...project, taskCount: project.taskCount ?? 0 }));
@@ -146,6 +174,7 @@ export const httpApi: PlatformApi = {
     request<Thread[]>(
       projectId ? `/api/threads?projectId=${encodeURIComponent(projectId)}` : "/api/threads",
     ),
+  listArchivedThreads: () => request<Thread[]>("/api/threads/archived"),
   getThread: (threadId) => request<Thread>(`/api/threads/${encodeURIComponent(threadId)}`),
   createThread: (input) =>
     request<Thread>("/api/threads", {
@@ -161,6 +190,16 @@ export const httpApi: PlatformApi = {
     request(`/api/threads/${encodeURIComponent(threadId)}/${action}`, {
       method: "POST",
       body: JSON.stringify(action === "steer" && input ? { prompt: input } : {}),
+    }),
+  archiveThread: (threadId) =>
+    request<{ ok: true }>(`/api/threads/${encodeURIComponent(threadId)}/archive`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  unarchiveThread: (threadId) =>
+    request<{ ok: true }>(`/api/threads/${encodeURIComponent(threadId)}/unarchive`, {
+      method: "POST",
+      body: JSON.stringify({}),
     }),
   listSubagents: (threadId) =>
     request<SubagentThread[]>(`/api/threads/${encodeURIComponent(threadId)}/subagents`),
@@ -195,8 +234,10 @@ export const httpApi: PlatformApi = {
       activeUsers: account.activeUsers,
       maxUsers: account.maxActiveUsers,
       weeklyRemainingPercent: account.weeklyRemaining,
+      ...(account.authStatus ? { authStatus: account.authStatus } : {}),
       health: account.healthScore,
       quotaUpdatedAt: account.quotaUpdatedAt ?? null,
+      quotaResetsAt: account.quotaResetsAt ?? null,
     }));
   },
   addAccount: (alias) =>
@@ -220,6 +261,16 @@ export const httpApi: PlatformApi = {
     }));
   },
 };
+
+function normalizeSession(session: RawSession): Session {
+  return {
+    authenticated: true,
+    user: session.user,
+    expiresAt: session.expiresAt ?? "",
+    persistent: session.persistent ?? false,
+    feishuConnectionStatus: session.feishuConnectionStatus ?? "REAUTH_REQUIRED",
+  };
+}
 
 function normalizeTaskStatus(status: string): TaskSummary["status"] {
   const supported = new Set<TaskSummary["status"]>([

@@ -108,6 +108,10 @@ CREATE TABLE IF NOT EXISTS feishu_credentials (
   refresh_expires_at INTEGER NOT NULL,
   scopes TEXT NOT NULL,
   token_type TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'CONNECTED'
+    CHECK(status IN ('CONNECTED', 'REFRESHING', 'REAUTH_REQUIRED')),
+  last_refresh_error_code TEXT,
+  reauth_required_at INTEGER,
   updated_at INTEGER NOT NULL
 );
 
@@ -125,6 +129,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
+  persistent_at INTEGER,
   revoked_at INTEGER
 );
 
@@ -152,6 +157,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   thread_id TEXT,
   current_turn_id TEXT,
   thread_config_json TEXT,
+  archived_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -313,8 +319,17 @@ export function migrateDatabase(sqlite: Database.Database): void {
   ensureColumn(sqlite, "codex_accounts", "quota_resets_at", "INTEGER");
   ensureColumn(sqlite, "task_events", "item_id", "TEXT");
   ensureColumn(sqlite, "tasks", "thread_config_json", "TEXT");
+  ensureColumn(sqlite, "tasks", "archived_at", "INTEGER");
+  sqlite.exec(
+    `CREATE INDEX IF NOT EXISTS tasks_owner_archived_updated_idx
+       ON tasks(owner_id, archived_at, updated_at DESC)`,
+  );
   ensureColumn(sqlite, "turns", "config_snapshot_json", "TEXT");
   ensureColumn(sqlite, "queue_entries", "required_account_id", "TEXT");
+  ensureColumn(sqlite, "sessions", "persistent_at", "INTEGER");
+  ensureColumn(sqlite, "feishu_credentials", "status", "TEXT NOT NULL DEFAULT 'CONNECTED'");
+  ensureColumn(sqlite, "feishu_credentials", "last_refresh_error_code", "TEXT");
+  ensureColumn(sqlite, "feishu_credentials", "reauth_required_at", "INTEGER");
   backfillQueuedThreadAccountAffinity(sqlite);
   backfillTaskEventItemIds(sqlite);
   migrateApprovalsTable(sqlite);
@@ -440,15 +455,27 @@ function migrateApprovalsTable(sqlite: Database.Database): void {
 
 function ensureColumn(
   sqlite: Database.Database,
-  table: "codex_accounts" | "queue_entries" | "task_events" | "tasks" | "turns",
+  table:
+    | "codex_accounts"
+    | "queue_entries"
+    | "task_events"
+    | "tasks"
+    | "turns"
+    | "sessions"
+    | "feishu_credentials",
   column:
     | "codex_home"
     | "quota_resets_at"
     | "required_account_id"
     | "item_id"
     | "thread_config_json"
-    | "config_snapshot_json",
-  definition: "TEXT" | "INTEGER",
+    | "archived_at"
+    | "config_snapshot_json"
+    | "persistent_at"
+    | "status"
+    | "last_refresh_error_code"
+    | "reauth_required_at",
+  definition: "TEXT" | "INTEGER" | "TEXT NOT NULL DEFAULT 'CONNECTED'",
 ): void {
   const columns = sqlite.pragma(`table_info(${table})`) as Array<{ name: string }>;
   if (columns.some((entry) => entry.name === column)) return;

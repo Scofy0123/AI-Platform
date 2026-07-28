@@ -1,6 +1,8 @@
 import { EventEmitter } from "node:events";
 import {
   BootstrapSchema,
+  ModelCatalogSchema,
+  type ModelOption,
   TaskDetailSchema,
   TaskSummarySchema,
   ThreadSchema,
@@ -17,6 +19,7 @@ import {
   type ApprovalDraft,
   ApprovalTransportUnavailableError,
   LocalPlatformService,
+  ModelCatalogUnavailableError,
   type RuntimeSafetyPort,
   type TaskEventDraft,
   type TaskExecutionAdapter,
@@ -24,6 +27,35 @@ import {
 import { SQLitePlatformStore } from "./platform-store.js";
 
 const NOW = new Date("2026-07-21T12:00:00.000Z");
+const STANDARD_MODEL: ModelOption = {
+  id: "fake-codex-standard",
+  model: "fake-codex-standard",
+  displayName: "Fake Codex Standard",
+  description: "Deterministic test model",
+  hidden: false,
+  isDefault: true,
+  defaultReasoningEffort: "medium",
+  supportedReasoningEfforts: [
+    { value: "low", description: "Fast" },
+    { value: "medium", description: "Balanced" },
+    { value: "high", description: "Deep" },
+  ],
+  inputModalities: ["text", "image"],
+  supportsPersonality: true,
+};
+const DEEP_MODEL: ModelOption = {
+  ...STANDARD_MODEL,
+  id: "fake-codex-deep",
+  model: "fake-codex-deep",
+  displayName: "Fake Codex Deep",
+  isDefault: false,
+  defaultReasoningEffort: "high",
+  supportedReasoningEfforts: [
+    { value: "medium", description: "Balanced" },
+    { value: "high", description: "Deep" },
+    { value: "xhigh", description: "Extended" },
+  ],
+};
 
 describe("LocalPlatformService", () => {
   let database: PlatformDatabase;
@@ -33,6 +65,7 @@ describe("LocalPlatformService", () => {
   let execution: FakeExecution;
   let gate: RuntimeSafetyPort;
   let service: LocalPlatformService;
+  let currentNow: Date;
 
   beforeEach(() => {
     database = createDatabase(":memory:");
@@ -56,6 +89,7 @@ describe("LocalPlatformService", () => {
     });
     execution = new FakeExecution();
     gate = { authorize: vi.fn(() => ({ allowed: true, mode: "SIMULATED_MULTI_USER" })) };
+    currentNow = NOW;
     service = new LocalPlatformService({
       store,
       leases,
@@ -63,7 +97,7 @@ describe("LocalPlatformService", () => {
       execution,
       safety: gate,
       dataDir: "/tmp/codexplatform-test",
-      now: () => NOW,
+      now: () => currentNow,
     });
   });
 
@@ -219,6 +253,441 @@ describe("LocalPlatformService", () => {
     });
   });
 
+  test("returns a strict account-independent model catalog for the current user", async () => {
+    execution.listModels.mockResolvedValueOnce([STANDARD_MODEL]);
+
+    const catalog = ModelCatalogSchema.parse(await service.listModels("user-1"));
+
+    expect(catalog).toMatchObject({
+      models: [expect.objectContaining({ model: "fake-codex-standard" })],
+      scope: "ELIGIBLE_ACCOUNT_INTERSECTION",
+      accountCount: 1,
+      observedAt: NOW.toISOString(),
+      stale: false,
+    });
+    expect(execution.listModels).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "account-1", codexHome: expect.any(String) }),
+    );
+    expect(JSON.stringify(catalog)).not.toMatch(/accountId|accountAlias|codexHome|Codex A/i);
+  });
+
+  test("intersects model capabilities across every account eligible for an unbound Thread", async () => {
+    leases.addAccount({
+      id: "account-2",
+      alias: "Codex B",
+      codexHome: "/tmp/codexplatform-test/account-2",
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+      maxActiveUsers: 4,
+      weeklyRemaining: 70,
+      quotaUpdatedAt: NOW,
+      allowUnknownQuota: false,
+      healthScore: 100,
+    });
+    execution.listModels.mockImplementation(async (account) =>
+      account.id === "account-1"
+        ? [STANDARD_MODEL]
+        : [
+            {
+              ...STANDARD_MODEL,
+              defaultReasoningEffort: "medium",
+              supportedReasoningEfforts: [
+                { value: "medium", description: "Balanced" },
+                { value: "xhigh", description: "Extended" },
+              ],
+              inputModalities: ["text"],
+              supportsPersonality: false,
+            },
+          ],
+    );
+
+    const catalog = ModelCatalogSchema.parse(await service.listModels("user-1"));
+
+    expect(catalog).toMatchObject({
+      scope: "ELIGIBLE_ACCOUNT_INTERSECTION",
+      accountCount: 2,
+      models: [
+        expect.objectContaining({
+          model: "fake-codex-standard",
+          supportedReasoningEfforts: [{ value: "medium", description: "Balanced" }],
+          inputModalities: ["text"],
+          supportsPersonality: false,
+        }),
+      ],
+    });
+  });
+
+  test("returns an expired cached model catalog as stale when refresh fails", async () => {
+    execution.listModels.mockResolvedValueOnce([STANDARD_MODEL]);
+    await expect(service.listModels("user-1")).resolves.toMatchObject({ stale: false });
+
+    currentNow = new Date(NOW.getTime() + 60_001);
+    execution.listModels.mockRejectedValueOnce(new Error("runtime unavailable"));
+
+    await expect(service.listModels("user-1")).resolves.toMatchObject({
+      stale: true,
+      observedAt: NOW.toISOString(),
+    });
+  });
+
+  test("fails closed instead of using a stale model catalog for execution", async () => {
+    execution.listModels.mockResolvedValueOnce([STANDARD_MODEL]);
+    await service.listModels("user-1");
+    currentNow = new Date(NOW.getTime() + 60_001);
+    execution.listModels.mockRejectedValueOnce(new Error("runtime unavailable"));
+    const project = await service.createProject("user-1", { name: "Fresh catalog" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Must refresh",
+    });
+
+    await expect(
+      service.startThreadTurn(thread.id, "user-1", "Do not start", {
+        model: "fake-codex-standard",
+        reasoningEffort: "medium",
+      }),
+    ).rejects.toBeInstanceOf(ModelCatalogUnavailableError);
+    expect(execution.startTask).not.toHaveBeenCalled();
+    expect(database.sqlite.prepare("SELECT COUNT(*) AS count FROM turns").get()).toEqual({
+      count: 0,
+    });
+  });
+
+  test("single-flights concurrent account model catalog refreshes", async () => {
+    const pending = deferred<ModelOption[]>();
+    execution.listModels.mockReturnValueOnce(pending.promise);
+
+    const first = service.listModels("user-1");
+    const second = service.listModels("user-1");
+    expect(execution.listModels).toHaveBeenCalledTimes(1);
+    pending.resolve([STANDARD_MODEL]);
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      expect.objectContaining({ stale: false }),
+      expect.objectContaining({ stale: false }),
+    ]);
+    expect(execution.listModels).toHaveBeenCalledTimes(1);
+  });
+
+  test("invalidates an account model cache when its authentication lifecycle changes", async () => {
+    execution.listModels
+      .mockResolvedValueOnce([STANDARD_MODEL])
+      .mockResolvedValueOnce([DEEP_MODEL]);
+    await expect(service.listModels("user-1")).resolves.toMatchObject({
+      models: [expect.objectContaining({ model: "fake-codex-standard" })],
+    });
+
+    execution.emit("accountAuthFailed", { accountId: "account-1" });
+    leases.updateAccount("account-1", {
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+    });
+
+    await expect(service.listModels("user-1")).resolves.toMatchObject({
+      models: [expect.objectContaining({ model: "fake-codex-deep" })],
+    });
+    expect(execution.listModels).toHaveBeenCalledTimes(2);
+  });
+
+  test("does not return a warm model catalog after its account is quarantined", async () => {
+    execution.listModels.mockResolvedValueOnce([STANDARD_MODEL]);
+    await expect(service.listModels("user-1")).resolves.toMatchObject({
+      stale: false,
+      accountCount: 1,
+    });
+
+    await service.setAccountState("account-1", "QUARANTINED", "user-1");
+
+    await expect(service.listModels("user-1")).rejects.toBeInstanceOf(ModelCatalogUnavailableError);
+    expect(execution.listModels).toHaveBeenCalledTimes(1);
+  });
+
+  test("refreshes the model catalog after an account is quarantined and restored", async () => {
+    execution.listModels
+      .mockResolvedValueOnce([STANDARD_MODEL])
+      .mockResolvedValueOnce([DEEP_MODEL]);
+    await expect(service.listModels("user-1")).resolves.toMatchObject({
+      models: [expect.objectContaining({ model: "fake-codex-standard" })],
+    });
+
+    await service.setAccountState("account-1", "QUARANTINED", "user-1");
+    await service.setAccountState("account-1", "AVAILABLE", "user-1");
+
+    await expect(service.listModels("user-1")).resolves.toMatchObject({
+      models: [expect.objectContaining({ model: "fake-codex-deep" })],
+      stale: false,
+    });
+    expect(execution.listModels).toHaveBeenCalledTimes(2);
+  });
+
+  test("rejects a leased Turn when its account is quarantined during model refresh", async () => {
+    const allocatedCatalog = deferred<ModelOption[]>();
+    execution.listModels
+      .mockResolvedValueOnce([STANDARD_MODEL])
+      .mockReturnValueOnce(allocatedCatalog.promise);
+    const project = await service.createProject("user-1", { name: "Quarantine race" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Must not start",
+    });
+
+    const starting = service.startThreadTurn(thread.id, "user-1", "Do not run");
+    await vi.waitFor(() => expect(execution.listModels).toHaveBeenCalledTimes(2));
+    await service.setAccountState("account-1", "QUARANTINED", "user-1");
+    allocatedCatalog.resolve([STANDARD_MODEL]);
+
+    await expect(starting).rejects.toThrow();
+    expect(execution.startTask).not.toHaveBeenCalled();
+    expect(accounts.list()[0]).toMatchObject({ status: "QUARANTINED" });
+    expect(leases.getAccountOccupancy("account-1")).toEqual({
+      activeUsers: 0,
+      activeTurns: 0,
+    });
+    expect(await service.getThread(thread.id, "user-1")).toMatchObject({
+      status: "FAILED",
+      currentTurn: null,
+      turns: [expect.objectContaining({ status: "FAILED" })],
+    });
+  });
+
+  test("returns only the bound account catalog for an existing Runtime Thread", async () => {
+    execution.listModels.mockResolvedValue([STANDARD_MODEL]);
+    const project = await service.createProject("user-1", { name: "Bound catalog" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Bound",
+    });
+    await service.startThreadTurn(thread.id, "user-1", "Bind the account");
+
+    await expect(service.listModels("user-1", thread.id)).resolves.toMatchObject({
+      scope: "SINGLE_ACCOUNT",
+      accountCount: 1,
+      models: [expect.objectContaining({ model: "fake-codex-standard" })],
+    });
+    await expect(service.listModels("user-2", thread.id)).rejects.toThrow("Thread not found");
+  });
+
+  test("validates a selected model and effort before persisting or starting a Turn", async () => {
+    execution.listModels.mockResolvedValue([STANDARD_MODEL]);
+    const project = await service.createProject("user-1", { name: "Model validation" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Validated",
+    });
+
+    await expect(
+      service.startThreadTurn(thread.id, "user-1", "Reject", {
+        model: "fake-codex-standard",
+        reasoningEffort: "ultra",
+      }),
+    ).rejects.toThrow("Reasoning effort is not supported by the selected model");
+    expect(execution.startTask).not.toHaveBeenCalled();
+    expect(database.sqlite.prepare("SELECT COUNT(*) AS count FROM turns").get()).toEqual({
+      count: 0,
+    });
+
+    await expect(
+      service.startThreadTurn(thread.id, "user-1", "Run", {
+        model: "fake-codex-standard",
+        reasoningEffort: "high",
+      }),
+    ).resolves.toMatchObject({ status: "RUNNING" });
+    expect(execution.startTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        effectiveConfig: expect.objectContaining({
+          model: "fake-codex-standard",
+          reasoningEffort: "high",
+        }),
+      }),
+    );
+  });
+
+  test("resolves a null model to the Runtime default in the immutable Turn snapshot", async () => {
+    execution.listModels.mockResolvedValue([STANDARD_MODEL]);
+    const project = await service.createProject("user-1", { name: "Runtime default" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Default model",
+    });
+
+    await service.startThreadTurn(thread.id, "user-1", "Use the default");
+
+    await expect(service.getThread(thread.id, "user-1")).resolves.toMatchObject({
+      currentTurn: {
+        configSnapshot: {
+          model: "fake-codex-standard",
+          reasoningEffort: "MEDIUM",
+        },
+      },
+    });
+    expect(execution.startTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        effectiveConfig: expect.objectContaining({ model: "fake-codex-standard" }),
+      }),
+    );
+  });
+
+  test("fails a changed model selection after allocation without requiring recovery", async () => {
+    execution.listModels.mockResolvedValueOnce([STANDARD_MODEL]).mockResolvedValueOnce([
+      {
+        ...STANDARD_MODEL,
+        defaultReasoningEffort: "low",
+        supportedReasoningEfforts: [{ value: "low", description: "Fast" }],
+      },
+    ]);
+    const project = await service.createProject("user-1", { name: "Allocation race" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Catalog changed",
+    });
+
+    await expect(
+      service.startThreadTurn(thread.id, "user-1", "Do not run", {
+        model: "fake-codex-standard",
+        reasoningEffort: "high",
+      }),
+    ).rejects.toThrow("Model availability changed after allocation");
+
+    expect(execution.startTask).not.toHaveBeenCalled();
+    expect(leases.getAccountOccupancy("account-1")).toEqual({
+      activeUsers: 0,
+      activeTurns: 0,
+    });
+    expect(database.sqlite.prepare("SELECT status FROM turns").get()).toEqual({
+      status: "FAILED",
+    });
+    expect(await service.getThread(thread.id, "user-1")).toMatchObject({
+      status: "FAILED",
+      turns: [expect.objectContaining({ status: "FAILED" })],
+      items: [
+        expect.objectContaining({
+          type: "TURN_FAILED",
+          payload: expect.objectContaining({
+            error: "The selected model or Effort became unavailable before execution.",
+          }),
+        }),
+      ],
+    });
+    expect(JSON.stringify(await service.getThread(thread.id, "user-1"))).not.toContain(
+      "NEEDS_RECOVERY",
+    );
+  });
+
+  test("cools down an account before promoting the next queued Turn after catalog refresh fails", async () => {
+    database.sqlite
+      .prepare("UPDATE codex_accounts SET max_active_users = 1 WHERE id = 'account-1'")
+      .run();
+    const catalogRefresh = deferred<ModelOption[]>();
+    execution.listModels
+      .mockResolvedValueOnce([STANDARD_MODEL])
+      .mockReturnValueOnce(catalogRefresh.promise)
+      .mockRejectedValue(new Error("runtime unavailable"));
+    const project = await service.createProject("user-1", { name: "Catalog outage" });
+    const firstThread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "First",
+    });
+    const secondProject = await service.createProject("user-2", { name: "Catalog outage" });
+    const secondThread = await service.createThread("user-2", {
+      projectId: secondProject.id,
+      title: "Second",
+    });
+
+    const firstStart = service.startThreadTurn(firstThread.id, "user-1", "First prompt");
+    await nextTick();
+    await expect(
+      service.startThreadTurn(secondThread.id, "user-2", "Second prompt"),
+    ).resolves.toMatchObject({ status: "QUEUED" });
+
+    catalogRefresh.reject(new Error("runtime unavailable"));
+    await expect(firstStart).rejects.toBeInstanceOf(ModelCatalogUnavailableError);
+    await nextTick();
+
+    expect(accounts.list()[0]).toMatchObject({ status: "COOLDOWN" });
+    expect(await service.getThread(secondThread.id, "user-2")).toMatchObject({
+      status: "QUEUED",
+      currentTurn: expect.objectContaining({ status: "QUEUED" }),
+    });
+    expect(execution.listModels).toHaveBeenCalledTimes(2);
+    expect(execution.startTask).not.toHaveBeenCalled();
+
+    execution.listModels.mockResolvedValue([STANDARD_MODEL]);
+    currentNow = new Date(NOW.getTime() + 31_000);
+    await service.runMaintenance(currentNow);
+    await vi.waitFor(async () => {
+      expect(await service.getThread(secondThread.id, "user-2")).toMatchObject({
+        status: "RUNNING",
+        currentTurn: expect.objectContaining({ status: "RUNNING" }),
+      });
+    });
+    expect(execution.startTask).toHaveBeenCalledTimes(1);
+  });
+
+  test("keeps personal model Settings linked to the selected model catalog", async () => {
+    execution.listModels.mockResolvedValue([STANDARD_MODEL]);
+
+    await expect(
+      service.patchMySettings("user-1", {
+        execution: { model: "fake-codex-standard", reasoningEffort: "high" },
+      }),
+    ).resolves.toMatchObject({
+      execution: { model: "fake-codex-standard", reasoningEffort: "high" },
+    });
+
+    await expect(
+      service.patchMySettings("user-1", {
+        execution: { reasoningEffort: "ultra" },
+      }),
+    ).rejects.toThrow("Reasoning effort is not supported by the selected model");
+    await expect(service.getMySettings("user-1")).resolves.toMatchObject({
+      execution: { model: "fake-codex-standard", reasoningEffort: "high" },
+    });
+  });
+
+  test("validates effort-only personal Settings against the Runtime default model", async () => {
+    execution.listModels.mockResolvedValue([STANDARD_MODEL]);
+
+    await expect(
+      service.patchMySettings("user-1", {
+        execution: { reasoningEffort: "ultra" },
+      }),
+    ).rejects.toThrow("Reasoning effort is not supported by the selected model");
+
+    await expect(service.getMySettings("user-1")).resolves.toMatchObject({
+      execution: { model: null, reasoningEffort: "MEDIUM" },
+    });
+  });
+
+  test("validates a null-model Thread config against the Runtime default before persisting", async () => {
+    execution.listModels.mockResolvedValue([STANDARD_MODEL]);
+    const project = await service.createProject("user-1", { name: "Default model config" });
+
+    await expect(
+      service.createThread("user-1", {
+        projectId: project.id,
+        title: "Invalid default Effort",
+        config: { model: null, reasoningEffort: "ultra" },
+      }),
+    ).rejects.toThrow("Reasoning effort is not supported by the selected model");
+
+    await expect(service.listThreads("user-1", project.id)).resolves.toEqual([]);
+  });
+
+  test("does not persist a null-model Thread config without a routable default model", async () => {
+    await service.setAccountState("account-1", "QUARANTINED", "user-1");
+    const project = await service.createProject("user-1", { name: "No default model" });
+
+    await expect(
+      service.createThread("user-1", {
+        projectId: project.id,
+        title: "Must not persist",
+        config: { model: null, reasoningEffort: "medium" },
+      }),
+    ).rejects.toBeInstanceOf(ModelCatalogUnavailableError);
+
+    await expect(service.listThreads("user-1", project.id)).resolves.toEqual([]);
+  });
+
   test("projects legacy tasks as owned continuous Threads with stable Items", async () => {
     const project = await service.createProject("user-1", { name: "Threads" });
     const thread = await service.createThread("user-1", {
@@ -294,6 +763,74 @@ describe("LocalPlatformService", () => {
     expect(await service.getThread(thread.id, "user-1")).toBeNull();
   });
 
+  test("lists, archives and unarchives only the current user's local Threads", async () => {
+    const project = await service.createProject("user-1", { name: "Archive" });
+    const visible = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Visible",
+    });
+    const archived = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Archive me",
+    });
+
+    await service.archiveThread(archived.id, "user-1");
+
+    expect(await service.listThreads("user-1")).toEqual([
+      expect.objectContaining({ id: visible.id, archivedAt: null }),
+    ]);
+    expect(await service.listArchivedThreads("user-1")).toEqual([
+      expect.objectContaining({ id: archived.id, archivedAt: NOW.toISOString() }),
+    ]);
+    expect(await service.listArchivedThreads("user-2")).toEqual([]);
+    await expect(service.archiveThread(archived.id, "user-2")).rejects.toThrow("Thread not found");
+    expect(execution.startTask).not.toHaveBeenCalled();
+    expect(execution.interruptTask).not.toHaveBeenCalled();
+
+    await service.unarchiveThread(archived.id, "user-1");
+
+    expect(await service.listArchivedThreads("user-1")).toEqual([]);
+    expect((await service.listThreads("user-1")).map((thread) => thread.id)).toEqual(
+      expect.arrayContaining([visible.id, archived.id]),
+    );
+  });
+
+  test("refuses to archive a Thread while its Turn is running", async () => {
+    const project = await service.createProject("user-1", { name: "Archive guard" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Still running",
+    });
+    await service.startThreadTurn(thread.id, "user-1", "Keep working");
+
+    await expect(service.archiveThread(thread.id, "user-1")).rejects.toThrow(
+      "Thread has active work and cannot be archived",
+    );
+    expect(await service.listArchivedThreads("user-1")).toEqual([]);
+  });
+
+  test("does not start a new Turn until an archived Thread is restored", async () => {
+    const project = await service.createProject("user-1", { name: "Archived execution" });
+    const thread = await service.createThread("user-1", {
+      projectId: project.id,
+      title: "Archived",
+    });
+    await service.archiveThread(thread.id, "user-1");
+
+    await expect(service.startThreadTurn(thread.id, "user-1", "Do not run")).rejects.toThrow(
+      "Thread is archived",
+    );
+    await expect(service.steerThread(thread.id, "user-1", "Do not steer")).rejects.toThrow(
+      "Thread is archived",
+    );
+    await expect(service.interruptThread(thread.id, "user-1")).rejects.toThrow(
+      "Thread is archived",
+    );
+    expect(execution.startTask).not.toHaveBeenCalled();
+    expect(execution.steerTask).not.toHaveBeenCalled();
+    expect(execution.interruptTask).not.toHaveBeenCalled();
+  });
+
   test("reconstructs every completed Turn in creation order with its immutable config snapshot", async () => {
     const project = await service.createProject("user-1", { name: "History" });
     const thread = await service.createThread("user-1", {
@@ -346,7 +883,13 @@ describe("LocalPlatformService", () => {
       policy: {
         allowedModels: null,
         allowedReasoningEfforts: ["LOW", "MEDIUM", "HIGH", "XHIGH", "ULTRA"],
-        allowedPermissionModes: ["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"],
+        allowedPermissionModes: [
+          "DEFAULT",
+          "READ_ONLY",
+          "WORKSPACE_WRITE",
+          "ASK_FOR_APPROVAL",
+          "APPROVE_FOR_ME",
+        ],
         allowedApprovalPreferences: ["ASK"],
         lockedFields: [],
       },
@@ -467,6 +1010,7 @@ describe("LocalPlatformService", () => {
   });
 
   test("merges organization, user, Thread and Turn config into one persisted immutable snapshot", async () => {
+    execution.listModels.mockResolvedValue([STANDARD_MODEL, DEEP_MODEL]);
     await service.patchMySettings("user-1", {
       execution: { reasoningEffort: "LOW", permissionMode: "READ_ONLY" },
       personalization: {
@@ -486,15 +1030,16 @@ describe("LocalPlatformService", () => {
     });
 
     await service.startThreadTurn(thread.id, "user-1", "Run", {
-      reasoningEffort: "ULTRA",
+      model: "fake-codex-deep",
+      reasoningEffort: "xhigh",
       personality: "NONE",
       instructions: "",
     });
 
     const detail = await service.getThread(thread.id, "user-1");
     expect(detail?.currentTurn?.configSnapshot).toEqual({
-      model: null,
-      reasoningEffort: "ULTRA",
+      model: "fake-codex-deep",
+      reasoningEffort: "xhigh",
       permissionMode: "WORKSPACE_WRITE",
       approvalMode: "ASK",
       personality: "NONE",
@@ -1179,6 +1724,84 @@ describe("LocalPlatformService", () => {
     expect(execution.startTask).toHaveBeenLastCalledWith(
       expect.objectContaining({ taskId: tasks[4]?.id, userId: "user-5", prompt: "Prompt 5" }),
     );
+  });
+
+  test("coalesces overlapping quota refreshes for the same account", async () => {
+    const quota = deferred<Awaited<ReturnType<TaskExecutionAdapter["refreshWeeklyQuota"]>>>();
+    execution.refreshWeeklyQuota.mockImplementation(() => quota.promise);
+    const staleAt = new Date(NOW.getTime() + 6 * 60_000);
+
+    const firstMaintenance = service.runMaintenance(staleAt);
+    const secondMaintenance = service.runMaintenance(staleAt);
+
+    await vi.waitFor(() => expect(execution.refreshWeeklyQuota).toHaveBeenCalledTimes(1));
+    quota.resolve({
+      status: "KNOWN",
+      limitId: "weekly",
+      usedPercent: 28,
+      remainingPercent: 72,
+      windowDurationMins: 10_080,
+      resetsAt: null,
+    });
+    await Promise.all([firstMaintenance, secondMaintenance]);
+
+    expect(accounts.list()[0]).toMatchObject({
+      status: "AVAILABLE",
+      weeklyRemaining: 72,
+    });
+  });
+
+  test("stores real-time account quota notifications with a fresh observation time", async () => {
+    currentNow = new Date(NOW.getTime() + 90_000);
+
+    execution.emit("accountQuotaUpdated", {
+      accountId: "account-1",
+      quota: {
+        status: "KNOWN",
+        limitId: "codex",
+        usedPercent: 44,
+        remainingPercent: 56,
+        windowDurationMins: 10_080,
+        resetsAt: 1_785_225_600,
+      },
+    });
+
+    expect(accounts.list()[0]).toMatchObject({
+      weeklyRemaining: 56,
+      quotaUpdatedAt: currentNow.toISOString(),
+    });
+  });
+
+  test("lets an administrator force a fresh account quota read", async () => {
+    currentNow = new Date(NOW.getTime() + 120_000);
+    execution.refreshWeeklyQuota.mockResolvedValueOnce({
+      status: "KNOWN",
+      limitId: "codex",
+      usedPercent: 45,
+      remainingPercent: 55,
+      windowDurationMins: 10_080,
+      resetsAt: 1_785_225_600,
+    });
+
+    await expect(service.refreshAccountQuotaNow("account-1", "user-1")).resolves.toMatchObject({
+      weeklyRemaining: 55,
+      quotaUpdatedAt: currentNow.toISOString(),
+    });
+    expect(execution.refreshWeeklyQuota).toHaveBeenCalledTimes(1);
+  });
+
+  test("keeps an authenticated account available after a transient quota refresh failure", async () => {
+    execution.refreshWeeklyQuota.mockRejectedValueOnce(new Error("temporary network failure"));
+    const staleAt = new Date(NOW.getTime() + 6 * 60_000);
+
+    await service.runMaintenance(staleAt);
+
+    expect(accounts.list()[0]).toMatchObject({
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+      weeklyRemaining: 80,
+      quotaUpdatedAt: NOW.toISOString(),
+    });
   });
 
   test("marks stale runtime turns for explicit recovery without replaying side effects", async () => {
@@ -1963,6 +2586,7 @@ describe("LocalPlatformService", () => {
 });
 
 class FakeExecution extends EventEmitter implements TaskExecutionAdapter {
+  readonly listModels = vi.fn<TaskExecutionAdapter["listModels"]>(async () => [STANDARD_MODEL]);
   readonly startTask = vi.fn(async (input: { taskId: string }) => ({
     threadId: `thread-${input.taskId}`,
     turnId: `codex-turn-${input.taskId}`,
@@ -1974,7 +2598,9 @@ class FakeExecution extends EventEmitter implements TaskExecutionAdapter {
     loginId: "login-1",
     authUrl: "https://auth.example.test/codex",
   }));
-  readonly refreshWeeklyQuota = vi.fn(async () => ({ status: "WEEKLY_QUOTA_UNKNOWN" as const }));
+  readonly refreshWeeklyQuota = vi.fn<TaskExecutionAdapter["refreshWeeklyQuota"]>(async () => ({
+    status: "WEEKLY_QUOTA_UNKNOWN" as const,
+  }));
 
   emitTaskEvent(event: TaskEventDraft): void {
     this.emit("taskEvent", event);
