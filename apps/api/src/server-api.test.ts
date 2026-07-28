@@ -1435,9 +1435,10 @@ describe("CodexPlatform HTTP API", () => {
     expect(response.statusCode).toBe(201);
     expect(response.json()).toMatchObject({
       id: "attachment-1",
-      relativePath: ".codexplatform/attachments/attachment-1/notes.txt",
       scanStatus: "READY",
     });
+    expect(response.json()).not.toHaveProperty("relativePath");
+    expect(response.body).not.toContain(".codexplatform/attachments");
     expect(response.body).not.toContain("/private/");
     expect(platform.uploadAttachment).toHaveBeenCalledWith(
       "draft-1",
@@ -1470,6 +1471,8 @@ describe("CodexPlatform HTTP API", () => {
     expect(response.json()).toEqual([
       expect.objectContaining({ id: "attachment-1", scanStatus: "READY" }),
     ]);
+    expect(response.body).not.toContain("relativePath");
+    expect(response.body).not.toContain(".codexplatform/attachments");
     expect(platform.listAttachments).toHaveBeenCalledWith("thread-1", "user-1");
   });
 
@@ -1941,7 +1944,6 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       threadId: "draft-1",
       kind: "FILE" as const,
       name: "notes.txt",
-      relativePath: ".codexplatform/attachments/attachment-1/notes.txt",
       mimeType: "text/plain",
       sizeBytes: 5,
       fileCount: 1,
@@ -1954,7 +1956,6 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
         threadId: "thread-1",
         kind: "FILE" as const,
         name: "notes.txt",
-        relativePath: ".codexplatform/attachments/attachment-1/notes.txt",
         mimeType: "text/plain",
         sizeBytes: 5,
         fileCount: 1,

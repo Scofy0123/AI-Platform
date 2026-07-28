@@ -42,11 +42,14 @@ export function ComposerAddMenu({
     setView("ROOT");
     close({ restoreFocus: true });
   };
-  const acceptFiles = (files: FileList | null) => {
-    const selected = Array.from(files ?? []);
-    if (selected.length === 0) return;
-    onChooseFiles(selected);
-    dismiss();
+  const acceptFiles = (input: HTMLInputElement) => {
+    try {
+      const selected = Array.from(input.files ?? []);
+      if (selected.length > 0) onChooseFiles(selected);
+    } finally {
+      input.value = "";
+      dismiss();
+    }
   };
 
   return (
@@ -102,7 +105,7 @@ export function ComposerAddMenu({
                   multiple
                   type="file"
                   aria-label="Choose files input"
-                  onChange={(event) => acceptFiles(event.currentTarget.files)}
+                  onChange={(event) => acceptFiles(event.currentTarget)}
                 />
                 <input
                   ref={folderInputRef}
@@ -112,7 +115,7 @@ export function ComposerAddMenu({
                   aria-label="Choose folder input"
                   // React does not type the Chromium directory picker attribute.
                   {...({ webkitdirectory: "" } as Record<string, string>)}
-                  onChange={(event) => acceptFiles(event.currentTarget.files)}
+                  onChange={(event) => acceptFiles(event.currentTarget)}
                 />
               </>
             ) : (

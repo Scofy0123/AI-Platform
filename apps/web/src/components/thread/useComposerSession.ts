@@ -1,6 +1,5 @@
 import type {
   ComposerState,
-  DraftAttachment,
   ThreadGoalInput,
   ThreadGoalPatch,
   ThreadGoalView,
@@ -11,6 +10,7 @@ import {
   type ComposerAttachment,
   composerAttachmentsBlockSubmission,
   type PendingComposerAttachment,
+  validateComposerFiles,
 } from "./ComposerResources.js";
 
 const DRAFT_SESSION_KEY = "codexplatform.composer-draft.v1";
@@ -45,28 +45,29 @@ export function useComposerSession({
   const pendingSequenceRef = useRef(0);
   const initialPlanMode = initialComposerState?.planMode ?? false;
   const initialComposerRevision = initialComposerState?.revision ?? 0;
-
-  useEffect(() => {
-    sessionGenerationRef.current += 1;
-    resourceThreadIdRef.current = threadId ?? null;
-    setResourceThreadId(threadId ?? null);
-    setAttachments([]);
-    setGoalEditorOpen(false);
-    setError(null);
-    setPlanMode(initialPlanMode);
-    setComposerRevision(initialComposerRevision);
-    revisionRef.current = initialComposerRevision;
-    draftPromiseRef.current = null;
-    restorePromiseRef.current = null;
-    restoreAttemptedRef.current = false;
-  }, [initialComposerRevision, initialPlanMode, threadId]);
+  const initialComposerStateRef = useRef({
+    planMode: initialPlanMode,
+    revision: initialComposerRevision,
+  });
+  initialComposerStateRef.current = {
+    planMode: initialPlanMode,
+    revision: initialComposerRevision,
+  };
 
   const restoreStoredDraft = useCallback(async (): Promise<string | null> => {
     if (restorePromiseRef.current) return restorePromiseRef.current;
     if (threadId || restoreAttemptedRef.current) return resourceThreadIdRef.current;
     restoreAttemptedRef.current = true;
     const stored = readStoredDraft();
-    if (!stored || !api.getDraft) return null;
+    if (!stored) return null;
+    if (!api.getDraft) {
+      restoreAttemptedRef.current = false;
+      const unavailable = new Error(
+        "Unable to restore Draft. Retry when the Draft API is available.",
+      );
+      setError(unavailable.message);
+      throw unavailable;
+    }
     const generation = sessionGenerationRef.current;
     const isCurrentRestore = () =>
       sessionGenerationRef.current === generation &&
@@ -105,8 +106,12 @@ export function useComposerSession({
           return null;
         }
         if (!isCurrentRestore()) return resourceThreadIdRef.current;
-        setError(errorMessage(cause));
-        return null;
+        restoreAttemptedRef.current = false;
+        const recoveryError = new Error(
+          `Unable to restore Draft. Retry the Composer action. ${errorMessage(cause)}`,
+        );
+        setError(recoveryError.message);
+        throw recoveryError;
       }
     })();
     restorePromiseRef.current = pending;
@@ -118,50 +123,68 @@ export function useComposerSession({
   }, [api, threadId]);
 
   useEffect(() => {
-    if (threadId) return;
-    void restoreStoredDraft();
-  }, [restoreStoredDraft, threadId]);
+    const generation = sessionGenerationRef.current + 1;
+    sessionGenerationRef.current = generation;
+    const initial = initialComposerStateRef.current;
+    resourceThreadIdRef.current = threadId ?? null;
+    setResourceThreadId(threadId ?? null);
+    setAttachments([]);
+    setGoal(null);
+    setGoalEditorOpen(false);
+    setError(null);
+    setPlanMode(initial.planMode);
+    setComposerRevision(initial.revision);
+    revisionRef.current = initial.revision;
+    draftPromiseRef.current = null;
+    restorePromiseRef.current = null;
+    restoreAttemptedRef.current = false;
+    if (!threadId) return;
 
-  useEffect(() => {
-    if (!threadId || !api.getThreadGoal) {
-      setGoal(null);
-      return;
-    }
-    let cancelled = false;
-    void api
-      .getThreadGoal(threadId)
-      .then((nextGoal) => {
-        if (!cancelled) setGoal(nextGoal);
+    const isCurrent = () =>
+      sessionGenerationRef.current === generation && resourceThreadIdRef.current === threadId;
+    void (api.listThreadAttachments?.(threadId) ?? Promise.resolve([]))
+      .then((loaded) => {
+        if (isCurrent()) setAttachments(loaded);
       })
       .catch((cause: unknown) => {
-        if (cancelled) return;
+        if (isCurrent()) setError(errorMessage(cause));
+      });
+    void (api.getThreadGoal?.(threadId) ?? Promise.resolve(null))
+      .then((nextGoal) => {
+        if (isCurrent()) setGoal(nextGoal);
+      })
+      .catch((cause: unknown) => {
+        if (!isCurrent()) return;
         if (hasStatus(cause, 404)) {
           setGoal(null);
           return;
         }
         setError(errorMessage(cause));
       });
+    void (
+      api.getThreadComposer?.(threadId) ??
+      Promise.resolve({ planMode: initial.planMode, revision: initial.revision })
+    )
+      .then((nextComposer) => {
+        if (!isCurrent()) return;
+        revisionRef.current = nextComposer.revision;
+        setComposerRevision(nextComposer.revision);
+        setPlanMode(nextComposer.planMode);
+      })
+      .catch((cause: unknown) => {
+        if (isCurrent()) setError(errorMessage(cause));
+      });
     return () => {
-      cancelled = true;
+      if (sessionGenerationRef.current === generation) sessionGenerationRef.current += 1;
     };
   }, [api, threadId]);
 
   useEffect(() => {
-    if (!threadId || !api.listThreadAttachments) return;
-    let cancelled = false;
-    void api
-      .listThreadAttachments(threadId)
-      .then((loaded) => {
-        if (cancelled) return;
-        setAttachments((current) => mergeComposerAttachments(loaded, current));
-      })
-      .catch((cause: unknown) => {
-        if (!cancelled) setError(errorMessage(cause));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [api, threadId]);
+    if (threadId) return;
+    void restoreStoredDraft().catch(() => {
+      // The error is kept in Composer state so the next user action can retry.
+    });
+  }, [restoreStoredDraft, threadId]);
 
   const runBusy = async <T>(operation: () => Promise<T>): Promise<T> => {
     setBusyCount((count) => count + 1);
@@ -179,10 +202,15 @@ export function useComposerSession({
     if (resourceThreadIdRef.current) return resourceThreadIdRef.current;
     if (draftPromiseRef.current) return draftPromiseRef.current;
     if (!api.createDraft) throw new Error("Draft endpoint unavailable");
+    const generation = sessionGenerationRef.current;
     const pending = (async () => {
       const projectId = await resolveProjectId();
       const created = await api.createDraft?.({ projectId });
       if (!created) throw new Error("Draft endpoint unavailable");
+      if (sessionGenerationRef.current !== generation || resourceThreadIdRef.current !== null) {
+        await api.deleteDraft?.(created.id).catch(() => undefined);
+        throw new Error("Composer session changed while creating Draft");
+      }
       resourceThreadIdRef.current = created.id;
       setResourceThreadId(created.id);
       storeDraft({ draftId: created.id, projectId });
@@ -192,42 +220,50 @@ export function useComposerSession({
     try {
       return await pending;
     } finally {
-      draftPromiseRef.current = null;
+      if (draftPromiseRef.current === pending) draftPromiseRef.current = null;
     }
   };
 
   const chooseFiles = async (files: readonly File[]) => {
     if (files.length === 0) return;
+    const operationGeneration = sessionGenerationRef.current;
     setError(null);
     await runBusy(async () => {
+      validateComposerFiles(files);
       const targetThreadId = await ensureResourceThread();
+      if (sessionGenerationRef.current !== operationGeneration) return;
+      const generation = sessionGenerationRef.current;
+      const isCurrent = () => isCurrentTarget(generation, targetThreadId);
       if (!api.uploadAttachments) throw new Error("Attachment upload endpoint unavailable");
       const groups = groupFilesByAttachmentRoot(files);
-      await Promise.all(
-        groups.map(async (group) => {
-          const localId = `upload-${++pendingSequenceRef.current}`;
-          const pending = pendingAttachment(localId, group);
-          setAttachments((current) => [...current, pending]);
-          try {
-            const uploaded = await api.uploadAttachments?.(targetThreadId, group);
-            if (!uploaded) throw new Error("Attachment upload endpoint unavailable");
-            setAttachments((current) =>
-              current.map((item) =>
-                "localId" in item && item.localId === localId ? uploaded : item,
-              ),
-            );
-          } catch (cause) {
-            setAttachments((current) =>
-              current.map((item) =>
-                "localId" in item && item.localId === localId
-                  ? { ...item, scanStatus: "FAILED", error: errorMessage(cause) }
-                  : item,
-              ),
-            );
-          }
-        }),
-      );
-    }).catch((cause) => setError(errorMessage(cause)));
+      await mapWithConcurrency(groups, 2, async (group) => {
+        if (!isCurrent()) return;
+        const localId = `upload-${++pendingSequenceRef.current}`;
+        const pending = pendingAttachment(localId, group);
+        setAttachments((current) => [...current, pending]);
+        try {
+          const uploaded = await api.uploadAttachments?.(targetThreadId, group);
+          if (!uploaded) throw new Error("Attachment upload endpoint unavailable");
+          if (!isCurrent()) return;
+          setAttachments((current) =>
+            current.map((item) =>
+              "localId" in item && item.localId === localId ? uploaded : item,
+            ),
+          );
+        } catch (cause) {
+          if (!isCurrent()) return;
+          setAttachments((current) =>
+            current.map((item) =>
+              "localId" in item && item.localId === localId
+                ? { ...item, scanStatus: "FAILED", error: errorMessage(cause) }
+                : item,
+            ),
+          );
+        }
+      });
+    }).catch((cause) => {
+      if (sessionGenerationRef.current === operationGeneration) setError(errorMessage(cause));
+    });
   };
 
   const removeAttachment = async (attachment: ComposerAttachment) => {
@@ -240,33 +276,45 @@ export function useComposerSession({
       setError("Attachment delete endpoint unavailable");
       return;
     }
+    const generation = sessionGenerationRef.current;
+    const targetThreadId = attachment.threadId;
     await runBusy(async () => {
       await api.deleteAttachment?.(attachment.threadId, attachment.id);
+      if (!isCurrentTarget(generation, targetThreadId)) return;
       setAttachments((current) =>
         current.filter((item) => !("id" in item) || item.id !== attachment.id),
       );
-    }).catch((cause) => setError(errorMessage(cause)));
+    }).catch((cause) => {
+      if (isCurrentTarget(generation, targetThreadId)) setError(errorMessage(cause));
+    });
   };
 
   const openGoal = async () => {
+    const operationGeneration = sessionGenerationRef.current;
     setError(null);
     try {
-      await ensureResourceThread();
-      setGoalEditorOpen(true);
+      const targetThreadId = await ensureResourceThread();
+      if (isCurrentTarget(operationGeneration, targetThreadId)) setGoalEditorOpen(true);
     } catch (cause) {
-      setError(errorMessage(cause));
+      if (sessionGenerationRef.current === operationGeneration) setError(errorMessage(cause));
     }
   };
 
   const saveGoal = async (input: ThreadGoalInput) => {
+    const operationGeneration = sessionGenerationRef.current;
     setError(null);
     await runBusy(async () => {
       const targetThreadId = await ensureResourceThread();
+      if (sessionGenerationRef.current !== operationGeneration) return;
+      const generation = sessionGenerationRef.current;
       if (!api.putThreadGoal) throw new Error("Goal endpoint unavailable");
       const updated = await api.putThreadGoal(targetThreadId, input);
+      if (!isCurrentTarget(generation, targetThreadId)) return;
       setGoal(updated);
       setGoalEditorOpen(false);
-    }).catch((cause) => setError(errorMessage(cause)));
+    }).catch((cause) => {
+      if (sessionGenerationRef.current === operationGeneration) setError(errorMessage(cause));
+    });
   };
 
   const goalAction = async (action: NonNullable<ThreadGoalPatch["action"]>) => {
@@ -275,11 +323,14 @@ export function useComposerSession({
       setError("Goal endpoint unavailable");
       return;
     }
+    const generation = sessionGenerationRef.current;
     setError(null);
     await runBusy(async () => {
       const updated = await api.patchThreadGoal?.(targetThreadId, { action });
-      if (updated) setGoal(updated);
-    }).catch((cause) => setError(errorMessage(cause)));
+      if (updated && isCurrentTarget(generation, targetThreadId)) setGoal(updated);
+    }).catch((cause) => {
+      if (isCurrentTarget(generation, targetThreadId)) setError(errorMessage(cause));
+    });
   };
 
   const clearGoal = async () => {
@@ -288,27 +339,37 @@ export function useComposerSession({
       setError("Goal endpoint unavailable");
       return;
     }
+    const generation = sessionGenerationRef.current;
     setError(null);
     await runBusy(async () => {
       await api.deleteThreadGoal?.(targetThreadId);
+      if (!isCurrentTarget(generation, targetThreadId)) return;
       setGoal(null);
       setGoalEditorOpen(false);
-    }).catch((cause) => setError(errorMessage(cause)));
+    }).catch((cause) => {
+      if (isCurrentTarget(generation, targetThreadId)) setError(errorMessage(cause));
+    });
   };
 
   const togglePlanMode = async () => {
+    const operationGeneration = sessionGenerationRef.current;
     setError(null);
     await runBusy(async () => {
       const targetThreadId = await ensureResourceThread();
+      if (sessionGenerationRef.current !== operationGeneration) return;
+      const generation = sessionGenerationRef.current;
       if (!api.patchThreadComposer) throw new Error("Composer state endpoint unavailable");
       const updated = await api.patchThreadComposer(targetThreadId, {
         planMode: !planMode,
         revision: revisionRef.current,
       });
+      if (!isCurrentTarget(generation, targetThreadId)) return;
       revisionRef.current = updated.revision;
       setComposerRevision(updated.revision);
       setPlanMode(updated.planMode);
-    }).catch((cause) => setError(errorMessage(cause)));
+    }).catch((cause) => {
+      if (sessionGenerationRef.current === operationGeneration) setError(errorMessage(cause));
+    });
   };
 
   const clearSubmittedAttachments = () => {
@@ -345,6 +406,12 @@ export function useComposerSession({
     },
     reportError: (message: string) => setError(message),
   };
+
+  function isCurrentTarget(generation: number, targetThreadId: string) {
+    return (
+      sessionGenerationRef.current === generation && resourceThreadIdRef.current === targetThreadId
+    );
+  }
 }
 
 function readStoredDraft(): { draftId: string; projectId: string } | null {
@@ -399,19 +466,6 @@ function hasStatus(value: unknown, status: number): boolean {
   );
 }
 
-function mergeComposerAttachments(
-  loaded: readonly DraftAttachment[],
-  current: readonly ComposerAttachment[],
-): ComposerAttachment[] {
-  const byKey = new Map<string, ComposerAttachment>();
-  for (const attachment of loaded) byKey.set(attachment.id, attachment);
-  for (const attachment of current) {
-    const key = "id" in attachment ? attachment.id : attachment.localId;
-    byKey.set(key, attachment);
-  }
-  return [...byKey.values()];
-}
-
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : "Composer operation failed";
 }
@@ -427,4 +481,20 @@ function groupFilesByAttachmentRoot(files: readonly File[]): File[][] {
     groups.set(key, group);
   });
   return [...groups.values()];
+}
+
+async function mapWithConcurrency<T>(
+  values: readonly T[],
+  concurrency: number,
+  worker: (value: T) => Promise<void>,
+) {
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (nextIndex < values.length) {
+      const value = values[nextIndex];
+      nextIndex += 1;
+      if (value !== undefined) await worker(value);
+    }
+  });
+  await Promise.all(workers);
 }

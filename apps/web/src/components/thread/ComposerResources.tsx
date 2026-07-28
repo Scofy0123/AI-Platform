@@ -1,6 +1,6 @@
 import type {
   AttachmentScanStatus,
-  DraftAttachment,
+  BrowserDraftAttachment,
   ThreadGoalInput,
   ThreadGoalPatch,
   ThreadGoalView,
@@ -17,7 +17,7 @@ export interface PendingComposerAttachment {
   error?: string;
 }
 
-export type ComposerAttachment = DraftAttachment | PendingComposerAttachment;
+export type ComposerAttachment = BrowserDraftAttachment | PendingComposerAttachment;
 
 interface ComposerResourcesProps {
   attachments: readonly ComposerAttachment[];
@@ -300,10 +300,10 @@ function attachmentTypeLabel(attachment: ComposerAttachment) {
     : "File";
 }
 
-const MAX_DROPPED_ROOTS = 32;
-const MAX_DROPPED_FILES = 500;
-const MAX_DROPPED_FILE_BYTES = 50 * 1024 * 1024;
-const MAX_DROPPED_TOTAL_BYTES = 200 * 1024 * 1024;
+const MAX_COMPOSER_ROOTS = 32;
+const MAX_FOLDER_FILES = 500;
+const MAX_COMPOSER_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_COMPOSER_TOTAL_BYTES = 200 * 1024 * 1024;
 
 interface LegacyFileSystemEntry {
   isFile: boolean;
@@ -335,14 +335,14 @@ export async function readDroppedFiles(dataTransfer: DataTransfer): Promise<File
     ).webkitGetAsEntry?.();
     return entry ? [entry] : [];
   });
-  if (entries.length > MAX_DROPPED_ROOTS) {
-    throw new Error(`Drop supports at most ${MAX_DROPPED_ROOTS} attachment roots`);
+  if (entries.length > MAX_COMPOSER_ROOTS) {
+    throw new Error(`Composer supports at most ${MAX_COMPOSER_ROOTS} attachment roots`);
   }
   const files =
     entries.length > 0
       ? (await Promise.all(entries.map((entry) => readFileSystemEntry(entry, entry.name)))).flat()
       : Array.from(dataTransfer.files ?? []);
-  validateDroppedFiles(files);
+  validateComposerFiles(files);
   return files;
 }
 
@@ -369,8 +369,8 @@ async function readFileSystemEntry(
     });
     if (batch.length === 0) break;
     children.push(...batch);
-    if (children.length > MAX_DROPPED_FILES) {
-      throw new Error(`Dropped folder exceeds the ${MAX_DROPPED_FILES} file limit`);
+    if (children.length > MAX_FOLDER_FILES) {
+      throw new Error(`Dropped folder exceeds the ${MAX_FOLDER_FILES} file limit`);
     }
   }
   return (
@@ -380,18 +380,30 @@ async function readFileSystemEntry(
   ).flat();
 }
 
-function validateDroppedFiles(files: readonly File[]) {
-  if (files.length > MAX_DROPPED_FILES) {
-    throw new Error(`Dropped folder exceeds the ${MAX_DROPPED_FILES} file limit`);
+export function validateComposerFiles(files: readonly File[]) {
+  const roots = new Map<string, number>();
+  files.forEach((file, index) => {
+    const relativePath = file.webkitRelativePath;
+    const root = relativePath ? relativePath.split("/")[0] || file.name : `file:${index}`;
+    const key = relativePath ? `folder:${root}` : root;
+    roots.set(key, (roots.get(key) ?? 0) + 1);
+  });
+  if (roots.size > MAX_COMPOSER_ROOTS) {
+    throw new Error(`Composer supports at most ${MAX_COMPOSER_ROOTS} attachment roots`);
+  }
+  for (const count of roots.values()) {
+    if (count > MAX_FOLDER_FILES) {
+      throw new Error(`Selected folder exceeds the ${MAX_FOLDER_FILES} file limit`);
+    }
   }
   let totalBytes = 0;
   for (const file of files) {
-    if (file.size > MAX_DROPPED_FILE_BYTES) {
+    if (file.size > MAX_COMPOSER_FILE_BYTES) {
       throw new Error(`${file.name} exceeds the 50 MiB file limit`);
     }
     totalBytes += file.size;
   }
-  if (totalBytes > MAX_DROPPED_TOTAL_BYTES) {
-    throw new Error("Dropped files exceed the 200 MiB Turn limit");
+  if (totalBytes > MAX_COMPOSER_TOTAL_BYTES) {
+    throw new Error("Selected files exceed the 200 MiB Turn limit");
   }
 }

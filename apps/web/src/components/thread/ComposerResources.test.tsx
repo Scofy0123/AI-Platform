@@ -1,18 +1,17 @@
 // @vitest-environment jsdom
 
-import type { DraftAttachment, ThreadGoalView } from "@codexplatform/contracts";
+import type { BrowserDraftAttachment, ThreadGoalView } from "@codexplatform/contracts";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { ComposerResources, readDroppedFiles } from "./ComposerResources.js";
 
 afterEach(cleanup);
 
-const attachment: DraftAttachment = {
+const attachment: BrowserDraftAttachment = {
   id: "attachment-1",
   threadId: "thread-1",
   kind: "FILE",
   name: "spec.md",
-  relativePath: ".codexplatform/attachments/attachment-1/spec.md",
   mimeType: "text/markdown",
   sizeBytes: 1_024,
   fileCount: 1,

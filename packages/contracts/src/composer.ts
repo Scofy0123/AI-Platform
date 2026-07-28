@@ -136,6 +136,11 @@ export const DraftAttachmentSchema = z
   .strict();
 export type DraftAttachment = z.infer<typeof DraftAttachmentSchema>;
 
+export const BrowserDraftAttachmentSchema = DraftAttachmentSchema.omit({
+  relativePath: true,
+}).strict();
+export type BrowserDraftAttachment = z.infer<typeof BrowserDraftAttachmentSchema>;
+
 export const ThreadGoalStatusSchema = z.enum([
   "ACTIVE",
   "PAUSED",

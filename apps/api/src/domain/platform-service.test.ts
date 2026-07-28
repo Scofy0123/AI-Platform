@@ -781,6 +781,10 @@ describe("LocalPlatformService", () => {
         },
       ],
     });
+    expect(attachment).not.toHaveProperty("relativePath");
+    await expect(service.listAttachments(draft.id, "user-1")).resolves.toEqual([
+      expect.not.objectContaining({ relativePath: expect.anything() }),
+    ]);
     const attachmentRoot = join(
       "/tmp/codexplatform-test",
       "workspaces",

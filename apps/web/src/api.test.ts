@@ -80,7 +80,6 @@ describe("HTTP API adapter", () => {
       threadId: "draft-1",
       kind: "FOLDER",
       name: "reports",
-      relativePath: ".codexplatform/attachments/attachment-1/reports",
       mimeType: "application/x-directory",
       sizeBytes: 8,
       fileCount: 2,

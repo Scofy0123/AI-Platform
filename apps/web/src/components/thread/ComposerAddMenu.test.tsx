@@ -101,6 +101,25 @@ describe("ComposerAddMenu", () => {
     expect(screen.getByRole("button", { name: "Add files and more" })).toHaveFocus();
   });
 
+  test("resets the native input so the same file can be selected again", () => {
+    const props = renderMenu();
+    const file = new File(["same"], "same.txt", { type: "text/plain" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Add files and more" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Files and folders/ }));
+    const firstInput = screen.getByLabelText("Choose files input");
+    fireEvent.change(firstInput, { target: { files: [file] } });
+    expect(firstInput).toHaveValue("");
+
+    fireEvent.click(screen.getByRole("button", { name: "Add files and more" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Files and folders/ }));
+    const secondInput = screen.getByLabelText("Choose files input");
+    fireEvent.change(secondInput, { target: { files: [file] } });
+
+    expect(props.onChooseFiles).toHaveBeenCalledTimes(2);
+    expect(secondInput).toHaveValue("");
+  });
+
   test("synchronizes Plan selection and exposes a typed lock reason", () => {
     const props = renderMenu({ planMode: true, planLockedReason: "ACTIVE_TURN" });
     fireEvent.click(screen.getByRole("button", { name: "Add files and more" }));

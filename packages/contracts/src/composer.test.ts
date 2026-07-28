@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  BrowserDraftAttachmentSchema,
   CollaborationModePresetSchema,
   ComposerCapabilitySchema,
   ComposerStateSchema,
@@ -139,6 +140,24 @@ describe("TurnInputBundleSchema", () => {
       createdAt: "2026-07-28T12:00:00.000Z",
     });
     expect(JSON.stringify(attachment)).not.toContain("/private/");
+    const browserAttachment = BrowserDraftAttachmentSchema.parse({
+      id: attachment.id,
+      threadId: attachment.threadId,
+      kind: attachment.kind,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.sizeBytes,
+      fileCount: attachment.fileCount,
+      scanStatus: attachment.scanStatus,
+      createdAt: attachment.createdAt,
+    });
+    expect(browserAttachment).not.toHaveProperty("relativePath");
+    expect(() =>
+      BrowserDraftAttachmentSchema.parse({
+        ...browserAttachment,
+        relativePath: ".codexplatform/attachments/attachment-1/diagram.png",
+      }),
+    ).toThrow();
     expect(
       DraftAttachmentSchema.parse({
         ...attachment,

@@ -202,7 +202,6 @@ function createApi(session: Session = adminSession) {
       threadId,
       kind: files.some((file) => file.webkitRelativePath) ? "FOLDER" : "FILE",
       name: files[0]?.name ?? "file",
-      relativePath: `.codexplatform/attachments/a/${files[0]?.name ?? "file"}`,
       mimeType: files[0]?.type || "application/octet-stream",
       sizeBytes: files.reduce((sum: number, file: File) => sum + file.size, 0),
       fileCount: files.length,

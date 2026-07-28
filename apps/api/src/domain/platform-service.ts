@@ -6,6 +6,8 @@ import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
   type ActorContext,
   type Bootstrap,
+  type BrowserDraftAttachment,
+  BrowserDraftAttachmentSchema,
   type CollaborationModePreset,
   type ComposerCapability,
   type ComposerState,
@@ -584,7 +586,7 @@ export class LocalPlatformService implements PlatformApi {
     input: {
       files: Array<{ name: string; relativePath: string; mimeType: string; content: Buffer }>;
     },
-  ): Promise<DraftAttachment> {
+  ): Promise<BrowserDraftAttachment> {
     const task = this.options.store.getTaskForUser(threadId, userId);
     if (!task || task.lifecycleState === "EXPIRED") throw new Error("Thread not found");
     if (task.archivedAt) throw new Error("Thread is archived");
@@ -637,7 +639,7 @@ export class LocalPlatformService implements PlatformApi {
       for (const file of scannedFiles) {
         await writeSafeAttachmentFile(attachmentRoot, file.relativePath, file.content);
       }
-      return this.options.store.createAttachment({
+      const stored = this.options.store.createAttachment({
         id: attachmentId,
         threadId,
         ownerId: userId,
@@ -652,6 +654,7 @@ export class LocalPlatformService implements PlatformApi {
         scanStatus: "READY",
         now: this.now(),
       });
+      return projectBrowserAttachment(stored);
     } catch (error) {
       if (stagingPrepared) {
         await removeSafeAttachmentRoot(this.options.dataDir, threadId, attachmentId);
@@ -665,8 +668,10 @@ export class LocalPlatformService implements PlatformApi {
     await this.processAttachmentCleanupJobs(this.now());
   }
 
-  async listAttachments(threadId: string, userId: string): Promise<DraftAttachment[]> {
-    return this.options.store.listUnclaimedAttachments(threadId, userId);
+  async listAttachments(threadId: string, userId: string): Promise<BrowserDraftAttachment[]> {
+    return this.options.store
+      .listUnclaimedAttachments(threadId, userId)
+      .map(projectBrowserAttachment);
   }
 
   async getThreadGoal(threadId: string, userId: string): Promise<ThreadGoalView | null> {
@@ -2910,6 +2915,11 @@ function deterministicGoalCapabilityConflict(reasonCode: string): boolean {
 function publicThreadGoal(goal: StoredThreadGoalView): ThreadGoalView {
   const { revision: _revision, ...view } = goal;
   return ThreadGoalViewSchema.parse(view);
+}
+
+function projectBrowserAttachment(attachment: DraftAttachment): BrowserDraftAttachment {
+  const { relativePath: _relativePath, ...browserAttachment } = attachment;
+  return BrowserDraftAttachmentSchema.parse(browserAttachment);
 }
 
 function toTaskSummary(task: TaskRecord): TaskSummary {

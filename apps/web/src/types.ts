@@ -1,9 +1,9 @@
 import type {
   Bootstrap,
+  BrowserDraftAttachment,
   ComposerCapability,
   ComposerState,
   ComposerStatePatch,
-  DraftAttachment,
   EffectiveConfigOverride,
   ModelCatalog,
   SubagentThread,
@@ -21,10 +21,10 @@ import type {
 
 export type {
   Bootstrap,
+  BrowserDraftAttachment,
   ComposerCapability,
   ComposerState,
   ComposerStatePatch,
-  DraftAttachment,
   ModelCatalog,
   ModelOption,
   SubagentThread,
@@ -212,8 +212,8 @@ export interface PlatformApi {
     lifecycleState: "DRAFT";
   }>;
   deleteDraft?(threadId: string): Promise<void>;
-  uploadAttachments?(threadId: string, files: readonly File[]): Promise<DraftAttachment>;
-  listThreadAttachments?(threadId: string): Promise<DraftAttachment[]>;
+  uploadAttachments?(threadId: string, files: readonly File[]): Promise<BrowserDraftAttachment>;
+  listThreadAttachments?(threadId: string): Promise<BrowserDraftAttachment[]>;
   deleteAttachment?(threadId: string, attachmentId: string): Promise<void>;
   getThreadGoal?(threadId: string): Promise<ThreadGoalView>;
   putThreadGoal?(threadId: string, input: ThreadGoalInput): Promise<ThreadGoalView>;
