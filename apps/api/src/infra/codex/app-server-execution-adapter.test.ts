@@ -235,6 +235,39 @@ describe("AppServerExecutionAdapter", () => {
     );
   });
 
+  test("clears a stale native Goal before starting a resumed Turn without a platform Goal", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.resumeThread).mockResolvedValue(
+      resumeResponse("thread-1", { type: "idle" }, []),
+    );
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Continue",
+      existingThreadId: "thread-1",
+      goal: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    expect(runtime.clearThreadGoal).toHaveBeenCalledWith("thread-1");
+    expect(vi.mocked(runtime.clearThreadGoal).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.startTurn).mock.invocationCallOrder[0] as number,
+    );
+  });
+
   test("disables native memory after creating a Thread and before starting its Turn", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();
@@ -265,6 +298,137 @@ describe("AppServerExecutionAdapter", () => {
     expect(vi.mocked(runtime.disableThreadMemory).mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(runtime.startTurn).mock.invocationCallOrder[0] as number,
     );
+  });
+
+  test("prepares the Runtime Thread then syncs Goal before starting the Turn", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    const prepared = vi.fn();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Start safely",
+      existingThreadId: null,
+      goal: {
+        objective: "持续完成",
+        status: "ACTIVE",
+        tokenBudget: 200_000,
+        tokensUsed: 0,
+        timeBudgetSeconds: 3_600,
+        timeUsedSeconds: 0,
+      },
+      onThreadPrepared: prepared,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    expect(prepared).toHaveBeenCalledWith("thread-1");
+    expect(vi.mocked(runtime.disableThreadMemory).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.setThreadGoal).mock.invocationCallOrder[0] as number,
+    );
+    expect(vi.mocked(runtime.setThreadGoal).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.startTurn).mock.invocationCallOrder[0] as number,
+    );
+  });
+
+  test("never starts a Turn when Goal synchronization fails", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.setThreadGoal).mockRejectedValueOnce(new Error("Goal unavailable"));
+    const prepared = vi.fn();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await expect(
+      adapter.startTask({
+        accountId: "account-1",
+        codexHome: "/tmp/account-1",
+        taskId: "task-1",
+        userId: "user-1",
+        cwd: "/workspace",
+        prompt: "Must not run",
+        existingThreadId: null,
+        goal: {
+          objective: "持续完成",
+          status: "ACTIVE",
+          tokenBudget: 200_000,
+          tokensUsed: 0,
+          timeBudgetSeconds: 3_600,
+          timeUsedSeconds: 0,
+        },
+        onThreadPrepared: prepared,
+        ...TEST_EXECUTION_CONTEXT,
+      }),
+    ).rejects.toThrow("Goal unavailable");
+    expect(prepared).toHaveBeenCalledWith("thread-1");
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test("projects Goal update and clear notifications onto the owning platform task", async () => {
+    const rpc = new FakeRpc();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime: runtimePort() }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const updates: unknown[] = [];
+    const clears: unknown[] = [];
+    adapter.on("goalUpdated", (event) => updates.push(event));
+    adapter.on("goalCleared", (event) => clears.push(event));
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Run",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    rpc.emit("notification", {
+      method: "thread/goal/updated",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        goal: { status: "budgetLimited", tokensUsed: 200_000, timeUsedSeconds: 60 },
+      },
+    });
+    rpc.emit("notification", {
+      method: "thread/goal/cleared",
+      params: { threadId: "thread-1" },
+    });
+
+    expect(updates).toEqual([
+      {
+        taskId: "task-1",
+        threadId: "thread-1",
+        status: "BUDGET_LIMITED",
+        tokensUsed: 200_000,
+        timeUsedSeconds: 60,
+      },
+    ]);
+    expect(clears).toEqual([{ taskId: "task-1", threadId: "thread-1" }]);
   });
 
   test.each([
@@ -1747,6 +1911,15 @@ function runtimePort(threadId = "thread-1", turnId = "turn-1"): ManagedRuntimePo
     resumeThread: vi.fn(async () => resumeResponse(threadId, { type: "idle" }, [])),
     startTurn: vi.fn(async () => ({ turn: { id: turnId } })),
     disableThreadMemory: vi.fn(async () => ({})),
+    setThreadGoal: vi.fn(async (_threadId, input) => ({
+      threadId,
+      ...input,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    })),
+    clearThreadGoal: vi.fn(async () => true),
     steerTurn: vi.fn(async () => undefined),
     interruptTurn: vi.fn(async () => undefined),
     startChatGptLogin: vi.fn(async () => ({

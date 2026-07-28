@@ -27,6 +27,12 @@ import {
   TaskStatusSchema,
   type TaskSummary,
   type Thread,
+  type ThreadGoalInput,
+  ThreadGoalInputSchema,
+  type ThreadGoalPatch,
+  ThreadGoalPatchSchema,
+  type ThreadGoalSnapshot,
+  type ThreadGoalView,
   type ThreadItem,
   TurnStatusSchema,
   type UserSettings,
@@ -158,6 +164,7 @@ export class InvalidThreadResumeResponseError extends ThreadResumeSafetyError {
 }
 
 export interface TaskExecutionAdapter {
+  readonly supportsGoal: boolean;
   listModels(account: InternalAccount): Promise<ModelOption[]>;
   startTask(input: {
     accountId: string;
@@ -169,6 +176,8 @@ export interface TaskExecutionAdapter {
     existingThreadId: string | null;
     effectiveConfig: EffectiveThreadConfigSnapshot;
     actorContext: ActorContext;
+    goal?: ThreadGoalSnapshot | null;
+    onThreadPrepared?(threadId: string): void;
     attachments?: Array<{ name: string; path: string; mimeType: string }>;
   }): Promise<{ threadId: string; turnId: string }>;
   steerTask(
@@ -196,6 +205,17 @@ export interface TaskExecutionAdapter {
     event: "accountQuotaUpdated",
     listener: (event: { accountId: string; quota: WeeklyQuota }) => void,
   ): this;
+  on(
+    event: "goalUpdated",
+    listener: (event: {
+      taskId: string;
+      threadId: string;
+      status: ThreadGoalView["status"];
+      tokensUsed: number;
+      timeUsedSeconds: number;
+    }) => void,
+  ): this;
+  on(event: "goalCleared", listener: (event: { taskId: string; threadId: string }) => void): this;
   on(
     event: "accountCrashed",
     listener: (event: {
@@ -311,6 +331,23 @@ export class LocalPlatformService implements PlatformApi {
       }
       this.startPromotedTurns(options.leases.promoteQueue(occurredAt));
     });
+    options.execution.on("goalUpdated", (event) => {
+      const ownerId = options.store.getTaskOwnerId(event.taskId);
+      if (!ownerId || !options.store.getThreadGoal(event.taskId, ownerId)) return;
+      options.store.syncThreadGoal({
+        threadId: event.taskId,
+        ownerId,
+        runtimeThreadId: event.threadId,
+        status: event.status,
+        tokensUsed: event.tokensUsed,
+        timeUsedSeconds: event.timeUsedSeconds,
+        now: this.now(),
+      });
+    });
+    options.execution.on("goalCleared", ({ taskId }) => {
+      const ownerId = options.store.getTaskOwnerId(taskId);
+      if (ownerId) options.store.deleteThreadGoal(taskId, ownerId);
+    });
   }
 
   async createProject(userId: string, input: { name: string }) {
@@ -408,8 +445,8 @@ export class LocalPlatformService implements PlatformApi {
     }
     return buildComposerCapabilities({
       stagingAvailable: true,
-      goalAvailable: false,
-      goalUnavailableReason: "Goal persistence is not enabled in this build",
+      goalAvailable: this.options.execution.supportsGoal,
+      goalUnavailableReason: "Goal protocol is unavailable for this Runtime",
       planModeAvailable: false,
       planModeUnavailableReason: "Plan mode is awaiting locked-version protocol validation",
       skillRecorderAvailable: false,
@@ -525,6 +562,43 @@ export class LocalPlatformService implements PlatformApi {
   async deleteAttachment(threadId: string, attachmentId: string, userId: string): Promise<void> {
     this.options.store.deleteAttachment(attachmentId, threadId, userId, this.now());
     await this.processAttachmentCleanupJobs(this.now());
+  }
+
+  async getThreadGoal(threadId: string, userId: string): Promise<ThreadGoalView | null> {
+    return this.options.store.getThreadGoal(threadId, userId);
+  }
+
+  async putThreadGoal(
+    threadId: string,
+    userId: string,
+    input: ThreadGoalInput,
+  ): Promise<ThreadGoalView> {
+    if (!this.options.execution.supportsGoal) throw new Error("Goal is unavailable");
+    const parsed = ThreadGoalInputSchema.parse(input);
+    return this.options.store.putThreadGoal({
+      threadId,
+      ownerId: userId,
+      ...parsed,
+      now: this.now(),
+    });
+  }
+
+  async patchThreadGoal(
+    threadId: string,
+    userId: string,
+    patch: ThreadGoalPatch,
+  ): Promise<ThreadGoalView> {
+    if (!this.options.execution.supportsGoal) throw new Error("Goal is unavailable");
+    return this.options.store.patchThreadGoal({
+      threadId,
+      ownerId: userId,
+      patch: ThreadGoalPatchSchema.parse(patch),
+      now: this.now(),
+    });
+  }
+
+  async deleteThreadGoal(threadId: string, userId: string): Promise<void> {
+    this.options.store.deleteThreadGoal(threadId, userId);
   }
 
   async listTasks(userId: string, projectId?: string) {
@@ -1137,6 +1211,20 @@ export class LocalPlatformService implements PlatformApi {
 
   async runMaintenance(now = this.now()): Promise<void> {
     await this.cleanupExpiredDrafts(now);
+    const limitedGoalTaskIds = this.options.store.applyGoalWatchdog(now);
+    await Promise.all(
+      limitedGoalTaskIds.map(async (taskId) => {
+        const ownerId = this.options.store.getTaskOwnerId(taskId);
+        if (!ownerId) return;
+        const task = this.options.store.getTaskForUser(taskId, ownerId);
+        if (!task?.threadId || !task.currentTurnId) return;
+        try {
+          await this.options.execution.interruptTask(task.threadId, task.currentTurnId);
+        } catch {
+          this.options.store.markThreadGoalRecovery(taskId, ownerId, now);
+        }
+      }),
+    );
     this.recoverExpiredModelCatalogCooldowns(now);
     for (const schedulerTurnId of this.schedulerTurnByRuntimeTurn.values()) {
       this.options.leases.heartbeatTurn(schedulerTurnId, now);
@@ -1531,6 +1619,12 @@ export class LocalPlatformService implements PlatformApi {
         ...payload,
         now: occurredAt,
       });
+      this.options.store.updateThreadGoalTokens(
+        draft.taskId,
+        ownerId,
+        payload.total.totalTokens,
+        occurredAt,
+      );
     }
     const event = this.options.store.appendTaskEvent({
       taskId: draft.taskId,
@@ -1827,6 +1921,16 @@ export class LocalPlatformService implements PlatformApi {
         existingThreadId: task.threadId,
         effectiveConfig,
         actorContext: this.actorContextFor(queuedTurn.ownerId),
+        goal: this.options.store.getTurnInputSnapshot(allocation.turnId)?.goal ?? null,
+        onThreadPrepared: (threadId) => {
+          this.options.store.bindTaskRuntime(queuedTurn.taskId, {
+            accountId: account.id,
+            accountAlias: account.alias,
+            leaseId: allocation.leaseId,
+            threadId,
+            now: this.now(),
+          });
+        },
         attachments:
           this.options.store
             .getTurnInputSnapshot(allocation.turnId)
@@ -1841,13 +1945,20 @@ export class LocalPlatformService implements PlatformApi {
         allocation.turnId,
       );
       this.options.store.bindTurnRuntime(allocation.turnId, started.turnId, this.now());
-      this.options.store.bindTaskRuntime(queuedTurn.taskId, {
-        accountId: account.id,
-        accountAlias: account.alias,
-        leaseId: allocation.leaseId,
-        threadId: started.threadId,
-        now: this.now(),
-      });
+      const preparedTask = this.options.store.getTaskForUser(queuedTurn.taskId, queuedTurn.ownerId);
+      if (
+        preparedTask?.threadId !== started.threadId ||
+        preparedTask.accountId !== account.id ||
+        preparedTask.leaseId !== allocation.leaseId
+      ) {
+        this.options.store.bindTaskRuntime(queuedTurn.taskId, {
+          accountId: account.id,
+          accountAlias: account.alias,
+          leaseId: allocation.leaseId,
+          threadId: started.threadId,
+          now: this.now(),
+        });
+      }
       this.options.store.setCurrentTurn(queuedTurn.taskId, started.turnId, "RUNNING", this.now());
       const event = this.options.store.appendTaskEvent({
         taskId: queuedTurn.taskId,
@@ -1875,6 +1986,17 @@ export class LocalPlatformService implements PlatformApi {
       }
       if (error instanceof ThreadResumeSafetyError) {
         this.options.accounts.setState(account.id, "QUARANTINED");
+      }
+      const preparedTask = this.options.store.getTaskForUser(queuedTurn.taskId, queuedTurn.ownerId);
+      if (
+        preparedTask?.threadId &&
+        this.options.store.getThreadGoal(queuedTurn.taskId, queuedTurn.ownerId)
+      ) {
+        this.options.store.markThreadGoalRecovery(
+          queuedTurn.taskId,
+          queuedTurn.ownerId,
+          this.now(),
+        );
       }
       const persisted = this.options.store.getTurn(allocation.turnId);
       if (persisted?.status !== "NEEDS_RECOVERY") {

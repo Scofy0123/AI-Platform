@@ -10,6 +10,9 @@ import type {
   TaskEvent,
   TaskSummary,
   Thread,
+  ThreadGoalInput,
+  ThreadGoalPatch,
+  ThreadGoalView,
   UserSettingsPatch,
   UserSettingsView,
 } from "@codexplatform/contracts";
@@ -52,6 +55,14 @@ export interface PlatformApi {
     },
   ): Promise<DraftAttachment>;
   deleteAttachment(threadId: string, attachmentId: string, userId: string): Promise<void>;
+  getThreadGoal(threadId: string, userId: string): Promise<ThreadGoalView | null>;
+  putThreadGoal(threadId: string, userId: string, input: ThreadGoalInput): Promise<ThreadGoalView>;
+  patchThreadGoal(
+    threadId: string,
+    userId: string,
+    patch: ThreadGoalPatch,
+  ): Promise<ThreadGoalView>;
+  deleteThreadGoal(threadId: string, userId: string): Promise<void>;
   listThreads(userId: string, projectId?: string): Promise<Thread[]>;
   listArchivedThreads(userId: string): Promise<Thread[]>;
   archiveThread(threadId: string, userId: string): Promise<{ ok: true }>;

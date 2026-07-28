@@ -204,7 +204,26 @@ CREATE TABLE IF NOT EXISTS turn_input_snapshots (
   turn_id TEXT PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
   prompt TEXT NOT NULL,
   attachments_json TEXT NOT NULL,
+  goal_json TEXT,
   captured_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS thread_goals (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  objective TEXT NOT NULL,
+  status TEXT NOT NULL
+    CHECK(status IN ('ACTIVE', 'PAUSED', 'COMPLETE', 'BUDGET_LIMITED', 'NEEDS_RECOVERY')),
+  token_budget INTEGER NOT NULL CHECK(token_budget > 0),
+  tokens_used INTEGER NOT NULL DEFAULT 0 CHECK(tokens_used >= 0),
+  time_budget_seconds INTEGER NOT NULL CHECK(time_budget_seconds > 0),
+  time_used_seconds INTEGER NOT NULL DEFAULT 0 CHECK(time_used_seconds >= 0),
+  runtime_sync_state TEXT NOT NULL DEFAULT 'PENDING'
+    CHECK(runtime_sync_state IN ('PENDING', 'SYNCED', 'NEEDS_RECOVERY')),
+  runtime_thread_id TEXT,
+  activated_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS steer_input_snapshots (
@@ -424,7 +443,23 @@ export function migrateDatabase(sqlite: Database.Database): void {
       turn_id TEXT PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
       prompt TEXT NOT NULL,
       attachments_json TEXT NOT NULL,
+      goal_json TEXT,
       captured_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS thread_goals (
+      task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+      owner_id TEXT NOT NULL,
+      objective TEXT NOT NULL,
+      status TEXT NOT NULL,
+      token_budget INTEGER NOT NULL,
+      tokens_used INTEGER NOT NULL DEFAULT 0,
+      time_budget_seconds INTEGER NOT NULL,
+      time_used_seconds INTEGER NOT NULL DEFAULT 0,
+      runtime_sync_state TEXT NOT NULL DEFAULT 'PENDING',
+      runtime_thread_id TEXT,
+      activated_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS steer_input_snapshots (
       id TEXT PRIMARY KEY,
@@ -461,6 +496,7 @@ export function migrateDatabase(sqlite: Database.Database): void {
     "delivery_status",
     "TEXT NOT NULL DEFAULT 'PENDING'",
   );
+  ensureColumn(sqlite, "turn_input_snapshots", "goal_json", "TEXT");
   ensureColumn(sqlite, "steer_input_snapshots", "delivery_error", "TEXT");
   ensureColumn(sqlite, "steer_input_snapshots", "delivered_at", "INTEGER");
   ensureColumn(sqlite, "steer_input_snapshots", "failed_at", "INTEGER");
@@ -651,7 +687,8 @@ function ensureColumn(
     | "turns"
     | "sessions"
     | "feishu_credentials"
-    | "steer_input_snapshots",
+    | "steer_input_snapshots"
+    | "turn_input_snapshots",
   column:
     | "codex_home"
     | "quota_resets_at"
@@ -670,7 +707,8 @@ function ensureColumn(
     | "delivery_error"
     | "delivered_at"
     | "failed_at"
-    | "unknown_at",
+    | "unknown_at"
+    | "goal_json",
   definition:
     | "TEXT"
     | "INTEGER"

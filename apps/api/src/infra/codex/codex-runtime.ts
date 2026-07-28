@@ -13,6 +13,14 @@ import type { SandboxMode } from "./generated/v2/SandboxMode.js";
 import type { SandboxPolicy } from "./generated/v2/SandboxPolicy.js";
 import type { ThreadBackgroundTerminalsListResponse } from "./generated/v2/ThreadBackgroundTerminalsListResponse.js";
 import type { ThreadBackgroundTerminalsTerminateResponse } from "./generated/v2/ThreadBackgroundTerminalsTerminateResponse.js";
+import type { ThreadGoal } from "./generated/v2/ThreadGoal.js";
+import type { ThreadGoalClearParams } from "./generated/v2/ThreadGoalClearParams.js";
+import type { ThreadGoalClearResponse } from "./generated/v2/ThreadGoalClearResponse.js";
+import type { ThreadGoalGetParams } from "./generated/v2/ThreadGoalGetParams.js";
+import type { ThreadGoalGetResponse } from "./generated/v2/ThreadGoalGetResponse.js";
+import type { ThreadGoalSetParams } from "./generated/v2/ThreadGoalSetParams.js";
+import type { ThreadGoalSetResponse } from "./generated/v2/ThreadGoalSetResponse.js";
+import type { ThreadGoalStatus } from "./generated/v2/ThreadGoalStatus.js";
 import type { ThreadMemoryModeSetParams } from "./generated/v2/ThreadMemoryModeSetParams.js";
 import type { ThreadMemoryModeSetResponse } from "./generated/v2/ThreadMemoryModeSetResponse.js";
 import type { ThreadResumeParams } from "./generated/v2/ThreadResumeParams.js";
@@ -215,6 +223,36 @@ export class CodexAppServerRuntime {
     return response;
   }
 
+  async setThreadGoal(
+    threadId: string,
+    input: { objective: string; status: ThreadGoalStatus; tokenBudget: number | null },
+  ): Promise<ThreadGoal> {
+    const params = { threadId, ...input } satisfies ThreadGoalSetParams;
+    const response = await this.rpc.request<ThreadGoalSetResponse>("thread/goal/set", params);
+    if (!isThreadGoalResponse(response, threadId)) {
+      throw new Error("Invalid thread/goal/set response");
+    }
+    return response.goal;
+  }
+
+  async getThreadGoal(threadId: string): Promise<ThreadGoal | null> {
+    const params = { threadId } satisfies ThreadGoalGetParams;
+    const response = await this.rpc.request<ThreadGoalGetResponse>("thread/goal/get", params);
+    if (!isThreadGoalGetResponse(response, threadId)) {
+      throw new Error("Invalid thread/goal/get response");
+    }
+    return response.goal;
+  }
+
+  async clearThreadGoal(threadId: string): Promise<boolean> {
+    const params = { threadId } satisfies ThreadGoalClearParams;
+    const response = await this.rpc.request<ThreadGoalClearResponse>("thread/goal/clear", params);
+    if (!isRecord(response) || typeof response.cleared !== "boolean") {
+      throw new Error("Invalid thread/goal/clear response");
+    }
+    return response.cleared;
+  }
+
   steerTurn(
     threadId: string,
     turnId: string,
@@ -408,6 +446,52 @@ function isEmptyJsonObject(value: unknown): value is Record<string, never> {
     !Array.isArray(value) &&
     Object.keys(value).length === 0
   );
+}
+
+const THREAD_GOAL_STATUSES = new Set<ThreadGoalStatus>([
+  "active",
+  "paused",
+  "blocked",
+  "usageLimited",
+  "budgetLimited",
+  "complete",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isThreadGoal(value: unknown, threadId: string): value is ThreadGoal {
+  if (!isRecord(value)) return false;
+  return (
+    value.threadId === threadId &&
+    typeof value.objective === "string" &&
+    value.objective.length > 0 &&
+    typeof value.status === "string" &&
+    THREAD_GOAL_STATUSES.has(value.status as ThreadGoalStatus) &&
+    (value.tokenBudget === null ||
+      (typeof value.tokenBudget === "number" &&
+        Number.isInteger(value.tokenBudget) &&
+        value.tokenBudget > 0)) &&
+    typeof value.tokensUsed === "number" &&
+    Number.isInteger(value.tokensUsed) &&
+    value.tokensUsed >= 0 &&
+    typeof value.timeUsedSeconds === "number" &&
+    Number.isInteger(value.timeUsedSeconds) &&
+    value.timeUsedSeconds >= 0 &&
+    typeof value.createdAt === "number" &&
+    Number.isFinite(value.createdAt) &&
+    typeof value.updatedAt === "number" &&
+    Number.isFinite(value.updatedAt)
+  );
+}
+
+function isThreadGoalResponse(value: unknown, threadId: string): value is ThreadGoalSetResponse {
+  return isRecord(value) && isThreadGoal(value.goal, threadId);
+}
+
+function isThreadGoalGetResponse(value: unknown, threadId: string): value is ThreadGoalGetResponse {
+  return isRecord(value) && (value.goal === null || isThreadGoal(value.goal, threadId));
 }
 
 function threadConfigParams(config: EffectiveThreadConfigSnapshot) {

@@ -200,6 +200,21 @@ describe("migrateDatabase", () => {
     );
   });
 
+  test("adds Goal persistence and immutable Turn Goal snapshots idempotently", () => {
+    const database = new Database(":memory:");
+    databases.push(database);
+    migrateDatabase(database);
+    migrateDatabase(database);
+
+    expect(
+      database
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'thread_goals'")
+        .get(),
+    ).toEqual({ name: "thread_goals" });
+    const columns = database.pragma("table_info(turn_input_snapshots)") as Array<{ name: string }>;
+    expect(columns.map((column) => column.name)).toContain("goal_json");
+  });
+
   test("marks snapshots created before delivery tracking as UNKNOWN instead of PENDING", () => {
     const database = new Database(":memory:");
     databases.push(database);

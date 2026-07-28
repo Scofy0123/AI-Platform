@@ -468,6 +468,64 @@ describe("CodexAppServerRuntime", () => {
     expect(rpc.requests).toEqual([]);
   });
 
+  test("sets, reads, and clears a Goal with strict protocol validation", async () => {
+    const goal = {
+      threadId: "thread-1",
+      objective: "Ship safely",
+      status: "active" as const,
+      tokenBudget: 200_000,
+      tokensUsed: 12,
+      timeUsedSeconds: 4,
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const rpc = new FakeRpc({
+      "thread/goal/set": { goal },
+      "thread/goal/get": { goal },
+      "thread/goal/clear": { cleared: true },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await expect(
+      runtime.setThreadGoal("thread-1", {
+        objective: "Ship safely",
+        status: "active",
+        tokenBudget: 200_000,
+      }),
+    ).resolves.toEqual(goal);
+    await expect(runtime.getThreadGoal("thread-1")).resolves.toEqual(goal);
+    await expect(runtime.clearThreadGoal("thread-1")).resolves.toBe(true);
+    expect(rpc.requests).toEqual([
+      {
+        method: "thread/goal/set",
+        params: {
+          threadId: "thread-1",
+          objective: "Ship safely",
+          status: "active",
+          tokenBudget: 200_000,
+        },
+      },
+      { method: "thread/goal/get", params: { threadId: "thread-1" } },
+      { method: "thread/goal/clear", params: { threadId: "thread-1" } },
+    ]);
+  });
+
+  test("fails closed on malformed Goal responses", async () => {
+    const runtime = new CodexAppServerRuntime(
+      new FakeRpc({
+        "thread/goal/set": { goal: { threadId: "thread-1", objective: "x" } },
+      }),
+    );
+
+    await expect(
+      runtime.setThreadGoal("thread-1", {
+        objective: "x",
+        status: "active",
+        tokenBudget: 200_000,
+      }),
+    ).rejects.toThrow("Invalid thread/goal/set response");
+  });
+
   test.each([null, [], { accepted: true }])(
     "rejects a malformed native memory response: %j",
     async (response) => {

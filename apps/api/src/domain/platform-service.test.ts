@@ -245,6 +245,7 @@ describe("LocalPlatformService", () => {
       {
         prompt: "",
         attachments: [attachment],
+        goal: null,
         capturedAt: NOW.toISOString(),
         deliveryStatus: "DELIVERED",
         deliveryError: null,
@@ -419,6 +420,131 @@ describe("LocalPlatformService", () => {
     expect(store.getTaskForUser(draft.id, "user-1")).toBeNull();
 
     await expect(service.runMaintenance(maintenanceAt)).resolves.toBeUndefined();
+  });
+
+  test("persists a Goal across Turns and sends its immutable snapshot after thread preparation", async () => {
+    const project = await service.createProject("user-1", { name: "Goal runtime" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await expect(
+      service.putThreadGoal(task.id, "user-1", {
+        objective: "持续完成",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      }),
+    ).resolves.toMatchObject({ status: "ACTIVE", runtimeSyncState: "PENDING" });
+    await expect(service.getThreadGoal(task.id, "user-2")).rejects.toThrow("Thread not found");
+
+    await service.startTurn(task.id, "user-1", "第一轮");
+    expect(execution.startTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        goal: expect.objectContaining({ objective: "持续完成", status: "ACTIVE" }),
+        onThreadPrepared: expect.any(Function),
+      }),
+    );
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "ACTIVE",
+      runtimeSyncState: "SYNCED",
+    });
+  });
+
+  test("preserves a prepared Runtime Thread and requires recovery when Goal sync fails", async () => {
+    const project = await service.createProject("user-1", { name: "Goal recovery" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "持续完成",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    execution.startTask.mockImplementationOnce(async (input) => {
+      input.onThreadPrepared?.(`thread-${input.taskId}`);
+      throw new Error("Goal sync failed");
+    });
+
+    await expect(service.startTurn(task.id, "user-1", "执行")).rejects.toThrow("Goal sync failed");
+    expect(store.getTaskForUser(task.id, "user-1")).toMatchObject({
+      threadId: `thread-${task.id}`,
+      status: "NEEDS_RECOVERY",
+    });
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
+    });
+  });
+
+  test("limits an active Goal when its time budget expires and blocks another Turn", async () => {
+    const project = await service.createProject("user-1", { name: "Goal budget" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "短目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 1,
+    });
+    await service.runMaintenance(new Date(NOW.getTime() + 2_000));
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "BUDGET_LIMITED",
+    });
+    await expect(service.startTurn(task.id, "user-1", "不应执行")).rejects.toThrow(
+      "does not accept new Turns",
+    );
+  });
+
+  test("limits an active Goal from authoritative Runtime token usage", async () => {
+    const project = await service.createProject("user-1", { name: "Goal tokens" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "有界执行",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await service.startTurn(task.id, "user-1", "执行");
+    execution.emitTaskEvent({
+      taskId: task.id,
+      threadId: `thread-${task.id}`,
+      turnId: `codex-turn-${task.id}`,
+      type: "TOKEN_USAGE_UPDATED",
+      payload: tokenUsagePayload(200_000, 180_000, 0, 20_000, 0),
+    });
+
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "BUDGET_LIMITED",
+      tokensUsed: 200_000,
+    });
+  });
+
+  test("interrupts an active Runtime Turn when the Goal watchdog reaches its time budget", async () => {
+    const project = await service.createProject("user-1", { name: "Goal watchdog" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "短时执行",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 1,
+    });
+    await service.startTurn(task.id, "user-1", "执行");
+
+    await service.runMaintenance(new Date(NOW.getTime() + 2_000));
+
+    expect(execution.interruptTask).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      `codex-turn-${task.id}`,
+    );
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "BUDGET_LIMITED",
+    });
   });
 
   test("keeps a durable cleanup job when file deletion fails and maintenance retries it", async () => {
@@ -2891,11 +3017,25 @@ describe("LocalPlatformService", () => {
 });
 
 class FakeExecution extends EventEmitter implements TaskExecutionAdapter {
+  readonly supportsGoal = true;
   readonly listModels = vi.fn<TaskExecutionAdapter["listModels"]>(async () => [STANDARD_MODEL]);
-  readonly startTask = vi.fn(async (input: { taskId: string }) => ({
-    threadId: `thread-${input.taskId}`,
-    turnId: `codex-turn-${input.taskId}`,
-  }));
+  readonly startTask = vi.fn<TaskExecutionAdapter["startTask"]>(async (input) => {
+    const threadId = `thread-${input.taskId}`;
+    input.onThreadPrepared?.(threadId);
+    if (input.goal) {
+      this.emit("goalUpdated", {
+        taskId: input.taskId,
+        threadId,
+        status: input.goal.status,
+        tokensUsed: input.goal.tokensUsed,
+        timeUsedSeconds: input.goal.timeUsedSeconds,
+      });
+    }
+    return {
+      threadId,
+      turnId: `codex-turn-${input.taskId}`,
+    };
+  });
   readonly steerTask = vi.fn(async () => undefined);
   readonly interruptTask = vi.fn(async () => undefined);
   readonly respondApproval = vi.fn(async (): Promise<void> => undefined);

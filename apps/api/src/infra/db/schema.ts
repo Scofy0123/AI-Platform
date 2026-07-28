@@ -223,7 +223,28 @@ export const turnInputSnapshots = sqliteTable("turn_input_snapshots", {
     .references(() => turns.id, { onDelete: "cascade" }),
   prompt: text("prompt").notNull(),
   attachmentsJson: text("attachments_json").notNull(),
+  goalJson: text("goal_json"),
   capturedAt: integer("captured_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const threadGoals = sqliteTable("thread_goals", {
+  taskId: text("task_id")
+    .primaryKey()
+    .references(() => tasks.id, { onDelete: "cascade" }),
+  ownerId: text("owner_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  objective: text("objective").notNull(),
+  status: text("status").notNull(),
+  tokenBudget: integer("token_budget").notNull(),
+  tokensUsed: integer("tokens_used").notNull().default(0),
+  timeBudgetSeconds: integer("time_budget_seconds").notNull(),
+  timeUsedSeconds: integer("time_used_seconds").notNull().default(0),
+  runtimeSyncState: text("runtime_sync_state").notNull().default("PENDING"),
+  runtimeThreadId: text("runtime_thread_id"),
+  activatedAt: integer("activated_at", { mode: "timestamp_ms" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });
 
 export const steerInputSnapshots = sqliteTable("steer_input_snapshots", {

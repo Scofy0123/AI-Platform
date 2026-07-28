@@ -4,6 +4,8 @@ import {
   type EffectiveThreadConfigSnapshot,
   type ModelOption,
   ModelOptionSchema,
+  type ThreadGoalSnapshot,
+  type ThreadGoalView,
 } from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
 import type {
@@ -58,6 +60,15 @@ interface RuntimePort {
     },
   ): Promise<unknown>;
   disableThreadMemory(threadId: string): Promise<unknown>;
+  setThreadGoal(
+    threadId: string,
+    input: { objective: string; status: "active" | "paused" | "complete"; tokenBudget: number },
+  ): Promise<{
+    status: string;
+    tokensUsed: number;
+    timeUsedSeconds: number;
+  }>;
+  clearThreadGoal(threadId: string): Promise<boolean>;
   steerTurn(
     threadId: string,
     turnId: string,
@@ -134,6 +145,7 @@ type BufferedRpcSignal =
   | { kind: "SERVER_REQUEST"; rpc: RpcPort; value: unknown };
 
 export class AppServerExecutionAdapter extends EventEmitter implements TaskExecutionAdapter {
+  readonly supportsGoal = true;
   private readonly attachedConnectionByAccount = new Map<string, AttachedConnection>();
   private readonly lastConnectionGenerationByAccount = new Map<string, number>();
   private readonly runtimeByThread = new Map<string, RuntimePort>();
@@ -165,6 +177,8 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     existingThreadId: string | null;
     effectiveConfig: EffectiveThreadConfigSnapshot;
     actorContext: ActorContext;
+    goal?: ThreadGoalSnapshot | null;
+    onThreadPrepared?(threadId: string): void;
     attachments?: Array<{ name: string; path: string; mimeType: string }>;
   }): Promise<{ threadId: string; turnId: string }> {
     const managed = await this.options.supervisor.startAccount({
@@ -222,6 +236,23 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         await this.options.supervisor.stopAccount?.(input.accountId).catch(() => undefined);
         throw safetyError;
       }
+    }
+    input.onThreadPrepared?.(threadId);
+    if (input.goal) {
+      const synced = await managed.runtime.setThreadGoal(threadId, {
+        objective: input.goal.objective,
+        status: runtimeGoalStatus(input.goal.status),
+        tokenBudget: input.goal.tokenBudget,
+      });
+      this.emit("goalUpdated", {
+        taskId: input.taskId,
+        threadId,
+        status: platformGoalStatus(synced.status),
+        tokensUsed: synced.tokensUsed,
+        timeUsedSeconds: synced.timeUsedSeconds,
+      });
+    } else if (input.existingThreadId) {
+      await managed.runtime.clearThreadGoal(threadId);
     }
     const contextKey = connectionThreadKey(input.accountId, connectionGeneration, threadId);
     this.contextByThread.set(contextKey, {
@@ -501,6 +532,38 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       if (!isRateLimitSnapshot(params.rateLimits)) return;
       const quota = weeklyQuotaFromRateLimitSnapshot(params.rateLimits);
       if (quota.status === "KNOWN") this.emit("accountQuotaUpdated", { accountId, quota });
+      return;
+    }
+    if (message.method === "thread/goal/updated") {
+      const goalThreadId = stringValue(params.threadId);
+      if (!goalThreadId) return;
+      const goal = asRecord(params.goal);
+      const context = this.contextByThread.get(
+        connectionThreadKey(accountId, connectionGeneration, goalThreadId),
+      );
+      if (
+        context &&
+        typeof goal.status === "string" &&
+        Number.isInteger(goal.tokensUsed) &&
+        Number.isInteger(goal.timeUsedSeconds)
+      ) {
+        this.emit("goalUpdated", {
+          taskId: context.taskId,
+          threadId: context.threadId,
+          status: platformGoalStatus(goal.status),
+          tokensUsed: goal.tokensUsed,
+          timeUsedSeconds: goal.timeUsedSeconds,
+        });
+      }
+      return;
+    }
+    if (message.method === "thread/goal/cleared") {
+      const goalThreadId = stringValue(params.threadId);
+      if (!goalThreadId) return;
+      const context = this.contextByThread.get(
+        connectionThreadKey(accountId, connectionGeneration, goalThreadId),
+      );
+      if (context) this.emit("goalCleared", { taskId: context.taskId, threadId: context.threadId });
       return;
     }
     const threadId = stringValue(params.threadId);
@@ -828,6 +891,20 @@ function cloneActorContext(actor: ActorContext): ActorContext {
     toolScopes: [...actor.toolScopes],
     approvalPolicy: actor.approvalPolicy,
   };
+}
+
+function runtimeGoalStatus(status: ThreadGoalView["status"]): "active" | "paused" | "complete" {
+  if (status === "ACTIVE") return "active";
+  if (status === "COMPLETE") return "complete";
+  return "paused";
+}
+
+function platformGoalStatus(status: string): ThreadGoalView["status"] {
+  if (status === "active") return "ACTIVE";
+  if (status === "complete") return "COMPLETE";
+  if (status === "budgetLimited" || status === "usageLimited") return "BUDGET_LIMITED";
+  if (status === "paused" || status === "blocked") return "PAUSED";
+  throw new Error(`Unsupported Runtime Goal status: ${status}`);
 }
 
 function messageThreadId(value: unknown): string | null {

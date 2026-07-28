@@ -2,6 +2,8 @@ import {
   EffectiveConfigOverrideSchema,
   type TaskEvent,
   type Thread,
+  ThreadGoalInputSchema,
+  ThreadGoalPatchSchema,
   UserSettingsPatchSchema,
 } from "@codexplatform/contracts";
 import cookie from "@fastify/cookie";
@@ -344,6 +346,40 @@ function registerRoutes(
     if (!actor) return;
     const { id, attachmentId } = request.params as { id: string; attachmentId: string };
     await platform.deleteAttachment(id, attachmentId, actor.user.id);
+    return reply.code(204).send();
+  });
+
+  app.get("/api/threads/:id/goal", async (request, reply) => {
+    const actor = requireSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    const goal = await platform.getThreadGoal(id, actor.user.id);
+    return goal ?? reply.code(404).send({ error: "Goal not found" });
+  });
+
+  app.put("/api/threads/:id/goal", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    const body = parseBody(ThreadGoalInputSchema, request.body, reply);
+    if (!body) return;
+    return platform.putThreadGoal(id, actor.user.id, body);
+  });
+
+  app.patch("/api/threads/:id/goal", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    const body = parseBody(ThreadGoalPatchSchema, request.body, reply);
+    if (!body) return;
+    return platform.patchThreadGoal(id, actor.user.id, body);
+  });
+
+  app.delete("/api/threads/:id/goal", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    await platform.deleteThreadGoal(id, actor.user.id);
     return reply.code(204).send();
   });
 

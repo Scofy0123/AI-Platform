@@ -123,6 +123,7 @@ describe("SQLitePlatformStore", () => {
     expect(store.getTurnInputSnapshot(turn.id)).toEqual({
       prompt: "",
       attachments: [attachment],
+      goal: null,
       capturedAt: NOW.toISOString(),
     });
     expect(store.getTaskForUser(draft.id, "user-1")).toMatchObject({
@@ -192,6 +193,7 @@ describe("SQLitePlatformStore", () => {
     ).toEqual({
       prompt: "",
       attachments: [ready],
+      goal: null,
       capturedAt: NOW.toISOString(),
     });
     expect(() =>
@@ -238,6 +240,123 @@ describe("SQLitePlatformStore", () => {
         now: NOW,
       }),
     ).toThrow("Invalid Steer input");
+  });
+
+  test("persists an owner-scoped Goal across Turns and snapshots it immutably", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Goals", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Goal thread",
+      now: NOW,
+    });
+    const goal = store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "持续完成安全审查",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+    expect(goal).toMatchObject({
+      status: "ACTIVE",
+      tokensUsed: 0,
+      runtimeSyncState: "PENDING",
+    });
+    expect(() => store.getThreadGoal(task.id, "user-2")).toThrow("Thread not found");
+    const first = store.createTurn({
+      id: "goal-turn-1",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "第一轮",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    store.patchThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      patch: { objective: "更新后的目标", action: "PAUSE" },
+      now: new Date(NOW.getTime() + 1_000),
+    });
+    store.completeTurn(first.id, "COMPLETED", new Date(NOW.getTime() + 1_500));
+    store.patchThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      patch: { action: "RESUME" },
+      now: new Date(NOW.getTime() + 1_700),
+    });
+    const second = store.createTurn({
+      id: "goal-turn-2",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "第二轮",
+      status: "ALLOCATING",
+      now: new Date(NOW.getTime() + 2_000),
+    });
+
+    expect(store.getTurnInputSnapshot(first.id)?.goal).toMatchObject({
+      objective: "持续完成安全审查",
+      status: "ACTIVE",
+    });
+    expect(store.getTurnInputSnapshot(second.id)?.goal).toMatchObject({
+      objective: "更新后的目标",
+      status: "ACTIVE",
+    });
+    expect(store.deleteThreadGoal(task.id, "user-1")).toBe(true);
+    expect(store.getThreadGoal(task.id, "user-1")).toBeNull();
+  });
+
+  test("accounts Goal active time across pause and resets usage only for a replacement PUT", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Goal accounting", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Goal accounting",
+      now: NOW,
+    });
+    store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "原目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+    store.syncThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      runtimeThreadId: "runtime-thread-1",
+      status: "ACTIVE",
+      tokensUsed: 12_000,
+      timeUsedSeconds: 5,
+      now: new Date(NOW.getTime() + 5_000),
+    });
+    expect(
+      store.patchThreadGoal({
+        threadId: task.id,
+        ownerId: "user-1",
+        patch: { action: "PAUSE" },
+        now: new Date(NOW.getTime() + 15_000),
+      }),
+    ).toMatchObject({ status: "PAUSED", timeUsedSeconds: 15 });
+    expect(
+      store.patchThreadGoal({
+        threadId: task.id,
+        ownerId: "user-1",
+        patch: { action: "RESUME" },
+        now: new Date(NOW.getTime() + 20_000),
+      }),
+    ).toMatchObject({ status: "ACTIVE", timeUsedSeconds: 15 });
+    expect(
+      store.putThreadGoal({
+        threadId: task.id,
+        ownerId: "user-1",
+        objective: "替换目标",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+        now: new Date(NOW.getTime() + 25_000),
+      }),
+    ).toMatchObject({ tokensUsed: 0, timeUsedSeconds: 0 });
   });
 
   test("tracks Steer delivery and releases failed attachments without marking them delivered", () => {

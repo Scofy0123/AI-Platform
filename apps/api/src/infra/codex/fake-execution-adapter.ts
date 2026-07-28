@@ -4,12 +4,14 @@ import type {
   ActorContext,
   EffectiveThreadConfigSnapshot,
   ModelOption,
+  ThreadGoalSnapshot,
 } from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
 import type { TaskEventDraft, TaskExecutionAdapter } from "../../domain/platform-service.js";
 import type { WeeklyQuota } from "./codex-runtime.js";
 
 export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionAdapter {
+  readonly supportsGoal = true;
   private readonly active = new Map<string, { taskId: string; turnId: string }>();
 
   async listModels(_account: InternalAccount): Promise<ModelOption[]> {
@@ -30,8 +32,20 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
     existingThreadId: string | null;
     effectiveConfig: EffectiveThreadConfigSnapshot;
     actorContext: ActorContext;
+    goal?: ThreadGoalSnapshot | null;
+    onThreadPrepared?(threadId: string): void;
   }): Promise<{ threadId: string; turnId: string }> {
     const threadId = input.existingThreadId ?? `fake-thread-${randomUUID()}`;
+    input.onThreadPrepared?.(threadId);
+    if (input.goal) {
+      this.emit("goalUpdated", {
+        taskId: input.taskId,
+        threadId,
+        status: input.goal.status,
+        tokensUsed: input.goal.tokensUsed,
+        timeUsedSeconds: input.goal.timeUsedSeconds,
+      });
+    }
     const turnId = `fake-turn-${randomUUID()}`;
     this.active.set(threadId, { taskId: input.taskId, turnId });
     setImmediate(() => this.emitWorkflow(input.taskId, threadId, turnId, input.prompt, input.cwd));

@@ -1084,6 +1084,63 @@ describe("CodexPlatform HTTP API", () => {
     expect(platform.unarchiveThread).toHaveBeenCalledWith("thread-1", "user-1");
   });
 
+  test("exposes owner-scoped Goal CRUD and protects every mutation with CSRF", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const cookies = { codexplatform_session: "valid-session" };
+    const write = { ...cookies, codexplatform_csrf: "valid-csrf" };
+    const headers = { "x-csrf-token": "valid-csrf" };
+
+    expect(
+      (
+        await app.inject({
+          method: "PUT",
+          url: "/api/threads/thread-1/goal",
+          cookies,
+          payload: { objective: "持续完成" },
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "PUT",
+          url: "/api/threads/thread-1/goal",
+          cookies: write,
+          headers,
+          payload: { objective: "持续完成" },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(platform.putThreadGoal).toHaveBeenCalledWith("thread-1", "user-1", {
+      objective: "持续完成",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: "/api/threads/thread-1/goal",
+          cookies: write,
+          headers,
+          payload: { action: "PAUSE" },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: "/api/threads/thread-1/goal",
+          cookies: write,
+          headers,
+        })
+      ).statusCode,
+    ).toBe(204);
+  });
+
   test("returns not found when archive routes target a Draft or expired Draft", async () => {
     const { auth, platform } = services();
     platform.archiveThread.mockRejectedValue(new Error("Thread not found"));
@@ -1737,6 +1794,41 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       createdAt: "2026-07-28T12:00:00.000Z",
     })),
     deleteAttachment: vi.fn(async () => undefined),
+    getThreadGoal: vi.fn(async () => ({
+      threadId: "thread-1",
+      objective: "持续完成",
+      status: "ACTIVE" as const,
+      tokenBudget: 200_000,
+      tokensUsed: 0,
+      timeBudgetSeconds: 3_600,
+      timeUsedSeconds: 0,
+      runtimeSyncState: "SYNCED" as const,
+      createdAt: "2026-07-28T12:00:00.000Z",
+      updatedAt: "2026-07-28T12:00:00.000Z",
+    })),
+    putThreadGoal: vi.fn(async (_threadId, _userId, input) => ({
+      threadId: "thread-1",
+      ...input,
+      status: "ACTIVE" as const,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      runtimeSyncState: "PENDING" as const,
+      createdAt: "2026-07-28T12:00:00.000Z",
+      updatedAt: "2026-07-28T12:00:00.000Z",
+    })),
+    patchThreadGoal: vi.fn(async () => ({
+      threadId: "thread-1",
+      objective: "持续完成",
+      status: "PAUSED" as const,
+      tokenBudget: 200_000,
+      tokensUsed: 0,
+      timeBudgetSeconds: 3_600,
+      timeUsedSeconds: 0,
+      runtimeSyncState: "PENDING" as const,
+      createdAt: "2026-07-28T12:00:00.000Z",
+      updatedAt: "2026-07-28T12:00:01.000Z",
+    })),
+    deleteThreadGoal: vi.fn(async () => undefined),
     listThreads: vi.fn(async () => []),
     listArchivedThreads: vi.fn(async (): Promise<Thread[]> => []),
     archiveThread: vi.fn(async () => ({ ok: true as const })),

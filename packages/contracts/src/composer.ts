@@ -104,10 +104,60 @@ export const DraftAttachmentSchema = z
   .strict();
 export type DraftAttachment = z.infer<typeof DraftAttachmentSchema>;
 
+export const ThreadGoalStatusSchema = z.enum([
+  "ACTIVE",
+  "PAUSED",
+  "COMPLETE",
+  "BUDGET_LIMITED",
+  "NEEDS_RECOVERY",
+]);
+export type ThreadGoalStatus = z.infer<typeof ThreadGoalStatusSchema>;
+
+export const ThreadGoalInputSchema = z
+  .object({
+    objective: z.string().trim().min(1).max(10_000),
+    tokenBudget: z.number().int().positive().max(10_000_000).default(200_000),
+    timeBudgetSeconds: z.number().int().positive().max(604_800).default(3_600),
+  })
+  .strict();
+export type ThreadGoalInput = z.infer<typeof ThreadGoalInputSchema>;
+
+export const ThreadGoalSnapshotSchema = z
+  .object({
+    objective: z.string().min(1),
+    status: ThreadGoalStatusSchema,
+    tokenBudget: z.number().int().positive(),
+    tokensUsed: z.number().int().nonnegative(),
+    timeBudgetSeconds: z.number().int().positive(),
+    timeUsedSeconds: z.number().int().nonnegative(),
+  })
+  .strict();
+export type ThreadGoalSnapshot = z.infer<typeof ThreadGoalSnapshotSchema>;
+
+export const ThreadGoalViewSchema = ThreadGoalSnapshotSchema.extend({
+  threadId: z.string().min(1),
+  runtimeSyncState: z.enum(["PENDING", "SYNCED", "NEEDS_RECOVERY"]),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+}).strict();
+export type ThreadGoalView = z.infer<typeof ThreadGoalViewSchema>;
+
+export const ThreadGoalPatchSchema = z
+  .object({
+    objective: z.string().trim().min(1).max(10_000).optional(),
+    tokenBudget: z.number().int().positive().max(10_000_000).optional(),
+    timeBudgetSeconds: z.number().int().positive().max(604_800).optional(),
+    action: z.enum(["PAUSE", "RESUME", "COMPLETE"]).optional(),
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, { message: "Goal patch cannot be empty" });
+export type ThreadGoalPatch = z.infer<typeof ThreadGoalPatchSchema>;
+
 export const EffectiveTurnInputSnapshotSchema = z
   .object({
     prompt: z.string(),
     attachments: z.array(DraftAttachmentSchema).max(32),
+    goal: ThreadGoalSnapshotSchema.nullable().default(null),
     capturedAt: z.iso.datetime(),
   })
   .strict();

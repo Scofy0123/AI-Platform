@@ -4,6 +4,8 @@ import {
   DraftAttachmentSchema,
   EffectiveTurnInputSnapshotSchema,
   ExecutionPermissionSelectionSchema,
+  ThreadGoalInputSchema,
+  ThreadGoalViewSchema,
   TurnInputBundleSchema,
 } from "./composer.js";
 
@@ -130,5 +132,45 @@ describe("TurnInputBundleSchema", () => {
       prompt: "",
       attachments: [{ id: "attachment-1", scanStatus: "READY" }],
     });
+  });
+
+  test("applies safe Goal defaults and exposes the platform status vocabulary", () => {
+    expect(ThreadGoalInputSchema.parse({ objective: "持续完成代码审查" })).toEqual({
+      objective: "持续完成代码审查",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    expect(
+      ThreadGoalViewSchema.parse({
+        threadId: "thread-1",
+        objective: "持续完成代码审查",
+        status: "ACTIVE",
+        tokenBudget: 200_000,
+        tokensUsed: 10,
+        timeBudgetSeconds: 3_600,
+        timeUsedSeconds: 2,
+        runtimeSyncState: "SYNCED",
+        createdAt: "2026-07-28T00:00:00.000Z",
+        updatedAt: "2026-07-28T00:00:02.000Z",
+      }).status,
+    ).toBe("ACTIVE");
+  });
+
+  test("captures an immutable Goal snapshot with each Turn input", () => {
+    expect(
+      EffectiveTurnInputSnapshotSchema.parse({
+        prompt: "继续",
+        attachments: [],
+        goal: {
+          objective: "持续完成代码审查",
+          status: "ACTIVE",
+          tokenBudget: 200_000,
+          tokensUsed: 10,
+          timeBudgetSeconds: 3_600,
+          timeUsedSeconds: 2,
+        },
+        capturedAt: "2026-07-28T00:00:00.000Z",
+      }).goal,
+    ).toMatchObject({ objective: "持续完成代码审查", status: "ACTIVE" });
   });
 });
