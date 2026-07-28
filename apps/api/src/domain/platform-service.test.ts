@@ -245,7 +245,7 @@ describe("LocalPlatformService", () => {
     execution.readPlanModeCatalog.mockResolvedValueOnce({
       availability: "UNAVAILABLE",
       reasonCode: "PLAN_PRESET_MISSING",
-      reason: "Plan preset disappeared",
+      reason: "spawn /Users/private/runtime --token secret_plan_probe",
       presets: [],
     });
 
@@ -253,6 +253,126 @@ describe("LocalPlatformService", () => {
       service.startTurn(task.id, "user-1", "Do not silently downgrade"),
     ).rejects.toMatchObject({ code: "PLAN_MODE_CAPABILITY_CHANGED" });
     expect(execution.startTask).not.toHaveBeenCalled();
+    expect(await service.listTaskEvents(task.id, "user-1", 0)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "TURN_FAILED",
+          payload: {
+            status: "failed",
+            code: "PLAN_MODE_CAPABILITY_CHANGED",
+            error: "Plan mode capability changed before execution.",
+          },
+        }),
+      ]),
+    );
+    expect(await service.listAudit()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "TURN_FAILED",
+          outcome: "FAILED",
+          summary: "PLAN_MODE_CAPABILITY_CHANGED: Plan mode capability changed before execution.",
+        }),
+      ]),
+    );
+    expect(JSON.stringify(await service.getThread(task.id, "user-1"))).not.toContain(
+      "secret_plan_probe",
+    );
+  });
+
+  test("revalidates the Plan preset model against the latest allocated-account catalog", async () => {
+    const planModel: ModelOption = {
+      ...STANDARD_MODEL,
+      id: "plan-model",
+      model: "plan-model",
+      displayName: "Plan Model",
+      isDefault: false,
+    };
+    execution.listModels
+      .mockResolvedValueOnce([STANDARD_MODEL, planModel])
+      .mockResolvedValueOnce([STANDARD_MODEL, planModel])
+      .mockResolvedValueOnce([STANDARD_MODEL]);
+    execution.readPlanModeCatalog.mockResolvedValue(planCatalog("plan-model", "high"));
+    const project = await service.createProject("user-1", { name: "Retired Plan model" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Retired Plan model",
+    });
+    await service.patchThreadComposer(task.id, "user-1", { planMode: true, revision: 0 });
+
+    await expect(
+      service.startTurn(task.id, "user-1", "Do not start retired model"),
+    ).rejects.toMatchObject({ code: "PLAN_PRESET_MODEL_UNAVAILABLE" });
+    expect(execution.listModels).toHaveBeenCalledTimes(3);
+    expect(execution.startTask).not.toHaveBeenCalled();
+    expect(await service.listTaskEvents(task.id, "user-1", 0)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "TURN_FAILED",
+          payload: {
+            status: "failed",
+            code: "PLAN_PRESET_MODEL_UNAVAILABLE",
+            error: "The selected collaboration preset is unavailable before execution.",
+          },
+        }),
+      ]),
+    );
+  });
+
+  test("rejects a collaboration preset effort unsupported by its actual model", async () => {
+    execution.listModels.mockResolvedValue([STANDARD_MODEL]);
+    execution.readPlanModeCatalog.mockResolvedValue(planCatalog("fake-codex-standard", "xhigh"));
+    const project = await service.createProject("user-1", { name: "Unsupported Plan effort" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Unsupported Plan effort",
+    });
+    await service.patchThreadComposer(task.id, "user-1", { planMode: true, revision: 0 });
+
+    await expect(
+      service.startTurn(task.id, "user-1", "Do not start unsupported effort"),
+    ).rejects.toMatchObject({ code: "PLAN_PRESET_MODEL_UNAVAILABLE" });
+    expect(execution.startTask).not.toHaveBeenCalled();
+  });
+
+  test("persists a promoted Plan failure code even though background promotion swallows rejection", async () => {
+    const project = await service.createProject("user-1", { name: "Promoted Plan failure" });
+    const tasks = await Promise.all(
+      ["First", "Second", "Promoted"].map((title) =>
+        service.createTask("user-1", { projectId: project.id, title }),
+      ),
+    );
+    await service.startTurn(tasks[0]?.id ?? "missing", "user-1", "First prompt");
+    await service.startTurn(tasks[1]?.id ?? "missing", "user-1", "Second prompt");
+    await service.startTurn(tasks[2]?.id ?? "missing", "user-1", "Promoted prompt");
+    execution.readPlanModeCatalog.mockResolvedValueOnce({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+      reason: "spawn /private/bin/codex --secret promoted_secret",
+      presets: [],
+    });
+
+    execution.emitTaskEvent({
+      taskId: tasks[0]?.id ?? "missing",
+      threadId: `thread-${tasks[0]?.id}`,
+      turnId: `codex-turn-${tasks[0]?.id}`,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed", durationMs: 10 },
+    });
+
+    await vi.waitFor(async () => {
+      expect(await service.listTaskEvents(tasks[2]?.id ?? "missing", "user-1", 0)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "TURN_FAILED",
+            payload: expect.objectContaining({ code: "PLAN_MODE_CAPABILITY_CHANGED" }),
+          }),
+        ]),
+      );
+    });
+    expect(execution.startTask).toHaveBeenCalledTimes(2);
+    expect(
+      JSON.stringify(await service.getThread(tasks[2]?.id ?? "missing", "user-1")),
+    ).not.toContain("promoted_secret");
   });
 
   test("advertises Plan only when every eligible account supports both collaboration presets", async () => {
@@ -3794,7 +3914,10 @@ function seedUser(database: PlatformDatabase, id: string, role: "ADMIN" | "MEMBE
     .run(id, `ou_${id}`, id, role, NOW.getTime(), NOW.getTime());
 }
 
-function planCatalog(): PlanModeCatalogCapability {
+function planCatalog(
+  planModel = "fake-codex-standard",
+  planReasoningEffort = "high",
+): PlanModeCatalogCapability {
   return {
     availability: "AVAILABLE",
     reasonCode: null,
@@ -3813,8 +3936,8 @@ function planCatalog(): PlanModeCatalogCapability {
         name: "Plan",
         mode: "plan",
         settings: {
-          model: "fake-codex-standard",
-          reasoningEffort: "high",
+          model: planModel,
+          reasoningEffort: planReasoningEffort,
           developerInstructions: null,
         },
       },

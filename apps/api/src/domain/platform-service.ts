@@ -58,6 +58,7 @@ import {
   GoalCapabilityUnavailableError,
   GoalMutationBlockedByPendingTurnError,
   PlanModeCapabilityChangedError,
+  PlanPresetModelUnavailableError,
 } from "./errors.js";
 import type { LeasedTurn, SQLiteLeaseStore } from "./lease-store.js";
 import type {
@@ -132,6 +133,11 @@ export class AllocatedModelSelectionChangedError extends Error {
     super(message);
     this.name = "AllocatedModelSelectionChangedError";
   }
+}
+
+interface PreRuntimeFailure {
+  code: string;
+  publicMessage: string;
 }
 
 export abstract class ThreadResumeSafetyError extends Error {
@@ -526,9 +532,7 @@ export class LocalPlatformService implements PlatformApi {
     if (patch.planMode) {
       const capability = await this.readPlanCapabilityForUser(userId, task.accountId);
       if (capability.availability !== "AVAILABLE") {
-        throw new PlanModeCapabilityChangedError(
-          capability.reason ?? "Plan mode is unavailable for this Runtime",
-        );
+        throw new PlanModeCapabilityChangedError();
       }
     }
     return this.options.store.patchComposerState({
@@ -1567,6 +1571,23 @@ export class LocalPlatformService implements PlatformApi {
     });
   }
 
+  private async validateAllocatedCollaborationPreset(
+    account: InternalAccount,
+    model: string,
+    reasoningEffort: string,
+  ): Promise<void> {
+    const catalog = await this.readAccountModelCatalog(account, {
+      allowStale: false,
+      forceRefresh: true,
+    });
+    try {
+      validateModelAgainstCatalog(catalog.models, model, reasoningEffort);
+      validateModelAgainstOrganizationPolicy(model, reasoningEffort);
+    } catch {
+      throw new PlanPresetModelUnavailableError();
+    }
+  }
+
   private validateSettingsPatch(patch: UserSettingsPatch): void {
     const execution = patch.execution;
     if (!execution) return;
@@ -2231,23 +2252,19 @@ export class LocalPlatformService implements PlatformApi {
         reasoningEffort: effectiveConfig.reasoningEffort,
       });
       if (planCapability.availability !== "AVAILABLE") {
-        throw new PlanModeCapabilityChangedError(
-          planCapability.reason ?? "Plan mode directory is unavailable on the allocated account",
-        );
+        throw new PlanModeCapabilityChangedError();
       }
       const targetMode = turnInput.planMode ? "plan" : "default";
       const preset = planCapability.presets.find((candidate) => candidate.mode === targetMode);
       if (!preset) {
-        throw new PlanModeCapabilityChangedError(
-          `The allocated Codex account no longer exposes the ${targetMode} preset`,
-        );
+        throw new PlanModeCapabilityChangedError();
       }
       const requestedConfig = {
         model: effectiveConfig.model,
         reasoningEffort: effectiveConfig.reasoningEffort.toLowerCase(),
         instructions: effectiveConfig.instructions,
       };
-      effectiveConfig = EffectiveThreadConfigSnapshotSchema.parse({
+      const actualConfig = EffectiveThreadConfigSnapshotSchema.parse({
         ...effectiveConfig,
         model: preset.settings.model,
         reasoningEffort:
@@ -2255,6 +2272,12 @@ export class LocalPlatformService implements PlatformApi {
         requestedConfig,
         collaborationPreset: cloneCollaborationPreset(preset),
       });
+      await this.validateAllocatedCollaborationPreset(
+        account,
+        actualConfig.model as string,
+        actualConfig.reasoningEffort,
+      );
+      effectiveConfig = actualConfig;
       await mkdir(cwd, { recursive: true, mode: 0o700 });
       this.options.store.updateTurnConfigSnapshot(allocation.turnId, effectiveConfig);
       if (!this.isAccountModelRoutingEligible(queuedTurn.ownerId, account.id)) {
@@ -2270,14 +2293,11 @@ export class LocalPlatformService implements PlatformApi {
       this.pendingStartSignalsByTask.delete(queuedTurn.taskId);
       this.rejectAllocatedTurnBeforeRuntime(
         allocation,
-        accountBecameIneligible
-          ? "The allocated Codex account became unavailable before execution."
-          : error instanceof ModelCatalogUnavailableError
-            ? "Runtime model catalog became unavailable before execution."
-            : "The selected model or Effort became unavailable before execution.",
+        preRuntimeFailure(error, accountBecameIneligible),
       );
       if (error instanceof ModelCatalogUnavailableError && !accountBecameIneligible) throw error;
       if (error instanceof PlanModeCapabilityChangedError) throw error;
+      if (error instanceof PlanPresetModelUnavailableError) throw error;
       throw new AllocatedModelSelectionChangedError(
         accountBecameIneligible
           ? "Allocated Codex account became unavailable; submit the Turn again"
@@ -2384,7 +2404,10 @@ export class LocalPlatformService implements PlatformApi {
     }
   }
 
-  private rejectAllocatedTurnBeforeRuntime(allocation: LeasedTurn, message: string): void {
+  private rejectAllocatedTurnBeforeRuntime(
+    allocation: LeasedTurn,
+    failure: PreRuntimeFailure,
+  ): void {
     const failedAt = this.now();
     const turn = this.options.store.getTurn(allocation.turnId);
     if (turn) {
@@ -2396,7 +2419,11 @@ export class LocalPlatformService implements PlatformApi {
         threadId: this.options.store.getTaskForUser(turn.taskId, turn.ownerId)?.threadId ?? null,
         turnId: allocation.turnId,
         type: "TURN_FAILED",
-        payload: { status: "failed", error: message },
+        payload: {
+          status: "failed",
+          code: failure.code,
+          error: failure.publicMessage,
+        },
         now: failedAt,
       });
       this.publish(event);
@@ -2573,6 +2600,47 @@ function validateModelAgainstCatalog(
     throw new Error(
       "Unsupported configuration: Reasoning effort is not supported by the selected model",
     );
+  }
+}
+
+function preRuntimeFailure(error: unknown, accountBecameIneligible: boolean): PreRuntimeFailure {
+  if (accountBecameIneligible) {
+    return {
+      code: "ALLOCATED_ACCOUNT_INELIGIBLE",
+      publicMessage: "The allocated Codex account became unavailable before execution.",
+    };
+  }
+  if (error instanceof PlanModeCapabilityChangedError) {
+    return { code: error.code, publicMessage: error.message };
+  }
+  if (error instanceof PlanPresetModelUnavailableError) {
+    return { code: error.code, publicMessage: error.message };
+  }
+  if (error instanceof ModelCatalogUnavailableError) {
+    return {
+      code: "MODEL_CATALOG_UNAVAILABLE",
+      publicMessage: "Runtime model catalog became unavailable before execution.",
+    };
+  }
+  return {
+    code: "ALLOCATED_MODEL_SELECTION_CHANGED",
+    publicMessage: "The selected model or Effort became unavailable before execution.",
+  };
+}
+
+function validateModelAgainstOrganizationPolicy(model: string, reasoningEffort: string): void {
+  if (
+    SETTINGS_POLICY.allowedModels &&
+    !(SETTINGS_POLICY.allowedModels as readonly string[]).includes(model)
+  ) {
+    throw new Error("Model is not allowed by organization policy");
+  }
+  if (
+    !SETTINGS_POLICY.allowedReasoningEfforts.some(
+      (allowed) => allowed.toLowerCase() === reasoningEffort.toLowerCase(),
+    )
+  ) {
+    throw new Error("Reasoning effort is not allowed by organization policy");
   }
 }
 

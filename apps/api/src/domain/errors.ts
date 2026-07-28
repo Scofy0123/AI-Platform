@@ -74,8 +74,18 @@ export class ComposerRevisionConflictError extends DomainError {
 }
 
 export class PlanModeCapabilityChangedError extends DomainError {
-  constructor(message = "Plan mode capability changed on the allocated Codex account") {
-    super("PLAN_MODE_CAPABILITY_CHANGED", message);
+  constructor() {
+    super("PLAN_MODE_CAPABILITY_CHANGED", "Plan mode capability changed before execution.");
     this.name = "PlanModeCapabilityChangedError";
+  }
+}
+
+export class PlanPresetModelUnavailableError extends DomainError {
+  constructor() {
+    super(
+      "PLAN_PRESET_MODEL_UNAVAILABLE",
+      "The selected collaboration preset is unavailable before execution.",
+    );
+    this.name = "PlanPresetModelUnavailableError";
   }
 }

@@ -513,7 +513,7 @@ describe("AppServerExecutionAdapter", () => {
     const runtime = runtimePort();
     vi.mocked(runtime.readGoalProtocolCapability)
       .mockImplementationOnce(() => {
-        throw new Error("temporary pipe failure");
+        throw new Error("spawn /Users/private/.codex/app-server --token secret_goal_probe failed");
       })
       .mockReturnValueOnce({ availability: "AVAILABLE", reasonCode: null, reason: null });
     const startAccount = vi.fn(async () => ({ accountId: "account-1", rpc, runtime }));
@@ -538,8 +538,10 @@ describe("AppServerExecutionAdapter", () => {
       codexHome: "/tmp/account-1",
     };
 
-    await expect(adapter.readGoalCapability(account)).resolves.toMatchObject({
+    await expect(adapter.readGoalCapability(account)).resolves.toEqual({
+      availability: "UNAVAILABLE",
       reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+      reason: "Goal Runtime capability probe failed",
     });
     await expect(adapter.readGoalCapability(account)).resolves.toMatchObject({
       availability: "AVAILABLE",
@@ -551,7 +553,7 @@ describe("AppServerExecutionAdapter", () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();
     vi.mocked(runtime.listCollaborationModes)
-      .mockRejectedValueOnce(new Error("temporary pipe failure"))
+      .mockRejectedValueOnce(new Error("exec /private/bin/codex --auth secret_plan_probe failed"))
       .mockResolvedValueOnce([
         {
           name: "Default",
@@ -598,7 +600,12 @@ describe("AppServerExecutionAdapter", () => {
 
     await expect(
       adapter.readPlanModeCatalog(account, { model: "gpt-5.5", reasoningEffort: "medium" }),
-    ).resolves.toMatchObject({ reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED" });
+    ).resolves.toEqual({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+      reason: "Plan mode Runtime capability probe failed",
+      presets: [],
+    });
     await expect(
       adapter.readPlanModeCatalog(account, { model: "gpt-5.5", reasoningEffort: "medium" }),
     ).resolves.toMatchObject({

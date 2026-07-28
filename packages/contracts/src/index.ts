@@ -416,7 +416,7 @@ export type UserSettingsPatch = z.infer<typeof UserSettingsPatchSchema>;
 export interface TaskEventPayloadMap {
   TURN_STARTED: { status: "inProgress" };
   TURN_COMPLETED: { status: "completed"; durationMs?: number | null };
-  TURN_FAILED: { status: "failed"; error: string };
+  TURN_FAILED: { status: "failed"; code?: string; error: string };
   TURN_INTERRUPTED: { status: "interrupted" };
   USER_MESSAGE: { itemId: string; kind: "STEER"; text: string };
   AGENT_MESSAGE_DELTA: { itemId: string; delta: string };

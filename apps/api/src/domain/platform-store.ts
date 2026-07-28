@@ -1965,6 +1965,25 @@ export class SQLitePlatformStore {
           JSON.stringify(payload),
           input.now.getTime(),
         );
+      if (input.type === "TURN_FAILED") {
+        const task = this.getTaskRow(input.taskId);
+        const failurePayload = payload as Record<string, unknown>;
+        const code = stringValue(failurePayload.code) ?? "TURN_FAILED";
+        const message = stringValue(failurePayload.error) ?? "Turn failed";
+        this.insertAudit({
+          actorUserId: task.owner_id,
+          accountId: task.account_id,
+          accountAlias: task.account_alias,
+          leaseId: task.lease_id,
+          taskId: input.taskId,
+          threadId: input.threadId,
+          turnId: input.turnId,
+          action: "TURN_FAILED",
+          outcome: "FAILED",
+          summary: `${code}: ${message}`,
+          now: input.now,
+        });
+      }
       return {
         taskId: input.taskId,
         threadId: input.threadId,
@@ -3176,7 +3195,7 @@ function deriveEventItemId(
 const PUBLIC_EVENT_PAYLOAD_KEYS = {
   TURN_STARTED: ["status"],
   TURN_COMPLETED: ["status", "durationMs"],
-  TURN_FAILED: ["status", "error"],
+  TURN_FAILED: ["status", "code", "error"],
   TURN_INTERRUPTED: ["status"],
   USER_MESSAGE: ["itemId", "kind", "text"],
   AGENT_MESSAGE_DELTA: ["itemId", "delta"],

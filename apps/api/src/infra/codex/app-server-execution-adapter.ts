@@ -203,11 +203,11 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         this.goalCapabilityByAccount.set(account.id, capability);
       }
       return { ...capability };
-    } catch (error) {
+    } catch {
       return {
         availability: "UNAVAILABLE",
         reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
-        reason: error instanceof Error ? error.message : "Goal Runtime capability probe failed",
+        reason: "Goal Runtime capability probe failed",
       };
     }
   }
@@ -240,12 +240,11 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         };
       }
       return { availability: "AVAILABLE", reasonCode: null, reason: null, presets };
-    } catch (error) {
+    } catch {
       return {
         availability: "UNAVAILABLE",
         reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
-        reason:
-          error instanceof Error ? error.message : "Plan mode Runtime capability probe failed",
+        reason: "Plan mode Runtime capability probe failed",
         presets: [],
       };
     }
@@ -820,7 +819,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     this.goalCapabilityByAccount.set(context.accountId, {
       availability: "UNAVAILABLE",
       reasonCode: "RUNTIME_GOAL_METHOD_UNSUPPORTED",
-      reason: error instanceof Error ? error.message : "Goal Runtime method is unsupported",
+      reason: "Goal Runtime method is unsupported",
     });
   }
 
