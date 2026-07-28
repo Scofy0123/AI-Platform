@@ -1129,16 +1129,14 @@ describe("CodexPlatform HTTP API", () => {
         })
       ).statusCode,
     ).toBe(200);
-    expect(
-      (
-        await app.inject({
-          method: "DELETE",
-          url: "/api/threads/thread-1/goal",
-          cookies: write,
-          headers,
-        })
-      ).statusCode,
-    ).toBe(204);
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: "/api/threads/thread-1/goal",
+      cookies: write,
+      headers,
+    });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({ cleared: true, runtimeSyncState: "SYNCED" });
   });
 
   test("returns not found when archive routes target a Draft or expired Draft", async () => {
@@ -1828,7 +1826,10 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       createdAt: "2026-07-28T12:00:00.000Z",
       updatedAt: "2026-07-28T12:00:01.000Z",
     })),
-    deleteThreadGoal: vi.fn(async () => undefined),
+    deleteThreadGoal: vi.fn(async () => ({
+      cleared: true as const,
+      runtimeSyncState: "SYNCED" as const,
+    })),
     listThreads: vi.fn(async () => []),
     listArchivedThreads: vi.fn(async (): Promise<Thread[]> => []),
     archiveThread: vi.fn(async () => ({ ok: true as const })),

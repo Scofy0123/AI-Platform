@@ -76,6 +76,8 @@ interface ThreadGoalRow {
   time_budget_seconds: number;
   time_used_seconds: number;
   runtime_sync_state: ThreadGoalView["runtimeSyncState"];
+  runtime_thread_id: string | null;
+  runtime_updated_at: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -920,6 +922,7 @@ export class SQLitePlatformStore {
            time_used_seconds = 0,
            runtime_sync_state = 'PENDING',
            runtime_thread_id = NULL,
+           runtime_updated_at = NULL,
            activated_at = excluded.activated_at,
            updated_at = excluded.updated_at`,
       )
@@ -996,26 +999,57 @@ export class SQLitePlatformStore {
     status: ThreadGoalView["status"];
     tokensUsed: number;
     timeUsedSeconds: number;
+    runtimeUpdatedAt?: number;
+    source?: "COMMAND" | "NOTIFICATION";
     now: Date;
   }): ThreadGoalView {
+    const current = this.getThreadGoal(input.threadId, input.ownerId);
+    if (!current) throw new Error("Goal not found");
+    const runtimeUpdatedAt = input.runtimeUpdatedAt ?? input.now.getTime();
     const result = this.sqlite
       .prepare(
-        `UPDATE thread_goals SET status = ?, tokens_used = ?, time_used_seconds = ?,
-         runtime_sync_state = 'SYNCED', runtime_thread_id = ?,
-         activated_at = ?, updated_at = ?
-         WHERE task_id = ? AND owner_id = ?`,
+        `UPDATE thread_goals SET
+         status = CASE
+           WHEN status IN ('COMPLETE', 'BUDGET_LIMITED', 'NEEDS_RECOVERY') THEN status
+           ELSE ?
+         END,
+         tokens_used = MAX(tokens_used, ?),
+         time_used_seconds = MAX(time_used_seconds, ?),
+         runtime_sync_state = CASE
+           WHEN runtime_sync_state = 'NEEDS_RECOVERY' THEN 'NEEDS_RECOVERY'
+           ELSE 'SYNCED'
+         END,
+         runtime_thread_id = ?,
+         runtime_updated_at = ?,
+         activated_at = CASE
+           WHEN status IN ('COMPLETE', 'BUDGET_LIMITED', 'NEEDS_RECOVERY') THEN NULL
+           WHEN ? = 'ACTIVE' THEN ?
+           ELSE NULL
+         END,
+         updated_at = ?
+         WHERE task_id = ? AND owner_id = ?
+           AND (
+             runtime_updated_at IS NULL OR
+             ? > runtime_updated_at OR
+             (? = 'COMMAND' AND runtime_sync_state = 'PENDING' AND ? >= runtime_updated_at)
+           )`,
       )
       .run(
         input.status,
         input.tokensUsed,
         input.timeUsedSeconds,
         input.runtimeThreadId,
-        input.status === "ACTIVE" ? input.now.getTime() : null,
+        runtimeUpdatedAt,
+        input.status,
+        input.now.getTime(),
         input.now.getTime(),
         input.threadId,
         input.ownerId,
+        runtimeUpdatedAt,
+        input.source ?? "NOTIFICATION",
+        runtimeUpdatedAt,
       );
-    if (result.changes !== 1) throw new Error("Goal not found");
+    if (result.changes === 0) return current;
     return this.getThreadGoal(input.threadId, input.ownerId) as ThreadGoalView;
   }
 

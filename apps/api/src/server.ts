@@ -379,8 +379,7 @@ function registerRoutes(
     const actor = requireWriteSession(request, reply, auth);
     if (!actor) return;
     const { id } = request.params as { id: string };
-    await platform.deleteThreadGoal(id, actor.user.id);
-    return reply.code(204).send();
+    return platform.deleteThreadGoal(id, actor.user.id);
   });
 
   app.post("/api/threads/:id/archive", async (request, reply) => {

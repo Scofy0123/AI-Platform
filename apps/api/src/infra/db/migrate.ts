@@ -221,6 +221,7 @@ CREATE TABLE IF NOT EXISTS thread_goals (
   runtime_sync_state TEXT NOT NULL DEFAULT 'PENDING'
     CHECK(runtime_sync_state IN ('PENDING', 'SYNCED', 'NEEDS_RECOVERY')),
   runtime_thread_id TEXT,
+  runtime_updated_at INTEGER,
   activated_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -457,6 +458,7 @@ export function migrateDatabase(sqlite: Database.Database): void {
       time_used_seconds INTEGER NOT NULL DEFAULT 0,
       runtime_sync_state TEXT NOT NULL DEFAULT 'PENDING',
       runtime_thread_id TEXT,
+      runtime_updated_at INTEGER,
       activated_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
@@ -497,6 +499,7 @@ export function migrateDatabase(sqlite: Database.Database): void {
     "TEXT NOT NULL DEFAULT 'PENDING'",
   );
   ensureColumn(sqlite, "turn_input_snapshots", "goal_json", "TEXT");
+  ensureColumn(sqlite, "thread_goals", "runtime_updated_at", "INTEGER");
   ensureColumn(sqlite, "steer_input_snapshots", "delivery_error", "TEXT");
   ensureColumn(sqlite, "steer_input_snapshots", "delivered_at", "INTEGER");
   ensureColumn(sqlite, "steer_input_snapshots", "failed_at", "INTEGER");
@@ -688,7 +691,8 @@ function ensureColumn(
     | "sessions"
     | "feishu_credentials"
     | "steer_input_snapshots"
-    | "turn_input_snapshots",
+    | "turn_input_snapshots"
+    | "thread_goals",
   column:
     | "codex_home"
     | "quota_resets_at"
@@ -708,7 +712,8 @@ function ensureColumn(
     | "delivered_at"
     | "failed_at"
     | "unknown_at"
-    | "goal_json",
+    | "goal_json"
+    | "runtime_updated_at",
   definition:
     | "TEXT"
     | "INTEGER"

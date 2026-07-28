@@ -72,9 +72,16 @@ interface RateLimitsResponse {
 }
 
 const MAX_MODEL_CATALOG_PAGES = 100;
+export const LOCKED_GOAL_PROTOCOL_VERSION = "0.144.6";
 
 export class CodexAppServerRuntime {
   private readonly memoryDisabledThreadIds = new Set<string>();
+  private initializeResponse: {
+    userAgent: string;
+    codexHome: string;
+    platformFamily: string;
+    platformOs: string;
+  } | null = null;
 
   constructor(private readonly rpc: RpcPeer) {}
 
@@ -96,8 +103,35 @@ export class CodexAppServerRuntime {
         requestAttestation: false,
       },
     });
+    this.initializeResponse = response;
     this.rpc.notify("initialized");
     return response;
+  }
+
+  readGoalProtocolCapability(): {
+    availability: "AVAILABLE" | "UNAVAILABLE";
+    reasonCode: string | null;
+    reason: string | null;
+  } {
+    const userAgent = this.initializeResponse?.userAgent;
+    if (!userAgent) {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "RUNTIME_HANDSHAKE_MISSING",
+        reason: "Codex App Server initialize handshake is unavailable",
+      };
+    }
+    const version = /(?:^|[/ ])(\d+\.\d+\.\d+)(?:$|[ )])/.exec(userAgent)?.[1] ?? null;
+    if (version !== LOCKED_GOAL_PROTOCOL_VERSION) {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+        reason: version
+          ? `Codex App Server ${version} does not match the locked Goal protocol ${LOCKED_GOAL_PROTOCOL_VERSION}`
+          : `Codex App Server did not report a compatible version for Goal protocol ${LOCKED_GOAL_PROTOCOL_VERSION}`,
+      };
+    }
+    return { availability: "AVAILABLE", reasonCode: null, reason: null };
   }
 
   async startChatGptLogin(): Promise<{ loginId: string; authUrl: string }> {

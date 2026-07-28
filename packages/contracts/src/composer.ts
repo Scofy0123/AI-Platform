@@ -49,6 +49,7 @@ export const ComposerCapabilitySchema = z
     description: z.string(),
     availability: z.enum(["AVAILABLE", "AUTH_REQUIRED", "POLICY_BLOCKED", "UNSUPPORTED"]),
     unavailableReason: z.string().min(1).nullable(),
+    unavailableReasonCode: z.string().min(1).nullable().optional(),
   })
   .strict()
   .superRefine((capability, context) => {

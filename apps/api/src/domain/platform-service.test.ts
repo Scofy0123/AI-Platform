@@ -450,6 +450,40 @@ describe("LocalPlatformService", () => {
     });
   });
 
+  test("fails closed with a machine-readable reason when the routed Runtime lacks Goal protocol", async () => {
+    execution.readGoalCapability.mockResolvedValueOnce({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "Locked Goal protocol is unavailable",
+    });
+    await expect(service.listComposerCapabilities("user-1")).resolves.toContainEqual(
+      expect.objectContaining({
+        id: "goal",
+        availability: "UNSUPPORTED",
+        unavailableReasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      }),
+    );
+
+    const project = await service.createProject("user-1", { name: "Old Runtime" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Old Runtime",
+    });
+    execution.readGoalCapability.mockResolvedValueOnce({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "Locked Goal protocol is unavailable",
+    });
+    await expect(
+      service.putThreadGoal(task.id, "user-1", {
+        objective: "不能被伪造为可用",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      }),
+    ).rejects.toThrow("RUNTIME_VERSION_UNSUPPORTED");
+    expect(await service.getThreadGoal(task.id, "user-1")).toBeNull();
+  });
+
   test("preserves a prepared Runtime Thread and requires recovery when Goal sync fails", async () => {
     const project = await service.createProject("user-1", { name: "Goal recovery" });
     const task = await service.createTask("user-1", {
@@ -544,6 +578,96 @@ describe("LocalPlatformService", () => {
     );
     expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
       status: "BUDGET_LIMITED",
+    });
+  });
+
+  test.each([
+    ["PAUSE", "PAUSED"],
+    ["COMPLETE", "COMPLETE"],
+  ] as const)(
+    "interrupts an active Turn before applying and synchronizing a %s Goal mutation",
+    async (action, expectedStatus) => {
+      const project = await service.createProject("user-1", { name: `Goal ${action}` });
+      const task = await service.createTask("user-1", {
+        projectId: project.id,
+        title: `Goal ${action}`,
+      });
+      await service.putThreadGoal(task.id, "user-1", {
+        objective: "持续执行",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      });
+      await service.startTurn(task.id, "user-1", "执行");
+      execution.interruptTask.mockClear();
+      execution.syncThreadGoal.mockClear();
+
+      const goal = await service.patchThreadGoal(task.id, "user-1", { action });
+
+      expect(goal).toMatchObject({ status: expectedStatus, runtimeSyncState: "SYNCED" });
+      expect(execution.interruptTask).toHaveBeenCalledWith(
+        `thread-${task.id}`,
+        `codex-turn-${task.id}`,
+      );
+      expect(execution.syncThreadGoal).toHaveBeenCalledWith(
+        `thread-${task.id}`,
+        expect.objectContaining({ status: expectedStatus }),
+      );
+      expect(vi.mocked(execution.interruptTask).mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(execution.syncThreadGoal).mock.invocationCallOrder[0] as number,
+      );
+    },
+  );
+
+  test("interrupts an active Turn and clears the Runtime Goal before deleting platform state", async () => {
+    const project = await service.createProject("user-1", { name: "Goal clear" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal clear",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "持续执行",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await service.startTurn(task.id, "user-1", "执行");
+    execution.interruptTask.mockClear();
+    execution.clearThreadGoal.mockClear();
+
+    await expect(service.deleteThreadGoal(task.id, "user-1")).resolves.toEqual({
+      cleared: true,
+      runtimeSyncState: "SYNCED",
+    });
+    expect(execution.interruptTask).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      `codex-turn-${task.id}`,
+    );
+    expect(execution.clearThreadGoal).toHaveBeenCalledWith(`thread-${task.id}`);
+    expect(vi.mocked(execution.interruptTask).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(execution.clearThreadGoal).mock.invocationCallOrder[0] as number,
+    );
+    expect(await service.getThreadGoal(task.id, "user-1")).toBeNull();
+  });
+
+  test("does not report SQLite success when an attached Runtime rejects a Goal update", async () => {
+    const project = await service.createProject("user-1", { name: "Goal sync rejection" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal sync rejection",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "原目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await service.startTurn(task.id, "user-1", "执行");
+    execution.syncThreadGoal.mockRejectedValueOnce(new Error("Runtime rejected Goal"));
+
+    await expect(
+      service.patchThreadGoal(task.id, "user-1", { objective: "不应静默成功" }),
+    ).rejects.toThrow("Runtime rejected Goal");
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
     });
   });
 
@@ -3017,8 +3141,36 @@ describe("LocalPlatformService", () => {
 });
 
 class FakeExecution extends EventEmitter implements TaskExecutionAdapter {
-  readonly supportsGoal = true;
+  private goalRuntimeVersion = NOW.getTime();
   readonly listModels = vi.fn<TaskExecutionAdapter["listModels"]>(async () => [STANDARD_MODEL]);
+  readonly readGoalCapability = vi.fn<TaskExecutionAdapter["readGoalCapability"]>(async () => ({
+    availability: "AVAILABLE",
+    reasonCode: null,
+    reason: null,
+  }));
+  readonly setThreadGoal = vi.fn<TaskExecutionAdapter["setThreadGoal"]>(
+    async (_threadId, goal) => ({
+      attachment: "ATTACHED",
+      goal: { ...goal },
+      runtimeUpdatedAt: ++this.goalRuntimeVersion,
+    }),
+  );
+  readonly getThreadGoal = vi.fn<TaskExecutionAdapter["getThreadGoal"]>(async () => ({
+    attachment: "ATTACHED",
+    goal: null,
+    runtimeUpdatedAt: null,
+  }));
+  readonly clearThreadGoal = vi.fn<TaskExecutionAdapter["clearThreadGoal"]>(async () => ({
+    attachment: "ATTACHED",
+    cleared: true,
+  }));
+  readonly syncThreadGoal = vi.fn<TaskExecutionAdapter["syncThreadGoal"]>(
+    async (_threadId, goal) => ({
+      attachment: "ATTACHED",
+      goal: { ...goal },
+      runtimeUpdatedAt: ++this.goalRuntimeVersion,
+    }),
+  );
   readonly startTask = vi.fn<TaskExecutionAdapter["startTask"]>(async (input) => {
     const threadId = `thread-${input.taskId}`;
     input.onThreadPrepared?.(threadId);
@@ -3029,6 +3181,7 @@ class FakeExecution extends EventEmitter implements TaskExecutionAdapter {
         status: input.goal.status,
         tokensUsed: input.goal.tokensUsed,
         timeUsedSeconds: input.goal.timeUsedSeconds,
+        runtimeUpdatedAt: ++this.goalRuntimeVersion,
       });
     }
     return {

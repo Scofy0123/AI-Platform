@@ -15,6 +15,7 @@ export interface ComposerCapabilityContext {
   stagingUnavailableReason?: string;
   goalAvailable: boolean;
   goalUnavailableReason?: string;
+  goalUnavailableReasonCode?: string;
   planModeAvailable: boolean;
   planModeUnavailableReason?: string;
   skillRecorderAvailable: boolean;
@@ -45,6 +46,9 @@ export function listComposerCapabilities(context: ComposerCapabilityContext): Co
       description: "Set a goal to keep pursuing",
       available: context.goalAvailable,
       unavailableReason: context.goalUnavailableReason ?? "Goal is unavailable for this Runtime",
+      ...(context.goalUnavailableReasonCode
+        ? { unavailableReasonCode: context.goalUnavailableReasonCode }
+        : {}),
       unavailableAvailability: "UNSUPPORTED",
     }),
     capability({
@@ -71,6 +75,7 @@ function capability(input: {
   description: string;
   available: boolean;
   unavailableReason: string;
+  unavailableReasonCode?: string;
   unavailableAvailability: "POLICY_BLOCKED" | "UNSUPPORTED";
 }): ComposerCapability {
   return ComposerCapabilitySchema.parse({
@@ -81,5 +86,6 @@ function capability(input: {
     description: input.description,
     availability: input.available ? "AVAILABLE" : input.unavailableAvailability,
     unavailableReason: input.available ? null : input.unavailableReason,
+    unavailableReasonCode: input.available ? null : (input.unavailableReasonCode ?? null),
   });
 }

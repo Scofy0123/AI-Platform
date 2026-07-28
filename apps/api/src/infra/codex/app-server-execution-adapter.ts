@@ -10,6 +10,9 @@ import {
 import type { InternalAccount } from "../../domain/account-admin-store.js";
 import type {
   ApprovalDraft,
+  AttachedGoalRuntimeResult,
+  GoalRuntimeCapability,
+  RuntimeGoalProjection,
   TaskEventDraft,
   TaskExecutionAdapter,
 } from "../../domain/platform-service.js";
@@ -41,6 +44,7 @@ interface RpcPort extends EventEmitter {
 }
 
 interface RuntimePort {
+  readGoalProtocolCapability(): GoalRuntimeCapability;
   startThread(input: {
     cwd: string;
     dynamicTools: ReturnType<ToolRuntimePort["definitions"]>;
@@ -64,10 +68,21 @@ interface RuntimePort {
     threadId: string,
     input: { objective: string; status: "active" | "paused" | "complete"; tokenBudget: number },
   ): Promise<{
+    objective: string;
     status: string;
+    tokenBudget: number | null;
     tokensUsed: number;
     timeUsedSeconds: number;
+    updatedAt: number;
   }>;
+  getThreadGoal(threadId: string): Promise<{
+    objective: string;
+    status: string;
+    tokenBudget: number | null;
+    tokensUsed: number;
+    timeUsedSeconds: number;
+    updatedAt: number;
+  } | null>;
   clearThreadGoal(threadId: string): Promise<boolean>;
   steerTurn(
     threadId: string,
@@ -145,7 +160,6 @@ type BufferedRpcSignal =
   | { kind: "SERVER_REQUEST"; rpc: RpcPort; value: unknown };
 
 export class AppServerExecutionAdapter extends EventEmitter implements TaskExecutionAdapter {
-  readonly supportsGoal = true;
   private readonly attachedConnectionByAccount = new Map<string, AttachedConnection>();
   private readonly lastConnectionGenerationByAccount = new Map<string, number>();
   private readonly runtimeByThread = new Map<string, RuntimePort>();
@@ -153,6 +167,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
   private readonly normalizerByTask = new Map<string, CodexEventNormalizer>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private readonly startingSignalsByThread = new Map<string, BufferedRpcSignal[]>();
+  private readonly goalCapabilityByAccount = new Map<string, GoalRuntimeCapability>();
 
   constructor(private readonly options: AdapterOptions) {
     super();
@@ -165,6 +180,100 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       codexHome: account.codexHome,
     });
     return (await managed.runtime.listModels()).map(mapRuntimeModel);
+  }
+
+  async readGoalCapability(account: InternalAccount): Promise<GoalRuntimeCapability> {
+    const cached = this.goalCapabilityByAccount.get(account.id);
+    if (cached) return { ...cached };
+    try {
+      const managed = await this.options.supervisor.startAccount({
+        accountId: account.id,
+        codexHome: account.codexHome,
+      });
+      const capability = managed.runtime.readGoalProtocolCapability();
+      this.goalCapabilityByAccount.set(account.id, capability);
+      return { ...capability };
+    } catch (error) {
+      const capability: GoalRuntimeCapability = {
+        availability: "UNAVAILABLE",
+        reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+        reason: error instanceof Error ? error.message : "Goal Runtime capability probe failed",
+      };
+      this.goalCapabilityByAccount.set(account.id, capability);
+      return capability;
+    }
+  }
+
+  async setThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    const runtime = this.runtimeByThread.get(threadId);
+    if (!runtime) return { attachment: "DETACHED" };
+    try {
+      const nativeGoal = await runtime.setThreadGoal(threadId, {
+        objective: goal.objective,
+        status: runtimeGoalStatus(goal.status),
+        tokenBudget: goal.tokenBudget,
+      });
+      return {
+        attachment: "ATTACHED",
+        goal: projectRuntimeGoal(goal, nativeGoal),
+        runtimeUpdatedAt: nativeGoal.updatedAt,
+      };
+    } catch (error) {
+      this.cacheAttachedGoalFailure(threadId, error);
+      throw error;
+    }
+  }
+
+  async getThreadGoal(threadId: string): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    const runtime = this.runtimeByThread.get(threadId);
+    if (!runtime) return { attachment: "DETACHED" };
+    try {
+      const nativeGoal = await runtime.getThreadGoal(threadId);
+      return {
+        attachment: "ATTACHED",
+        goal: nativeGoal ? projectRuntimeGoal(null, nativeGoal) : null,
+        runtimeUpdatedAt: nativeGoal?.updatedAt ?? null,
+      };
+    } catch (error) {
+      this.cacheAttachedGoalFailure(threadId, error);
+      throw error;
+    }
+  }
+
+  async clearThreadGoal(
+    threadId: string,
+  ): Promise<AttachedGoalRuntimeResult<{ cleared: boolean }>> {
+    const runtime = this.runtimeByThread.get(threadId);
+    if (!runtime) return { attachment: "DETACHED" };
+    try {
+      return { attachment: "ATTACHED", cleared: await runtime.clearThreadGoal(threadId) };
+    } catch (error) {
+      this.cacheAttachedGoalFailure(threadId, error);
+      throw error;
+    }
+  }
+
+  async syncThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    const applied = await this.setThreadGoal(threadId, goal);
+    if (applied.attachment === "DETACHED") return applied;
+    const verified = await this.getThreadGoal(threadId);
+    if (verified.attachment === "DETACHED" || !verified.goal) {
+      throw new Error("Runtime Goal verification failed after synchronization");
+    }
+    return {
+      ...verified,
+      goal: {
+        ...verified.goal,
+        objective: verified.goal.objective || goal.objective,
+        timeBudgetSeconds: goal.timeBudgetSeconds,
+      },
+    };
   }
 
   async startTask(input: {
@@ -239,6 +348,13 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     }
     input.onThreadPrepared?.(threadId);
     if (input.goal) {
+      const capability =
+        this.goalCapabilityByAccount.get(input.accountId) ??
+        managed.runtime.readGoalProtocolCapability();
+      if (capability.availability !== "AVAILABLE") {
+        this.goalCapabilityByAccount.set(input.accountId, capability);
+        throw new Error(capability.reason ?? "Goal protocol is unavailable for this Runtime");
+      }
       const synced = await managed.runtime.setThreadGoal(threadId, {
         objective: input.goal.objective,
         status: runtimeGoalStatus(input.goal.status),
@@ -250,6 +366,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         status: platformGoalStatus(synced.status),
         tokensUsed: synced.tokensUsed,
         timeUsedSeconds: synced.timeUsedSeconds,
+        runtimeUpdatedAt: synced.updatedAt,
       });
     } else if (input.existingThreadId) {
       await managed.runtime.clearThreadGoal(threadId);
@@ -545,14 +662,28 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         context &&
         typeof goal.status === "string" &&
         Number.isInteger(goal.tokensUsed) &&
-        Number.isInteger(goal.timeUsedSeconds)
+        Number.isInteger(goal.timeUsedSeconds) &&
+        Number.isInteger(goal.updatedAt)
       ) {
+        const status = platformGoalStatusOrNull(goal.status);
+        if (!status) {
+          const reason = `Unsupported Runtime Goal status: ${goal.status}`;
+          this.goalCapabilityByAccount.set(accountId, {
+            availability: "UNAVAILABLE",
+            reasonCode: "RUNTIME_GOAL_STATUS_UNSUPPORTED",
+            reason,
+          });
+          this.detachAccount(accountId, reason, { sourceTaskId: context.taskId });
+          void this.options.supervisor.stopAccount?.(accountId).catch(() => undefined);
+          return;
+        }
         this.emit("goalUpdated", {
           taskId: context.taskId,
           threadId: context.threadId,
-          status: platformGoalStatus(goal.status),
+          status,
           tokensUsed: goal.tokensUsed,
           timeUsedSeconds: goal.timeUsedSeconds,
+          runtimeUpdatedAt: goal.updatedAt,
         });
       }
       return;
@@ -617,6 +748,18 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         this.detachDescendantContexts(context);
       }
     }
+  }
+
+  private cacheAttachedGoalFailure(threadId: string, error: unknown): void {
+    const context = [...this.contextByThread.values()].find(
+      (candidate) => candidate.threadId === threadId,
+    );
+    if (!context) return;
+    this.goalCapabilityByAccount.set(context.accountId, {
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_GOAL_RPC_FAILED",
+      reason: error instanceof Error ? error.message : "Goal Runtime RPC failed",
+    });
   }
 
   private attachSubagentContext(parent: ThreadContext, childThreadId: string): void {
@@ -900,11 +1043,40 @@ function runtimeGoalStatus(status: ThreadGoalView["status"]): "active" | "paused
 }
 
 function platformGoalStatus(status: string): ThreadGoalView["status"] {
+  const projected = platformGoalStatusOrNull(status);
+  if (projected) return projected;
+  throw new Error(`Unsupported Runtime Goal status: ${status}`);
+}
+
+function platformGoalStatusOrNull(status: string): ThreadGoalView["status"] | null {
   if (status === "active") return "ACTIVE";
   if (status === "complete") return "COMPLETE";
   if (status === "budgetLimited" || status === "usageLimited") return "BUDGET_LIMITED";
   if (status === "paused" || status === "blocked") return "PAUSED";
-  throw new Error(`Unsupported Runtime Goal status: ${status}`);
+  return null;
+}
+
+function projectRuntimeGoal(
+  fallback: ThreadGoalSnapshot | null,
+  nativeGoal: {
+    objective: string;
+    status: string;
+    tokenBudget: number | null;
+    tokensUsed: number;
+    timeUsedSeconds: number;
+  },
+): ThreadGoalSnapshot {
+  const tokenBudget = nativeGoal.tokenBudget ?? fallback?.tokenBudget;
+  const objective = nativeGoal.objective || fallback?.objective;
+  if (!tokenBudget || !objective) throw new Error("Runtime Goal projection is incomplete");
+  return {
+    objective,
+    status: platformGoalStatus(nativeGoal.status),
+    tokenBudget,
+    tokensUsed: nativeGoal.tokensUsed,
+    timeBudgetSeconds: fallback?.timeBudgetSeconds ?? 3_600,
+    timeUsedSeconds: nativeGoal.timeUsedSeconds,
+  };
 }
 
 function messageThreadId(value: unknown): string | null {

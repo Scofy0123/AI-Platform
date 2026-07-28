@@ -359,6 +359,76 @@ describe("SQLitePlatformStore", () => {
     ).toMatchObject({ tokensUsed: 0, timeUsedSeconds: 0 });
   });
 
+  test("projects Runtime Goal notifications monotonically and never reopens a terminal platform state", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Goal projection", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Goal projection",
+      now: NOW,
+    });
+    store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "持续执行",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+
+    store.syncThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      runtimeThreadId: "runtime-thread-1",
+      status: "ACTIVE",
+      tokensUsed: 120,
+      timeUsedSeconds: 12,
+      runtimeUpdatedAt: 200,
+      now: new Date(NOW.getTime() + 2_000),
+    });
+    store.syncThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      runtimeThreadId: "runtime-thread-1",
+      status: "ACTIVE",
+      tokensUsed: 1,
+      timeUsedSeconds: 1,
+      runtimeUpdatedAt: 100,
+      now: new Date(NOW.getTime() + 3_000),
+    });
+    expect(store.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "ACTIVE",
+      tokensUsed: 120,
+      timeUsedSeconds: 12,
+    });
+
+    store.syncThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      runtimeThreadId: "runtime-thread-1",
+      status: "BUDGET_LIMITED",
+      tokensUsed: 200_000,
+      timeUsedSeconds: 20,
+      runtimeUpdatedAt: 300,
+      now: new Date(NOW.getTime() + 4_000),
+    });
+    store.syncThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      runtimeThreadId: "runtime-thread-1",
+      status: "ACTIVE",
+      tokensUsed: 150_000,
+      timeUsedSeconds: 19,
+      runtimeUpdatedAt: 400,
+      now: new Date(NOW.getTime() + 5_000),
+    });
+    expect(store.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "BUDGET_LIMITED",
+      tokensUsed: 200_000,
+      timeUsedSeconds: 20,
+    });
+  });
+
   test("tracks Steer delivery and releases failed attachments without marking them delivered", () => {
     const project = store.createProject({ ownerId: "user-1", name: "Steer delivery", now: NOW });
     const task = store.createTask({

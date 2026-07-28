@@ -342,6 +342,88 @@ describe("AppServerExecutionAdapter", () => {
     );
   });
 
+  test("probes Goal support from the initialized locked Runtime instead of advertising it statically", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.readGoalProtocolCapability).mockReturnValue({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "Codex App Server 0.143.0 predates the locked Goal protocol",
+    });
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await expect(
+      adapter.readGoalCapability({
+        id: "account-1",
+        alias: "Codex A",
+        status: "AVAILABLE",
+        authStatus: "AUTHENTICATED",
+        maxActiveUsers: 4,
+        activeUsers: 0,
+        activeTurns: 0,
+        healthScore: 100,
+        weeklyRemaining: null,
+        quotaUpdatedAt: null,
+        quotaResetsAt: null,
+        allowUnknownQuota: true,
+        codexHome: "/tmp/account-1",
+      }),
+    ).resolves.toMatchObject({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+    });
+  });
+
+  test("synchronizes an attached Goal immediately and verifies the Runtime projection", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Run",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    await expect(
+      adapter.syncThreadGoal("thread-1", {
+        objective: "新的持续目标",
+        status: "PAUSED",
+        tokenBudget: 200_000,
+        tokensUsed: 25,
+        timeBudgetSeconds: 3_600,
+        timeUsedSeconds: 12,
+      }),
+    ).resolves.toMatchObject({
+      attachment: "ATTACHED",
+      goal: { status: "PAUSED", tokensUsed: 0, timeUsedSeconds: 0 },
+    });
+    expect(runtime.setThreadGoal).toHaveBeenLastCalledWith("thread-1", {
+      objective: "新的持续目标",
+      status: "paused",
+      tokenBudget: 200_000,
+    });
+    expect(runtime.getThreadGoal).toHaveBeenCalledWith("thread-1");
+  });
+
   test("never starts a Turn when Goal synchronization fails", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();
@@ -411,7 +493,12 @@ describe("AppServerExecutionAdapter", () => {
       params: {
         threadId: "thread-1",
         turnId: "turn-1",
-        goal: { status: "budgetLimited", tokensUsed: 200_000, timeUsedSeconds: 60 },
+        goal: {
+          status: "budgetLimited",
+          tokensUsed: 200_000,
+          timeUsedSeconds: 60,
+          updatedAt: 200,
+        },
       },
     });
     rpc.emit("notification", {
@@ -426,9 +513,56 @@ describe("AppServerExecutionAdapter", () => {
         status: "BUDGET_LIMITED",
         tokensUsed: 200_000,
         timeUsedSeconds: 60,
+        runtimeUpdatedAt: 200,
       },
     ]);
     expect(clears).toEqual([{ taskId: "task-1", threadId: "thread-1" }]);
+  });
+
+  test("fails closed and quarantines the Runtime when a Goal notification has an unknown status", async () => {
+    const rpc = new FakeRpc();
+    const stopAccount = vi.fn(async () => undefined);
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime: runtimePort() }),
+        stopAccount,
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const crashes: unknown[] = [];
+    adapter.on("accountCrashed", (event) => crashes.push(event));
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Run",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    expect(() =>
+      rpc.emit("notification", {
+        method: "thread/goal/updated",
+        params: {
+          threadId: "thread-1",
+          goal: { status: "futureStatus", tokensUsed: 1, timeUsedSeconds: 1, updatedAt: 300 },
+        },
+      }),
+    ).not.toThrow();
+    await nextTick();
+
+    expect(crashes).toEqual([
+      expect.objectContaining({
+        accountId: "account-1",
+        sourceTaskId: "task-1",
+        reason: "Unsupported Runtime Goal status: futureStatus",
+      }),
+    ]);
+    expect(stopAccount).toHaveBeenCalledWith("account-1");
   });
 
   test.each([
@@ -1907,6 +2041,11 @@ class FakeRpc extends EventEmitter {
 
 function runtimePort(threadId = "thread-1", turnId = "turn-1"): ManagedRuntimePort["runtime"] {
   return {
+    readGoalProtocolCapability: vi.fn(() => ({
+      availability: "AVAILABLE" as const,
+      reasonCode: null,
+      reason: null,
+    })),
     startThread: vi.fn(async () => ({ thread: { id: threadId } })),
     resumeThread: vi.fn(async () => resumeResponse(threadId, { type: "idle" }, [])),
     startTurn: vi.fn(async () => ({ turn: { id: turnId } })),
@@ -1914,6 +2053,16 @@ function runtimePort(threadId = "thread-1", turnId = "turn-1"): ManagedRuntimePo
     setThreadGoal: vi.fn(async (_threadId, input) => ({
       threadId,
       ...input,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    })),
+    getThreadGoal: vi.fn(async () => ({
+      threadId,
+      objective: "新的持续目标",
+      status: "paused" as const,
+      tokenBudget: 200_000,
       tokensUsed: 0,
       timeUsedSeconds: 0,
       createdAt: 1,

@@ -242,6 +242,7 @@ export const threadGoals = sqliteTable("thread_goals", {
   timeUsedSeconds: integer("time_used_seconds").notNull().default(0),
   runtimeSyncState: text("runtime_sync_state").notNull().default("PENDING"),
   runtimeThreadId: text("runtime_thread_id"),
+  runtimeUpdatedAt: integer("runtime_updated_at"),
   activatedAt: integer("activated_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),

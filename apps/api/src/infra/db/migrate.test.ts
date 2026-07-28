@@ -213,6 +213,8 @@ describe("migrateDatabase", () => {
     ).toEqual({ name: "thread_goals" });
     const columns = database.pragma("table_info(turn_input_snapshots)") as Array<{ name: string }>;
     expect(columns.map((column) => column.name)).toContain("goal_json");
+    const goalColumns = database.pragma("table_info(thread_goals)") as Array<{ name: string }>;
+    expect(goalColumns.map((column) => column.name)).toContain("runtime_updated_at");
   });
 
   test("marks snapshots created before delivery tracking as UNKNOWN instead of PENDING", () => {

@@ -7,12 +7,56 @@ import type {
   ThreadGoalSnapshot,
 } from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
-import type { TaskEventDraft, TaskExecutionAdapter } from "../../domain/platform-service.js";
+import type {
+  AttachedGoalRuntimeResult,
+  GoalRuntimeCapability,
+  RuntimeGoalProjection,
+  TaskEventDraft,
+  TaskExecutionAdapter,
+} from "../../domain/platform-service.js";
 import type { WeeklyQuota } from "./codex-runtime.js";
 
 export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionAdapter {
-  readonly supportsGoal = true;
   private readonly active = new Map<string, { taskId: string; turnId: string }>();
+  private readonly goalByThread = new Map<string, ThreadGoalSnapshot>();
+
+  async readGoalCapability(_account: InternalAccount): Promise<GoalRuntimeCapability> {
+    return { availability: "AVAILABLE", reasonCode: null, reason: null };
+  }
+
+  async setThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    this.goalByThread.set(threadId, { ...goal });
+    return {
+      attachment: "ATTACHED",
+      goal: { ...goal },
+      runtimeUpdatedAt: Date.now(),
+    };
+  }
+
+  async getThreadGoal(threadId: string): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    const goal = this.goalByThread.get(threadId);
+    return {
+      attachment: "ATTACHED",
+      goal: goal ? { ...goal } : null,
+      runtimeUpdatedAt: Date.now(),
+    };
+  }
+
+  async clearThreadGoal(
+    threadId: string,
+  ): Promise<AttachedGoalRuntimeResult<{ cleared: boolean }>> {
+    return { attachment: "ATTACHED", cleared: this.goalByThread.delete(threadId) };
+  }
+
+  async syncThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    return this.setThreadGoal(threadId, goal);
+  }
 
   async listModels(_account: InternalAccount): Promise<ModelOption[]> {
     return FAKE_MODEL_OPTIONS.map((model) => ({
@@ -38,12 +82,14 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
     const threadId = input.existingThreadId ?? `fake-thread-${randomUUID()}`;
     input.onThreadPrepared?.(threadId);
     if (input.goal) {
+      this.goalByThread.set(threadId, { ...input.goal });
       this.emit("goalUpdated", {
         taskId: input.taskId,
         threadId,
         status: input.goal.status,
         tokensUsed: input.goal.tokensUsed,
         timeUsedSeconds: input.goal.timeUsedSeconds,
+        runtimeUpdatedAt: Date.now(),
       });
     }
     const turnId = `fake-turn-${randomUUID()}`;
@@ -100,6 +146,7 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
 
   async close(): Promise<void> {
     this.active.clear();
+    this.goalByThread.clear();
     this.removeAllListeners();
   }
 

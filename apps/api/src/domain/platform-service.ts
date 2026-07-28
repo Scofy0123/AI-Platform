@@ -163,9 +163,34 @@ export class InvalidThreadResumeResponseError extends ThreadResumeSafetyError {
   }
 }
 
+export interface GoalRuntimeCapability {
+  availability: "AVAILABLE" | "UNAVAILABLE";
+  reasonCode: string | null;
+  reason: string | null;
+}
+
+export type AttachedGoalRuntimeResult<T> =
+  | { attachment: "DETACHED" }
+  | ({ attachment: "ATTACHED" } & T);
+
+export interface RuntimeGoalProjection {
+  goal: ThreadGoalSnapshot | null;
+  runtimeUpdatedAt: number | null;
+}
+
 export interface TaskExecutionAdapter {
-  readonly supportsGoal: boolean;
   listModels(account: InternalAccount): Promise<ModelOption[]>;
+  readGoalCapability(account: InternalAccount): Promise<GoalRuntimeCapability>;
+  setThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>>;
+  getThreadGoal(threadId: string): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>>;
+  clearThreadGoal(threadId: string): Promise<AttachedGoalRuntimeResult<{ cleared: boolean }>>;
+  syncThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>>;
   startTask(input: {
     accountId: string;
     codexHome: string;
@@ -213,6 +238,7 @@ export interface TaskExecutionAdapter {
       status: ThreadGoalView["status"];
       tokensUsed: number;
       timeUsedSeconds: number;
+      runtimeUpdatedAt: number;
     }) => void,
   ): this;
   on(event: "goalCleared", listener: (event: { taskId: string; threadId: string }) => void): this;
@@ -341,12 +367,15 @@ export class LocalPlatformService implements PlatformApi {
         status: event.status,
         tokensUsed: event.tokensUsed,
         timeUsedSeconds: event.timeUsedSeconds,
+        runtimeUpdatedAt: event.runtimeUpdatedAt,
         now: this.now(),
       });
     });
     options.execution.on("goalCleared", ({ taskId }) => {
       const ownerId = options.store.getTaskOwnerId(taskId);
-      if (ownerId) options.store.deleteThreadGoal(taskId, ownerId);
+      if (ownerId && options.store.getThreadGoal(taskId, ownerId)) {
+        options.store.markThreadGoalRecovery(taskId, ownerId, this.now());
+      }
     });
   }
 
@@ -440,13 +469,17 @@ export class LocalPlatformService implements PlatformApi {
   }
 
   async listComposerCapabilities(userId: string, threadId?: string): Promise<ComposerCapability[]> {
-    if (threadId && !this.options.store.getTaskForUser(threadId, userId)) {
-      throw new Error("Thread not found");
-    }
+    const task = threadId ? this.options.store.getTaskForUser(threadId, userId) : null;
+    if (threadId && !task) throw new Error("Thread not found");
+    const goalCapability = await this.readGoalCapabilityForUser(userId, task?.accountId ?? null);
     return buildComposerCapabilities({
       stagingAvailable: true,
-      goalAvailable: this.options.execution.supportsGoal,
-      goalUnavailableReason: "Goal protocol is unavailable for this Runtime",
+      goalAvailable: goalCapability.availability === "AVAILABLE",
+      goalUnavailableReason:
+        goalCapability.reason ?? "Goal protocol is unavailable for this Runtime",
+      ...(goalCapability.reasonCode
+        ? { goalUnavailableReasonCode: goalCapability.reasonCode }
+        : {}),
       planModeAvailable: false,
       planModeUnavailableReason: "Plan mode is awaiting locked-version protocol validation",
       skillRecorderAvailable: false,
@@ -573,14 +606,17 @@ export class LocalPlatformService implements PlatformApi {
     userId: string,
     input: ThreadGoalInput,
   ): Promise<ThreadGoalView> {
-    if (!this.options.execution.supportsGoal) throw new Error("Goal is unavailable");
+    const task = this.requireTask(threadId, userId);
+    await this.ensureGoalCapability(userId, task.accountId);
+    await this.interruptGoalMutationTurn(task);
     const parsed = ThreadGoalInputSchema.parse(input);
-    return this.options.store.putThreadGoal({
+    const pending = this.options.store.putThreadGoal({
       threadId,
       ownerId: userId,
       ...parsed,
       now: this.now(),
     });
+    return this.synchronizeStoredGoal(task, userId, pending);
   }
 
   async patchThreadGoal(
@@ -588,17 +624,47 @@ export class LocalPlatformService implements PlatformApi {
     userId: string,
     patch: ThreadGoalPatch,
   ): Promise<ThreadGoalView> {
-    if (!this.options.execution.supportsGoal) throw new Error("Goal is unavailable");
-    return this.options.store.patchThreadGoal({
+    const task = this.requireTask(threadId, userId);
+    await this.ensureGoalCapability(userId, task.accountId);
+    await this.interruptGoalMutationTurn(task);
+    const pending = this.options.store.patchThreadGoal({
       threadId,
       ownerId: userId,
       patch: ThreadGoalPatchSchema.parse(patch),
       now: this.now(),
     });
+    return this.synchronizeStoredGoal(task, userId, pending);
   }
 
-  async deleteThreadGoal(threadId: string, userId: string): Promise<void> {
-    this.options.store.deleteThreadGoal(threadId, userId);
+  async deleteThreadGoal(
+    threadId: string,
+    userId: string,
+  ): Promise<{ cleared: true; runtimeSyncState: "PENDING" | "SYNCED" }> {
+    const task = this.requireTask(threadId, userId);
+    const current = this.options.store.getThreadGoal(threadId, userId);
+    if (!current) throw new Error("Goal not found");
+    await this.ensureGoalCapability(userId, task.accountId);
+    await this.interruptGoalMutationTurn(task);
+    if (!task.threadId) {
+      this.options.store.deleteThreadGoal(threadId, userId);
+      return { cleared: true, runtimeSyncState: "PENDING" };
+    }
+    try {
+      const cleared = await this.options.execution.clearThreadGoal(task.threadId);
+      if (cleared.attachment === "DETACHED") {
+        this.options.store.deleteThreadGoal(threadId, userId);
+        return { cleared: true, runtimeSyncState: "PENDING" };
+      }
+      const verified = await this.options.execution.getThreadGoal(task.threadId);
+      if (verified.attachment !== "ATTACHED" || verified.goal !== null) {
+        throw new Error("Runtime Goal remained present after clear");
+      }
+      this.options.store.deleteThreadGoal(threadId, userId);
+      return { cleared: true, runtimeSyncState: "SYNCED" };
+    } catch (error) {
+      this.options.store.markThreadGoalRecovery(threadId, userId, this.now());
+      throw error;
+    }
   }
 
   async listTasks(userId: string, projectId?: string) {
@@ -1539,6 +1605,85 @@ export class LocalPlatformService implements PlatformApi {
     if (!task) throw new Error("Task not found");
     if (task.archivedAt) throw new Error("Thread is archived");
     return task;
+  }
+
+  private async readGoalCapabilityForUser(
+    userId: string,
+    requiredAccountId: string | null,
+  ): Promise<GoalRuntimeCapability> {
+    this.options.store.getUserIdentity(userId);
+    const accountIds = this.options.leases.listModelRoutingAccountIdsForUser(
+      userId,
+      this.now(),
+      requiredAccountId,
+    );
+    if (accountIds.length === 0) {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "NO_ROUTABLE_CODEX_ACCOUNT",
+        reason: "No routable Codex account can provide the locked Goal protocol",
+      };
+    }
+    for (const accountId of accountIds) {
+      const account = this.options.accounts.getInternal(accountId);
+      if (!account) {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "CODEX_ACCOUNT_UNAVAILABLE",
+          reason: `Codex account ${accountId} is unavailable`,
+        };
+      }
+      const capability = await this.options.execution.readGoalCapability(account);
+      if (capability.availability !== "AVAILABLE") return capability;
+    }
+    return { availability: "AVAILABLE", reasonCode: null, reason: null };
+  }
+
+  private async ensureGoalCapability(
+    userId: string,
+    requiredAccountId: string | null,
+  ): Promise<void> {
+    const capability = await this.readGoalCapabilityForUser(userId, requiredAccountId);
+    if (capability.availability !== "AVAILABLE") {
+      throw new Error(
+        capability.reasonCode
+          ? `${capability.reasonCode}: ${capability.reason ?? "Goal is unavailable"}`
+          : (capability.reason ?? "Goal is unavailable"),
+      );
+    }
+  }
+
+  private async interruptGoalMutationTurn(task: TaskRecord): Promise<void> {
+    const active = this.options.store.getActiveTurnForTask(task.id, task.ownerId);
+    if (!active || !task.threadId || !task.currentTurnId) return;
+    await this.options.execution.interruptTask(task.threadId, task.currentTurnId);
+  }
+
+  private async synchronizeStoredGoal(
+    task: TaskRecord,
+    ownerId: string,
+    pending: ThreadGoalView,
+  ): Promise<ThreadGoalView> {
+    if (!task.threadId) return pending;
+    try {
+      const synced = await this.options.execution.syncThreadGoal(task.threadId, pending);
+      if (synced.attachment === "DETACHED") return pending;
+      if (!synced.goal) throw new Error("Runtime Goal synchronization returned no Goal");
+      return this.options.store.syncThreadGoal({
+        threadId: task.id,
+        ownerId,
+        runtimeThreadId: task.threadId,
+        status: synced.goal.status,
+        tokensUsed: synced.goal.tokensUsed,
+        timeUsedSeconds: synced.goal.timeUsedSeconds,
+        ...(synced.runtimeUpdatedAt === null ? {} : { runtimeUpdatedAt: synced.runtimeUpdatedAt }),
+        source: "COMMAND",
+        now: this.now(),
+      });
+    } catch (error) {
+      this.options.store.markThreadGoalRecovery(task.id, ownerId, this.now());
+      throw error;
+    }
   }
 
   private receiveTaskEvent(draft: TaskEventDraft): void {

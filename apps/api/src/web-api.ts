@@ -62,7 +62,10 @@ export interface PlatformApi {
     userId: string,
     patch: ThreadGoalPatch,
   ): Promise<ThreadGoalView>;
-  deleteThreadGoal(threadId: string, userId: string): Promise<void>;
+  deleteThreadGoal(
+    threadId: string,
+    userId: string,
+  ): Promise<{ cleared: true; runtimeSyncState: "PENDING" | "SYNCED" }>;
   listThreads(userId: string, projectId?: string): Promise<Thread[]>;
   listArchivedThreads(userId: string): Promise<Thread[]>;
   archiveThread(threadId: string, userId: string): Promise<{ ok: true }>;

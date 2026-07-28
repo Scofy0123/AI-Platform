@@ -98,6 +98,34 @@ describe("CodexAppServerRuntime", () => {
       },
     });
     expect(rpc.notifications).toEqual([{ method: "initialized", params: undefined }]);
+    expect(runtime.readGoalProtocolCapability()).toEqual({
+      availability: "AVAILABLE",
+      reasonCode: null,
+      reason: null,
+    });
+  });
+
+  test("does not advertise Goal before initialization or from an older App Server handshake", async () => {
+    const runtime = new CodexAppServerRuntime(
+      new FakeRpc({
+        initialize: {
+          userAgent: "codex/0.143.0",
+          codexHome: "/tmp/account-1",
+          platformFamily: "unix",
+          platformOs: "macos",
+        },
+      }),
+    );
+    expect(runtime.readGoalProtocolCapability()).toMatchObject({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_HANDSHAKE_MISSING",
+    });
+
+    await runtime.initialize();
+    expect(runtime.readGoalProtocolCapability()).toMatchObject({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+    });
   });
 
   test("starts browser login and exposes the returned auth URL", async () => {
