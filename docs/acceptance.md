@@ -58,9 +58,9 @@ pnpm verify
   参数映射由 Runtime 单测逐字段核验。当前组织策略只开放前两档，`FULL_ACCESS` 与 `CUSTOM`
   在 Composer 中可见但不可选，并显示门禁原因。
 - `GET /api/composer/capabilities` 按当前飞书用户和 Thread 返回服务端能力真值；浏览器不能自行把
-  `Files and folders`、Goal、Plan mode 或 Record a skill 标记成可用。
-- 当前四个 Add 能力尚未完成端到端实现，全部显示为禁用；这证明产品不会用可点击空壳伪装能力，
-  不代表附件、Goal、Plan 或 Skill 已交付。
+  Files、Goal 或 Plan 标记成可用。本轮只交付这三项，其余 Add 类别隐藏。
+- Files、隐藏 Draft、Goal 和 Plan 处于实施中；本节只定义验收，不代表已交付。通过自动测试、
+  浏览器 UAT、真实 App Server 参数复核和数据复核后，才补充执行证据。
 - Playwright 已验证权限菜单选择 `Approve for me` 后，保存的 Turn 配置快照为
   `permissionMode=APPROVE_FOR_ME`；同时验证 Full access 与四个 Add 能力的禁用状态。
 - 视觉 UAT 产物名为 `composer-add-menu.png` 和 `composer-permissions.png`，由
@@ -129,21 +129,25 @@ pnpm test:e2e
 使用 `RUNTIME_MODE=fake` 启动后：
 
 1. 用飞书登录，确认直接进入 `/threads/new`。
-2. 打开 “Add files and more”，确认 Files、Goal、Plan、Record skill 均显示真实禁用原因；当前阶段
-   不应允许点击。
-3. 打开权限菜单，确认 Ask for approval 与 Approve for me 可选，Full access 与 Custom 禁用；选择
+2. 打开 “Add files and more”，确认只显示 Files、Goal、Plan；Record skill、Plugins、Apps、
+   Skills 和历史会话引用不出现。
+3. 选择文件和目录，确认上传/扫描 Chip、删除、重选、拖放和纯附件提交可用；Draft 不进入历史列表。
+4. 设置 Goal 并完成至少两个 Turn，确认目标跨 Turn 保留；验证暂停、恢复、编辑、完成和清除。
+5. 开启 Plan mode，确认图标和菜单选中态同步；活动 Turn 中禁止切换，真实 Runtime 参数包含
+   锁定目录返回的 collaboration preset。
+6. 打开权限菜单，确认 Ask for approval 与 Approve for me 可选，Full access 与 Custom 禁用；选择
    `Approve for me`。
-4. 打开 Composer 的 Model / Effort 选择器：选择 `Fake Deep` 后默认 Effort 应切换到 `high`，再选择 `xhigh` 并提交。
-5. Turn 完成后读取 `/api/threads/:id`，确认该 Turn 的 `model=fake-codex-deep`、`effort=xhigh`、
+7. 打开 Composer 的 Model / Effort 选择器：选择 `Fake Deep` 后默认 Effort 应切换到 `high`，再选择 `xhigh` 并提交。
+8. Turn 完成后读取 `/api/threads/:id`，确认该 Turn 的 `model=fake-codex-deep`、`effort=xhigh`、
    `configSnapshot.permissionMode=APPROVE_FOR_ME`；只看选择器文案不能判定通过。
-6. 确认 Transcript 连续展示用户消息、Plan 更新、命令/Tool/Diff 活动摘要和最终回复；Markdown 粗体与代码应正确渲染，正文中不得出现独立的 `fake-codexplatform` 原始输出。
-7. 点击命令活动行打开 Bottom Panel 的 Terminal，确认其中能看到 `fake-codexplatform`；Bottom Panel 不出现 Changes、Files 或 Tool details 标签。
-8. 依次打开 Pinned Summary、Side Panel 和 Bottom Panel，确认三者同时可见；单独关闭 Pinned Summary 后，Side 与 Bottom 仍保持打开。
-9. Side Panel 切换 Plan、Outputs、Subagents、Sources；再分别点击 Transcript 的 Tool 与 Diff/文件活动行，确认 Side Panel 进入对应详情并能返回父 Tab。Pinned Summary 打开时不改变正文宽度，Side Panel 打开时才压缩正文。
-10. 在同一 Composer 提交第 2 个 Prompt，确认 URL 和 Thread 不变、两轮内容连续。
-11. 进入 Settings，修改 Theme 或默认 Model / Effort，保存并刷新，确认值仍属于当前飞书用户。
-12. 管理员进入独立 `/admin/accounts`，检查 Accounts、Policies、Connectors、Usage、Audit 和 Runtime health；再返回用户工作区。
-13. 在浏览器 Network 中检查 `/api/threads/:id` 和 SSE：用户侧不得出现账号别名、raw reasoning、`.data/real-runtime/codex-accounts/` 或真实 `CODEX_HOME` 路径；管理员审计可出现账号别名但不能出现凭证路径。
+9. 确认 Transcript 连续展示用户消息、Plan 更新、命令/Tool/Diff 活动摘要和最终回复；Markdown 粗体与代码应正确渲染，正文中不得出现独立的 `fake-codexplatform` 原始输出。
+10. 点击命令活动行打开 Bottom Panel 的 Terminal，确认其中能看到 `fake-codexplatform`；Bottom Panel 不出现 Changes、Files 或 Tool details 标签。
+11. 依次打开 Pinned Summary、Side Panel 和 Bottom Panel，确认三者同时可见；单独关闭 Pinned Summary 后，Side 与 Bottom 仍保持打开。
+12. Side Panel 切换 Plan、Outputs、Subagents、Sources；再分别点击 Transcript 的 Tool 与 Diff/文件活动行，确认 Side Panel 进入对应详情并能返回父 Tab。Pinned Summary 打开时不改变正文宽度，Side Panel 打开时才压缩正文。
+13. 在同一 Composer 提交第 2 个 Prompt，确认 URL 和 Thread 不变、两轮内容连续。
+14. 进入 Settings，修改 Theme 或默认 Model / Effort，保存并刷新，确认值仍属于当前飞书用户。
+15. 管理员进入独立 `/admin/accounts`，检查 Accounts、Policies、Connectors、Usage、Audit 和 Runtime health；再返回用户工作区。
+16. 在浏览器 Network 中检查 `/api/threads/:id` 和 SSE：用户侧不得出现账号别名、raw reasoning、`.data/real-runtime/codex-accounts/` 或真实 `CODEX_HOME` 路径；管理员审计可出现账号别名但不能出现凭证路径。
 
 fake UAT 证明的是交互和投影，不证明真实 Codex、多用户凭证隔离或真实飞书 Tool 已通过。
 

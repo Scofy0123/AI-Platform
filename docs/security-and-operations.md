@@ -125,6 +125,12 @@ codex-cli 0.144.6
 - SQLite 内部审计保留租约、Thread、Turn、Tool 和审批关联；管理员浏览器接口只返回用户、账号别名、Thread、动作、结果、摘要和时间，不返回这些运行时关联 ID。
 - Demo SQL 只接受单条 allowlist `SELECT`，拒绝注释、多语句、DDL/DML、SQLite 系统对象和超限结果。
 - Runtime 错误和 Tool 错误做基础 Token 脱敏。
+- Composer 附件按用户和 Thread 隔离暂存；文件名规范化、真实路径 containment、符号链接、MIME、
+  大小、目录数量和 owner ACL 均在提交前重新校验。浏览器响应、SSE、日志和审计不返回绝对路径。
+- 1.1A 的 `AttachmentScanner` 只提供类型、大小、路径和可读性门禁；正式多人开放前必须接入恶意
+  文件扫描和 DLP。压缩包不自动解压，失败或未完成扫描的附件不能进入 Turn。
+- Goal 的 200k Token 预算由 Runtime Goal 管理，60 分钟预算由平台 Watchdog 管理；预算到达只暂停
+  Goal，不自动重试已经产生外部副作用的 Tool Call。
 
 ## 故障恢复
 
@@ -198,3 +204,5 @@ sqlite3 .data/real-codexplatform.sqlite ".backup '.data/real-codexplatform.backu
 16. **Settings 仍是 1.1A 范围。** 用户偏好和 Turn 快照已实现；Project 级执行设置、完整组织策略编辑、插件安装和平台 Memory 尚未实现。
 17. **原生 Memory 已在 real Runtime 的 Thread 级关闭，但多人隔离仍未完成。** 1.1A real Runtime 已在每次新建/恢复 Thread 后强制下发 `thread/memoryMode=disabled`，并在失败时 fail closed；真实多人开放仍需通过跨用户 Memory、Thread 历史和文件哨兵测试，并完成独立 Worker/`CODEX_HOME` 隔离。
 18. **企业 App Server client 尚需登记。** 组织试点前必须按 OpenAI App Server 初始化要求联系 OpenAI，将 `codexplatform` 加入 known clients；本仓库发送 `clientInfo` 不等于已获准。
+19. **附件扫描尚非生产恶意文件检测。** 1.1A 只在单操作者本机完成格式、路径和配额门禁；多人或
+    企业文件开放前必须接入正式扫描器、DLP、保留期和安全删除策略。

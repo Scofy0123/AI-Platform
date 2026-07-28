@@ -79,8 +79,9 @@ flowchart TB
 
 Composer：
 
-- `+` 打开 `Add files and more`，按 Add、Plugins、Apps、Files and chats 分区。菜单由服务端
-  Capability Registry 驱动；未接入项可以显示为带原因的禁用项，但不能伪装可用。
+- `+` 打开 `Add files and more`。1.1A 只展示真实交付的 `Files and folders`、`Goal` 和
+  `Plan mode`；Record a skill、Plugins、Apps、Skills 和历史会话引用在接入前隐藏，不保留灰色空壳。
+  菜单可用性由服务端 Capability Registry 决定，前端不能自行放开。
 - 模型和 Effort 使用同一个联动选择器，选项来自当前账号的 `model/list`。
 - 权限 Popover、发送、停止和运行状态位于同一操作区。
 - Turn 运行中提交文本即 Steer；配置变更只对下一 Turn 生效。
@@ -102,21 +103,18 @@ Composer：
 
 ### 3.2.2 Add files and more
 
-- Files and folders：浏览器只负责选择和上传；服务端扫描后将文件放入当前用户、当前 Thread 的隔离
-  staging workspace。图片映射为 `localImage`，其他文件或目录映射为受控路径引用与
-  `additionalContext`，绝不传浏览器本地路径。
-- Goal：使用稳定的 `thread/goal/set|get|clear`，属于 Thread 持久状态，跨 Turn 保留。
-- Plan mode：使用实验性 `collaborationMode` 适配，只影响下一 Turn，固定协议版本并做合约测试。
-- Record a skill：属于桌面宿主 Computer Use/录制能力；独立 Worker 未接入前显示禁用原因。
-- Plugins/Skills：目录来自 `skills/list` 与管理员批准策略的交集；选择后发送结构化 `skill`
-  UserInput，不只是在 Prompt 中拼接名称。
-- Apps：目录来自 `app/list` 与 Connector Policy 的交集；OAuth、Scope 和 Token 按飞书用户隔离。
-- Files and chats：只搜索当前用户的 CodexPlatform Thread、已上传文件和可访问企业资源。App Server
-  不提供个人 ChatGPT 历史搜索，平台不得通过共享账号展示个人 ChatGPT conversations。
-
-Documents、PDF、Spreadsheets 和 Presentations 是由 Skill、命令与文件库实现的工作流，不是 App
-Server 原生 Office 对象。Plugin 安装与市场接口处于 under development，普通用户只可使用管理员
-批准的目录。
+- Files and folders：点击后显示 `Choose files / Choose folder` 二级菜单，支持多文件、目录和拖放。
+  浏览器只负责选择和上传；服务端扫描后将内容放入当前用户、当前 Thread 的隔离 staging workspace。
+  图片映射为 `localImage`，其他文件或目录映射为受控路径引用与 `additionalContext`，绝不传浏览器
+  本地路径。附件以紧凑 Chip 展示；未达到 READY 时禁止提交。
+- Goal：使用稳定的 `thread/goal/set|get|clear`，属于 Thread 持久状态，跨 Turn 保留；支持编辑、
+  暂停、恢复、完成和清除。原生 Token 预算默认为 200k，平台 Watchdog 默认 60 分钟，先到者暂停。
+- Plan mode：使用锁定版本的实验性 `collaborationMode=plan`。选择为 Thread sticky，对当前及后续
+  新 Turn 生效，直到用户关闭；活动 Turn 期间禁止切换，Steer 继承当前 Turn 快照。
+- 在 `/threads/new` 首次选择文件或设置 Goal 时创建隐藏 Draft；Draft 不出现在左侧历史中，首次发送
+  原子转为正式 Thread，废弃 Draft 与暂存文件自动过期清理。
+- Record a skill、Plugins、Apps、Skills 和 Files and chats 属于后续能力，本轮不展示。它们只有在
+  Runtime、组织策略、用户授权和真实纵切同时通过后才可重新进入 Capability Registry。
 
 ### 3.3 三个独立 Workspace Surface
 
@@ -356,6 +354,9 @@ Tenant
 - `ComposerCapability`：能力类型、分区、来源、可用状态、禁用原因与组织策略。
 - `ContextAttachment`：FILE/FOLDER/IMAGE/THREAD/FEISHU_DOC/APP/SKILL 引用及
   UPLOADING/SCANNING/READY/BLOCKED 等状态。
+- `DraftThread`：隐藏草稿及其 `DRAFT → ACTIVE | EXPIRED` 生命周期。
+- `ThreadGoal`：目标、状态、Token 预算、平台时间预算、用量与恢复状态。
+- `ComposerState`：Plan mode、Goal 和 Draft Attachment 的 Thread 级可见状态。
 - `ExecutionPermission`：用户模式及其展开后的 Sandbox、Approval policy、Reviewer、Profile 和来源。
 - `EffectiveTurnInputSnapshot`：提交时解析后的文本、附件、Goal/Plan、权限和供应商输入。
 - `ActorContext`：Tenant、飞书用户、角色、Tool Scope 和审批策略。
@@ -372,12 +373,17 @@ GET  /api/projects
 POST /api/projects
 GET  /api/threads
 POST /api/threads
+POST /api/threads/drafts
 GET  /api/threads/:id
+DELETE /api/threads/:id/draft
 POST /api/threads/:id/turns
 POST /api/threads/:id/attachments
 DELETE /api/threads/:id/attachments/:attachmentId
-POST /api/threads/:id/goal
+GET  /api/threads/:id/goal
+PUT  /api/threads/:id/goal
+PATCH /api/threads/:id/goal
 DELETE /api/threads/:id/goal
+PATCH /api/threads/:id/composer
 POST /api/threads/:id/steer
 POST /api/threads/:id/interrupt
 GET  /api/threads/:id/events
@@ -527,10 +533,12 @@ flowchart LR
 - Composer 展示当前账号真实模型目录；模型与 Effort 联动，最终 `thread/start` / `turn/start` 参数和 Turn 快照一致。
 - 权限 Popover 的 Ask for approval、Approve for me、Full access 与 Custom 映射到正确 Runtime
   参数；组织策略和 Worker 门禁无法通过直接 API 绕过。
-- Add 菜单由 Capability Registry 驱动；文件、Goal、Plan、Skill、App 和 Thread 引用均显示真实
-  状态，未接入能力显示准确禁用原因。
-- 文件上传完成扫描和 owner ACL 后才能提交；图片使用 `localImage`，Skill 使用结构化 `skill`
-  UserInput，浏览器本地路径不会进入 Runtime、SSE 或日志。
+- Add 菜单由 Capability Registry 驱动；1.1A 只显示 Files、Goal 和 Plan，其他未接入能力隐藏。
+- 文件上传完成扫描和 owner ACL 后才能提交；图片使用 `localImage`，普通文件和目录只引用受控
+  staging 路径，浏览器本地路径不会进入 Runtime、SSE 或日志。
+- 隐藏 Draft 不出现在历史列表；首次提交原子转为正式 Thread；废弃 Draft 和暂存文件按 TTL 清理。
+- Goal 跨 Turn 保留并支持编辑、暂停、恢复、完成和清除；200k Token 或 60 分钟预算先到即暂停。
+- Plan mode 的图标、菜单状态、Thread 持久化与实际 `collaborationMode` 一致，活动 Turn 中不可切换。
 - 主对话流以用户消息、Agent Markdown 和紧凑活动行呈现；同一 Item 的流式 Delta 不生成重复卡片。
 - Pinned Summary、Bottom Panel、Side Panel 可以独立开关和组合存在；关闭 Side Panel 后主对话恢复完整宽度。
 - 点击 Output、Source 或 Subagent 摘要时在 Side Panel 打开对应 Tab；Terminal 只在 Bottom Panel
@@ -587,6 +595,8 @@ flowchart LR
 - 本轮 PR Head 已实现 Runtime 模型目录、模型/Effort 联动、连续 Transcript、三个独立
   Workspace Surface、安全 Markdown、复合 Item 详情边界和运行路径脱敏；是否“通过”仍以
   `pnpm verify`、真实浏览器 UAT 与外部 Smoke 的独立证据为准。
+- Files/Folders、隐藏 Draft、Goal 和 Plan mode 当前处于本轮实施中；只有自动测试、浏览器 UAT、
+  App Server 参数证据和数据复核均通过后，才从“实施中”更新为“已验证”。
 - real Runtime 的单操作者纵切需要实际完成 Codex 登录并通过 Smoke 才能标记为已验证。
 - 真实飞书 Tool 需要当前飞书用户 Token 和可读测试文档，必须独立验收。
 - 生产多人执行、独立 Worker、Credential Broker、正式 MCP Gateway、PostgreSQL、消息总线、KMS 和 HA 属于 1.1B 规划，不属于 1.1A 已实现能力。

@@ -42,6 +42,36 @@ flowchart LR
 | `apps/api/src/security` | AES-GCM Token 加密、运行环境白名单和 Codex 凭证隔离探针 |
 | `packages/contracts` | CODEX bootstrap、Thread/Turn/Item、Settings、Subagent、用量和事件 DTO |
 
+## Composer Draft、附件、Goal 与 Plan
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant W as Composer
+    participant A as Platform API
+    participant S as SQLite / Staging
+    participant R as Codex App Server
+
+    U->>W: 选择文件或设置 Goal
+    W->>A: 创建隐藏 Draft
+    A->>S: 保存 DRAFT 与隔离附件
+    A->>S: 扫描、ACL、配额与路径校验
+    U->>W: 提交文本或纯附件 Turn
+    W->>A: TurnInputBundle
+    A->>S: DRAFT 原子转 ACTIVE\n保存不可变输入快照
+    A->>R: thread/start 或 resume
+    A->>R: memoryMode=disabled
+    A->>R: goal/set（如有变更）
+    A->>R: turn/start + collaborationMode + inputs
+```
+
+- 隐藏 Draft 使用 `DRAFT → ACTIVE | EXPIRED` 生命周期，不进入用户历史列表。
+- 附件只存入 `<RUNTIME_DATA_DIR>/workspaces/<threadId>/.codexplatform/attachments/<attachmentId>/`；
+  目录为 `0700`、文件为 `0600`，浏览器永远不获得服务器绝对路径。
+- 单个附件根最多 50 MiB，单 Turn 200 MiB、32 个附件根、目录最多 500 个文件；不自动解压。
+- Goal 原生 Token 预算与平台 60 分钟 Watchdog 同时生效；预算到达后暂停，不自动重复外部副作用。
+- Plan mode 为 Thread sticky，使用锁定协议中的 collaboration preset；能力探测失败时拒绝启用。
+
 ## 用户端与管理后台
 
 用户端和管理后台共享登录态与后端，但不共享信息架构：
@@ -97,7 +127,16 @@ GET  /api/projects
 POST /api/projects
 GET  /api/threads
 POST /api/threads
+POST /api/threads/drafts
 GET  /api/threads/:id
+DELETE /api/threads/:id/draft
+POST /api/threads/:id/attachments
+DELETE /api/threads/:id/attachments/:attachmentId
+GET /api/threads/:id/goal
+PUT /api/threads/:id/goal
+PATCH /api/threads/:id/goal
+DELETE /api/threads/:id/goal
+PATCH /api/threads/:id/composer
 POST /api/threads/:id/turns
 POST /api/threads/:id/steer
 POST /api/threads/:id/interrupt
