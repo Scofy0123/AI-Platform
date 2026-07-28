@@ -106,6 +106,19 @@ describe("TurnInputBundleSchema", () => {
       createdAt: "2026-07-28T12:00:00.000Z",
     });
     expect(JSON.stringify(attachment)).not.toContain("/private/");
+    expect(
+      DraftAttachmentSchema.parse({
+        ...attachment,
+        name: "report..md",
+        relativePath: ".codexplatform/attachments/attachment-1/report..md",
+      }),
+    ).toMatchObject({ name: "report..md" });
+    expect(() =>
+      DraftAttachmentSchema.parse({
+        ...attachment,
+        relativePath: ".codexplatform/attachments/../secret.md",
+      }),
+    ).toThrow();
 
     expect(
       EffectiveTurnInputSnapshotSchema.parse({

@@ -43,10 +43,11 @@ export interface ProjectRecord {
 }
 
 export interface SteerInputSnapshotRecord extends EffectiveTurnInputSnapshot {
-  deliveryStatus: "PENDING" | "DELIVERED" | "FAILED";
+  deliveryStatus: "PENDING" | "DELIVERED" | "FAILED" | "UNKNOWN";
   deliveryError: string | null;
   deliveredAt: string | null;
   failedAt: string | null;
+  unknownAt: string | null;
 }
 
 export interface AttachmentCleanupJob {
@@ -853,7 +854,7 @@ export class SQLitePlatformStore {
       .prepare(
         `UPDATE steer_input_snapshots
          SET delivery_status = 'DELIVERED', delivery_error = NULL,
-             delivered_at = ?, failed_at = NULL
+             delivered_at = ?, failed_at = NULL, unknown_at = NULL
          WHERE id = ? AND delivery_status = 'PENDING'`,
       )
       .run(now.getTime(), id);
@@ -878,7 +879,7 @@ export class SQLitePlatformStore {
         .prepare(
           `UPDATE steer_input_snapshots
            SET delivery_status = 'FAILED', delivery_error = ?,
-               delivered_at = NULL, failed_at = ?
+               delivered_at = NULL, failed_at = ?, unknown_at = NULL
            WHERE id = ?`,
         )
         .run(error, now.getTime(), id);
@@ -894,20 +895,33 @@ export class SQLitePlatformStore {
     });
   }
 
+  markSteerInputDeliveryUnknown(id: string, error: string, now: Date): void {
+    const result = this.sqlite
+      .prepare(
+        `UPDATE steer_input_snapshots
+         SET delivery_status = 'UNKNOWN', delivery_error = ?,
+             delivered_at = NULL, failed_at = NULL, unknown_at = ?
+         WHERE id = ? AND delivery_status = 'PENDING'`,
+      )
+      .run(error, now.getTime(), id);
+    if (result.changes !== 1) throw new Error("Steer input is not pending");
+  }
+
   listSteerInputSnapshots(turnId: string): SteerInputSnapshotRecord[] {
     const rows = this.sqlite
       .prepare(
         `SELECT prompt, attachments_json, delivery_status, delivery_error,
-                delivered_at, failed_at, captured_at
+                delivered_at, failed_at, unknown_at, captured_at
          FROM steer_input_snapshots WHERE turn_id = ? ORDER BY captured_at, rowid`,
       )
       .all(turnId) as Array<{
       prompt: string;
       attachments_json: string;
-      delivery_status: "PENDING" | "DELIVERED" | "FAILED";
+      delivery_status: "PENDING" | "DELIVERED" | "FAILED" | "UNKNOWN";
       delivery_error: string | null;
       delivered_at: number | null;
       failed_at: number | null;
+      unknown_at: number | null;
       captured_at: number;
     }>;
     return rows.map((row) => ({
@@ -920,6 +934,7 @@ export class SQLitePlatformStore {
       deliveryError: row.delivery_error,
       deliveredAt: row.delivered_at === null ? null : new Date(row.delivered_at).toISOString(),
       failedAt: row.failed_at === null ? null : new Date(row.failed_at).toISOString(),
+      unknownAt: row.unknown_at === null ? null : new Date(row.unknown_at).toISOString(),
     }));
   }
 

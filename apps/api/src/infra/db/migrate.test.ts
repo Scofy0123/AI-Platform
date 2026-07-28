@@ -190,8 +190,65 @@ describe("migrateDatabase", () => {
         (column) => column.name,
       ),
     ).toEqual(
-      expect.arrayContaining(["delivery_status", "delivery_error", "delivered_at", "failed_at"]),
+      expect.arrayContaining([
+        "delivery_status",
+        "delivery_error",
+        "delivered_at",
+        "failed_at",
+        "unknown_at",
+      ]),
     );
+  });
+
+  test("marks snapshots created before delivery tracking as UNKNOWN instead of PENDING", () => {
+    const database = new Database(":memory:");
+    databases.push(database);
+    database.exec(`
+      CREATE TABLE turns (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        codex_turn_id TEXT,
+        prompt TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        duration_ms INTEGER
+      );
+      CREATE TABLE steer_input_snapshots (
+        id TEXT PRIMARY KEY,
+        turn_id TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        attachments_json TEXT NOT NULL,
+        delivery_status TEXT NOT NULL DEFAULT 'PENDING',
+        delivery_error TEXT,
+        delivered_at INTEGER,
+        failed_at INTEGER,
+        captured_at INTEGER NOT NULL
+      );
+      INSERT INTO turns (
+        id, task_id, prompt, status, started_at
+      ) VALUES ('legacy-turn', 'legacy-task', 'Initial', 'RUNNING', 1);
+      INSERT INTO steer_input_snapshots (
+        id, turn_id, prompt, attachments_json, captured_at
+      ) VALUES ('legacy-steer', 'legacy-turn', 'Maybe delivered', '[]', 2);
+    `);
+
+    migrateDatabase(database);
+    migrateDatabase(database);
+
+    expect(
+      database
+        .prepare(
+          `SELECT delivery_status, delivery_error, delivered_at, failed_at
+           FROM steer_input_snapshots WHERE id = 'legacy-steer'`,
+        )
+        .get(),
+    ).toEqual({
+      delivery_status: "UNKNOWN",
+      delivery_error: "Legacy Steer delivery outcome is unknown",
+      delivered_at: null,
+      failed_at: null,
+    });
   });
 
   test("adds persistent session and Feishu connection state without deleting identities", () => {

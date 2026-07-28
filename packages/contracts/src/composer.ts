@@ -87,7 +87,14 @@ export const DraftAttachmentSchema = z
     relativePath: z
       .string()
       .min(1)
-      .refine((value) => !value.startsWith("/") && !value.includes("\0") && !value.includes("..")),
+      .refine(
+        (value) =>
+          !value.startsWith("/") &&
+          !value.includes("\0") &&
+          !value.includes("\\") &&
+          !/^[A-Za-z]:/.test(value) &&
+          !value.split("/").includes(".."),
+      ),
     mimeType: z.string().min(1),
     sizeBytes: z.number().int().nonnegative(),
     fileCount: z.number().int().positive().max(500),

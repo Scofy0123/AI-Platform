@@ -11,6 +11,7 @@ import {
   UserSettingsViewSchema,
 } from "@codexplatform/contracts";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { RpcError } from "../infra/codex/jsonl-rpc-client.js";
 import { createDatabase, type PlatformDatabase } from "../infra/db/database.js";
 import { migrateDatabase } from "../infra/db/migrate.js";
 import { encodeSse } from "../server.js";
@@ -196,7 +197,7 @@ describe("LocalPlatformService", () => {
       ],
     });
 
-    execution.steerTask.mockRejectedValueOnce(new Error("runtime rejected steer"));
+    execution.steerTask.mockRejectedValueOnce(new RpcError(-32000, "runtime rejected steer"));
     await expect(service.steerThread(task.id, "user-1", "不得落库")).rejects.toThrow(
       "runtime rejected steer",
     );
@@ -249,6 +250,7 @@ describe("LocalPlatformService", () => {
         deliveryError: null,
         deliveredAt: NOW.toISOString(),
         failedAt: null,
+        unknownAt: null,
       },
     ]);
     expect(() => store.deleteAttachment(attachment.id, task.id, "user-1")).toThrow(
@@ -291,15 +293,15 @@ describe("LocalPlatformService", () => {
       scanStatus: "READY",
       now: NOW,
     });
-    execution.steerTask.mockRejectedValueOnce(new Error("runtime timeout"));
+    execution.steerTask.mockRejectedValueOnce(new RpcError(-32000, "runtime rejected steer"));
 
     await expect(
       service.steerThread(task.id, "user-1", "", [attachment.id, deletable.id]),
-    ).rejects.toThrow("runtime timeout");
+    ).rejects.toThrow("runtime rejected steer");
     expect(store.listSteerInputSnapshots(platformTurnId)).toEqual([
       expect.objectContaining({
         deliveryStatus: "FAILED",
-        deliveryError: "runtime timeout",
+        deliveryError: "runtime rejected steer",
         deliveredAt: null,
         failedAt: NOW.toISOString(),
       }),
@@ -313,6 +315,61 @@ describe("LocalPlatformService", () => {
     expect(
       store.listSteerInputSnapshots(platformTurnId).map((snapshot) => snapshot.deliveryStatus),
     ).toEqual(["FAILED", "DELIVERED"]);
+  });
+
+  test("marks an uncertain Steer UNKNOWN, preserves its claim, and requires recovery", async () => {
+    const project = await service.createProject("user-1", { name: "Steer uncertain" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Initial");
+    const platformTurnId = (
+      database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+        id: string;
+      }
+    ).id;
+    const attachment = store.createAttachment({
+      id: "steer-uncertain-attachment",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "uncertain.txt",
+      relativePath: ".codexplatform/attachments/steer-uncertain-attachment/uncertain.txt",
+      mimeType: "text/plain",
+      sizeBytes: 9,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    execution.steerTask.mockRejectedValueOnce(new Error("RPC request timed out: turn/steer"));
+
+    await expect(service.steerThread(task.id, "user-1", "", [attachment.id])).rejects.toThrow(
+      "RPC request timed out",
+    );
+
+    expect(store.listSteerInputSnapshots(platformTurnId)).toEqual([
+      expect.objectContaining({
+        deliveryStatus: "UNKNOWN",
+        deliveryError: "RPC request timed out: turn/steer",
+      }),
+    ]);
+    expect(() => store.deleteAttachment(attachment.id, task.id, "user-1")).toThrow(
+      "Attachment is already claimed by a Turn",
+    );
+    expect(store.getTurn(platformTurnId)).toMatchObject({ status: "NEEDS_RECOVERY" });
+    expect(await service.getTask(task.id, "user-1")).toMatchObject({ status: "NEEDS_RECOVERY" });
+    expect(await service.listTaskEvents(task.id, "user-1", 0)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "RECOVERY_REQUIRED",
+          payload: expect.objectContaining({
+            reason: expect.stringContaining("delivery outcome is unknown"),
+          }),
+        }),
+      ]),
+    );
+    await expect(service.steerThread(task.id, "user-1", "", [attachment.id])).rejects.toThrow(
+      "does not accept Steer",
+    );
+    expect(execution.steerTask).toHaveBeenCalledTimes(1);
   });
 
   test("allows Steer only for RUNNING or WAITING_APPROVAL tasks", async () => {

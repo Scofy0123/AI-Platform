@@ -328,6 +328,78 @@ describe("SQLitePlatformStore", () => {
     ).toThrow("Steer input is not pending");
   });
 
+  test("keeps an UNKNOWN Steer attachment claimed because delivery may have occurred", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Unknown delivery", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Unknown",
+      now: NOW,
+    });
+    const turn = store.createTurn({
+      id: "unknown-delivery-turn",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Initial",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    store.setTurnStatus(turn.id, "RUNNING");
+    store.setCurrentTurn(task.id, "runtime-unknown-turn", "RUNNING", NOW);
+    const attachment = store.createAttachment({
+      id: "unknown-delivery-attachment",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "unknown.txt",
+      relativePath: ".codexplatform/attachments/unknown-delivery-attachment/unknown.txt",
+      mimeType: "text/plain",
+      sizeBytes: 7,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    store.claimSteerInput({
+      id: "steer-unknown-1",
+      taskId: task.id,
+      turnId: turn.id,
+      ownerId: "user-1",
+      prompt: "",
+      attachmentIds: [attachment.id],
+      now: NOW,
+    });
+
+    store.markSteerInputDeliveryUnknown(
+      "steer-unknown-1",
+      "RPC request timed out: turn/steer",
+      new Date(NOW.getTime() + 1),
+    );
+
+    expect(store.listSteerInputSnapshots(turn.id)).toEqual([
+      expect.objectContaining({
+        deliveryStatus: "UNKNOWN",
+        deliveryError: "RPC request timed out: turn/steer",
+        deliveredAt: null,
+        failedAt: null,
+        unknownAt: new Date(NOW.getTime() + 1).toISOString(),
+      }),
+    ]);
+    expect(() => store.deleteAttachment(attachment.id, task.id, "user-1")).toThrow(
+      "Attachment is already claimed by a Turn",
+    );
+    expect(() =>
+      store.claimSteerInput({
+        id: "steer-unknown-retry",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-1",
+        prompt: "",
+        attachmentIds: [attachment.id],
+        now: new Date(NOW.getTime() + 2),
+      }),
+    ).toThrow("Attachments must exist, be owned, unclaimed, and READY");
+  });
+
   test("excludes attachments claimed by prior inputs from new Composer upload quotas", () => {
     const project = store.createProject({
       ownerId: "user-1",

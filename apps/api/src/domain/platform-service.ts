@@ -34,6 +34,7 @@ import {
   type UserSettingsView,
 } from "@codexplatform/contracts";
 import type { WeeklyQuota } from "../infra/codex/codex-runtime.js";
+import { RpcError } from "../infra/codex/jsonl-rpc-client.js";
 import type { PlatformApi } from "../web-api.js";
 import type { AccountAdminStore, InternalAccount } from "./account-admin-store.js";
 import {
@@ -807,11 +808,34 @@ export class LocalPlatformService implements PlatformApi {
       }
     } catch (error) {
       try {
-        this.options.store.failSteerInputDelivery(
-          steerInputId,
-          error instanceof Error ? error.message : "Runtime Steer failed",
-          this.now(),
-        );
+        const occurredAt = this.now();
+        const message = error instanceof Error ? error.message : "Runtime Steer failed";
+        if (error instanceof RpcError) {
+          this.options.store.failSteerInputDelivery(steerInputId, message, occurredAt);
+        } else {
+          this.options.store.markSteerInputDeliveryUnknown(steerInputId, message, occurredAt);
+          const recoveryReason =
+            "Steer delivery outcome is unknown after a Runtime transport failure; explicit Turn recovery is required.";
+          this.options.store.markTurnApprovalsForRecovery(taskId, task.currentTurnId);
+          this.finishSchedulerTurn(platformTurnId, "NEEDS_RECOVERY", occurredAt);
+          const schedulerKey = runtimeTurnKey(taskId, task.currentTurnId);
+          if (schedulerKey) this.schedulerTurnByRuntimeTurn.delete(schedulerKey);
+          this.options.store.setTaskInactiveIfCurrent(
+            taskId,
+            task.currentTurnId,
+            "NEEDS_RECOVERY",
+            occurredAt,
+          );
+          const recoveryEvent = this.options.store.appendTaskEvent({
+            taskId,
+            threadId: task.threadId,
+            turnId: platformTurnId,
+            type: "RECOVERY_REQUIRED",
+            payload: { reason: recoveryReason },
+            now: occurredAt,
+          });
+          this.publish(recoveryEvent);
+        }
       } catch (compensationError) {
         throw new AggregateError(
           [error, compensationError],

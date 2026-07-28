@@ -237,6 +237,7 @@ export const steerInputSnapshots = sqliteTable("steer_input_snapshots", {
   deliveryError: text("delivery_error"),
   deliveredAt: integer("delivered_at", { mode: "timestamp_ms" }),
   failedAt: integer("failed_at", { mode: "timestamp_ms" }),
+  unknownAt: integer("unknown_at", { mode: "timestamp_ms" }),
   capturedAt: integer("captured_at", { mode: "timestamp_ms" }).notNull(),
 });
 

@@ -213,10 +213,11 @@ CREATE TABLE IF NOT EXISTS steer_input_snapshots (
   prompt TEXT NOT NULL,
   attachments_json TEXT NOT NULL,
   delivery_status TEXT NOT NULL DEFAULT 'PENDING'
-    CHECK(delivery_status IN ('PENDING', 'DELIVERED', 'FAILED')),
+    CHECK(delivery_status IN ('PENDING', 'DELIVERED', 'FAILED', 'UNKNOWN')),
   delivery_error TEXT,
   delivered_at INTEGER,
   failed_at INTEGER,
+  unknown_at INTEGER,
   captured_at INTEGER NOT NULL
 );
 
@@ -378,6 +379,12 @@ CREATE TABLE IF NOT EXISTS platform_settings (
 `;
 
 export function migrateDatabase(sqlite: Database.Database): void {
+  const steerSnapshotColumns = new Set(
+    (sqlite.pragma("table_info(steer_input_snapshots)") as Array<{ name: string }>).map(
+      (column) => column.name,
+    ),
+  );
+  const trackedSteerOutcomeUncertainty = steerSnapshotColumns.has("unknown_at");
   sqlite.exec(INITIAL_SCHEMA);
   ensureColumn(sqlite, "codex_accounts", "codex_home", "TEXT");
   ensureColumn(sqlite, "codex_accounts", "quota_resets_at", "INTEGER");
@@ -426,6 +433,7 @@ export function migrateDatabase(sqlite: Database.Database): void {
       delivery_error TEXT,
       delivered_at INTEGER,
       failed_at INTEGER,
+      unknown_at INTEGER,
       captured_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS steer_input_snapshots_turn_idx
@@ -454,6 +462,17 @@ export function migrateDatabase(sqlite: Database.Database): void {
   ensureColumn(sqlite, "steer_input_snapshots", "delivery_error", "TEXT");
   ensureColumn(sqlite, "steer_input_snapshots", "delivered_at", "INTEGER");
   ensureColumn(sqlite, "steer_input_snapshots", "failed_at", "INTEGER");
+  ensureColumn(sqlite, "steer_input_snapshots", "unknown_at", "INTEGER");
+  if (!trackedSteerOutcomeUncertainty) {
+    sqlite
+      .prepare(
+        `UPDATE steer_input_snapshots
+         SET delivery_status = 'UNKNOWN',
+             delivery_error = 'Legacy Steer delivery outcome is unknown'
+         WHERE delivery_status = 'PENDING'`,
+      )
+      .run();
+  }
   ensureColumn(sqlite, "queue_entries", "required_account_id", "TEXT");
   ensureColumn(sqlite, "sessions", "persistent_at", "INTEGER");
   ensureColumn(sqlite, "feishu_credentials", "status", "TEXT NOT NULL DEFAULT 'CONNECTED'");
@@ -610,7 +629,8 @@ function ensureColumn(
     | "delivery_status"
     | "delivery_error"
     | "delivered_at"
-    | "failed_at",
+    | "failed_at"
+    | "unknown_at",
   definition:
     | "TEXT"
     | "INTEGER"
