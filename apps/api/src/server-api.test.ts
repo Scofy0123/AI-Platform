@@ -10,9 +10,9 @@ import type {
   UserSettingsView,
 } from "@codexplatform/contracts";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { GoalMutationBlockedByPendingTurnError } from "./domain/errors.js";
 import {
   ActiveTurnResumeConflictError,
-  GoalMutationBlockedByPendingTurnError,
   InvalidThreadResumeResponseError,
   ModelCatalogUnavailableError,
 } from "./domain/platform-service.js";

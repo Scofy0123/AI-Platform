@@ -50,6 +50,7 @@ import {
   MAX_TURN_ATTACHMENT_BYTES,
 } from "./attachments.js";
 import { listComposerCapabilities as buildComposerCapabilities } from "./composer-capabilities.js";
+import { GoalMutationBlockedByPendingTurnError } from "./errors.js";
 import type { LeasedTurn, SQLiteLeaseStore } from "./lease-store.js";
 import type {
   ApprovalTransportIdentity,
@@ -160,15 +161,6 @@ export class InvalidThreadResumeResponseError extends ThreadResumeSafetyError {
   ) {
     super(threadId, null, message);
     this.name = "InvalidThreadResumeResponseError";
-  }
-}
-
-export class GoalMutationBlockedByPendingTurnError extends Error {
-  readonly code = "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN";
-
-  constructor(readonly turnStatus: "ALLOCATING" | "QUEUED") {
-    super(`A ${turnStatus} Turn already froze the Goal input snapshot`);
-    this.name = "GoalMutationBlockedByPendingTurnError";
   }
 }
 

@@ -14,9 +14,9 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import { z } from "zod";
 import type { FeishuConnectionStatus, PlatformUser } from "./auth/auth-store.js";
 import { MAX_TURN_ATTACHMENT_BYTES } from "./domain/attachments.js";
+import { GoalMutationBlockedByPendingTurnError } from "./domain/errors.js";
 import {
   AllocatedModelSelectionChangedError,
-  GoalMutationBlockedByPendingTurnError,
   ModelCatalogUnavailableError,
   ThreadResumeSafetyError,
 } from "./domain/platform-service.js";

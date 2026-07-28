@@ -272,13 +272,13 @@ describe("SQLitePlatformStore", () => {
       status: "ALLOCATING",
       now: NOW,
     });
+    store.completeTurn(first.id, "COMPLETED", new Date(NOW.getTime() + 500));
     store.patchThreadGoal({
       threadId: task.id,
       ownerId: "user-1",
       patch: { objective: "更新后的目标", action: "PAUSE" },
       now: new Date(NOW.getTime() + 1_000),
     });
-    store.completeTurn(first.id, "COMPLETED", new Date(NOW.getTime() + 1_500));
     store.patchThreadGoal({
       threadId: task.id,
       ownerId: "user-1",
@@ -302,6 +302,7 @@ describe("SQLitePlatformStore", () => {
       objective: "更新后的目标",
       status: "ACTIVE",
     });
+    store.completeTurn(second.id, "COMPLETED", new Date(NOW.getTime() + 2_500));
     expect(store.deleteThreadGoal(task.id, "user-1")).toBe(true);
     expect(store.getThreadGoal(task.id, "user-1")).toBeNull();
   });
@@ -427,6 +428,114 @@ describe("SQLitePlatformStore", () => {
       tokensUsed: 200_000,
       timeUsedSeconds: 20,
     });
+  });
+
+  test.each(["PUT", "PATCH", "DELETE"] as const)(
+    "atomically rejects Goal %s after a pending Turn freezes its snapshot",
+    (operation) => {
+      const project = store.createProject({
+        ownerId: "user-1",
+        name: `Atomic ${operation}`,
+        now: NOW,
+      });
+      const task = store.createTask({
+        ownerId: "user-1",
+        projectId: project.id,
+        title: `Atomic ${operation}`,
+        now: NOW,
+      });
+      store.putThreadGoal({
+        threadId: task.id,
+        ownerId: "user-1",
+        objective: "原始 Goal",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+        now: NOW,
+      });
+      const turn = store.createTurn({
+        id: `atomic-${operation.toLowerCase()}`,
+        taskId: task.id,
+        ownerId: "user-1",
+        prompt: "冻结原始 Goal",
+        status: operation === "PUT" ? "ALLOCATING" : "QUEUED",
+        now: new Date(NOW.getTime() + 1),
+      });
+
+      let caught: unknown;
+      try {
+        if (operation === "PUT") {
+          store.putThreadGoal({
+            threadId: task.id,
+            ownerId: "user-1",
+            objective: "替换 Goal",
+            tokenBudget: 100_000,
+            timeBudgetSeconds: 1_800,
+            now: new Date(NOW.getTime() + 2),
+          });
+        } else if (operation === "PATCH") {
+          store.patchThreadGoal({
+            threadId: task.id,
+            ownerId: "user-1",
+            patch: { objective: "修改 Goal" },
+            now: new Date(NOW.getTime() + 2),
+          });
+        } else {
+          store.deleteThreadGoal(task.id, "user-1");
+        }
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toMatchObject({ code: "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN" });
+      expect(store.getThreadGoal(task.id, "user-1")).toMatchObject({
+        objective: "原始 Goal",
+      });
+      expect(store.getTurnInputSnapshot(turn.id)?.goal).toMatchObject({
+        objective: "原始 Goal",
+      });
+      expect(store.getTurn(turn.id)).toMatchObject({
+        status: operation === "PUT" ? "ALLOCATING" : "QUEUED",
+      });
+      expect(database.sqlite.inTransaction).toBe(false);
+    },
+  );
+
+  test("serializes Goal mutation before Turn snapshot creation in the opposite race order", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Atomic order", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Atomic order",
+      now: NOW,
+    });
+    store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "旧 Goal",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+
+    store.patchThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      patch: { objective: "事务先提交的新 Goal" },
+      now: new Date(NOW.getTime() + 1),
+    });
+    const turn = store.createTurn({
+      id: "atomic-opposite-order",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "应冻结新 Goal",
+      status: "ALLOCATING",
+      now: new Date(NOW.getTime() + 2),
+    });
+
+    expect(store.getTurnInputSnapshot(turn.id)?.goal).toMatchObject({
+      objective: "事务先提交的新 Goal",
+    });
+    expect(database.sqlite.inTransaction).toBe(false);
   });
 
   test("tracks Steer delivery and releases failed attachments without marking them delivered", () => {
