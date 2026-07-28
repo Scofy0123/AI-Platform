@@ -1,6 +1,6 @@
 import type { ComposerCapability } from "@codexplatform/contracts";
-import { useState } from "react";
 import { Icon, type IconName } from "../../icons.js";
+import { useDismissiblePopover } from "./useDismissiblePopover.js";
 
 interface ComposerAddMenuProps {
   capabilities: readonly ComposerCapability[];
@@ -20,32 +20,24 @@ export function ComposerAddMenu({
   onSelect,
   disabled = false,
 }: ComposerAddMenuProps) {
-  const [open, setOpen] = useState(false);
+  const { close, open, rootRef, toggle, triggerRef } = useDismissiblePopover<HTMLDivElement>();
 
   return (
-    <div className="composer-add-menu">
+    <div ref={rootRef} className="composer-add-menu">
       <button
+        ref={triggerRef}
         type="button"
         className="composer-add-trigger"
         aria-label="Add files and more"
         aria-haspopup="menu"
         aria-expanded={open}
         disabled={disabled}
-        onClick={() => setOpen((current) => !current)}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") setOpen(false);
-        }}
+        onClick={toggle}
       >
         <Icon name="plus" />
       </button>
       {open ? (
-        <div
-          className="composer-add-popover"
-          role="menu"
-          onKeyDown={(event) => {
-            if (event.key === "Escape") setOpen(false);
-          }}
-        >
+        <div className="composer-add-popover" role="menu">
           {(Object.keys(SECTION_LABELS) as Array<keyof typeof SECTION_LABELS>).map((section) => {
             const items = capabilities.filter((capability) => capability.section === section);
             if (items.length === 0) return null;
@@ -61,7 +53,7 @@ export function ComposerAddMenu({
                     key={capability.id}
                     onClick={() => {
                       if (capability.availability !== "AVAILABLE") return;
-                      setOpen(false);
+                      close({ restoreFocus: true });
                       onSelect(capability);
                     }}
                   >

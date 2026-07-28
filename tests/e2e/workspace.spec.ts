@@ -123,7 +123,8 @@ test("new Thread exposes governed Composer capabilities and submits its Runtime 
   if (process.env.CODEXPLATFORM_CAPTURE_UAT === "1") {
     await page.screenshot({ path: testInfo.outputPath("composer-add-menu.png") });
   }
-  await page.getByRole("button", { name: "Add files and more" }).press("Escape");
+  await page.mouse.click(1000, 40);
+  await expect(page.getByRole("menu")).toHaveCount(0);
 
   await page.getByRole("button", { name: "Execution permissions" }).click();
   await expect(page.getByRole("menuitem", { name: /Full access/ })).toBeDisabled();
@@ -135,6 +136,10 @@ test("new Thread exposes governed Composer capabilities and submits its Runtime 
   const picker = page.getByRole("button", { name: /Model and Effort:/ });
   await expect(picker).toContainText("Fake Standard");
   await expect(picker).toContainText("medium");
+  await picker.click();
+  await expect(page.getByRole("listbox", { name: "Runtime models" })).toBeVisible();
+  await page.mouse.click(1000, 40);
+  await expect(page.getByRole("listbox", { name: "Runtime models" })).toHaveCount(0);
   await picker.click();
   await page.getByRole("option", { name: /Fake Deep/ }).click();
   await expect(picker).toContainText("Fake Deep");

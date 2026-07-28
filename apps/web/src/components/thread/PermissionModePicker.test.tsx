@@ -132,8 +132,28 @@ describe("PermissionModePicker", () => {
         onChange={vi.fn()}
       />,
     );
+    const trigger = screen.getByRole("button", { name: "Execution permissions" });
+    fireEvent.click(trigger);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  test("closes when the user clicks outside the menu", () => {
+    render(
+      <div>
+        <PermissionModePicker
+          value={{ mode: "ASK_FOR_APPROVAL", profileId: null }}
+          options={OPTIONS}
+          onChange={vi.fn()}
+        />
+        <button type="button">Outside</button>
+      </div>,
+    );
+
     fireEvent.click(screen.getByRole("button", { name: "Execution permissions" }));
-    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Outside" }));
+
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 });

@@ -1,5 +1,5 @@
 import type { ModelCatalog, ModelOption } from "@codexplatform/contracts";
-import { useState } from "react";
+import { useDismissiblePopover } from "./useDismissiblePopover.js";
 
 export interface ModelSelection {
   model: string;
@@ -46,7 +46,7 @@ export function ModelEffortPicker({
   loading = false,
   error = false,
 }: ModelEffortPickerProps) {
-  const [open, setOpen] = useState(false);
+  const { close, open, rootRef, toggle, triggerRef } = useDismissiblePopover<HTMLFieldSetElement>();
   const selection = resolveCatalogSelection(catalog, value?.model, value?.reasoningEffort);
   const selectedModel = catalog?.models.find((model) => model.model === selection?.model) ?? null;
 
@@ -70,21 +70,16 @@ export function ModelEffortPicker({
 
   const label = `${selectedModel.displayName} · ${selection.reasoningEffort}`;
   return (
-    <fieldset
-      className="model-effort-picker"
-      aria-label="Model and Effort picker"
-      onKeyDown={(event) => {
-        if (event.key === "Escape") setOpen(false);
-      }}
-    >
+    <fieldset ref={rootRef} className="model-effort-picker" aria-label="Model and Effort picker">
       <button
+        ref={triggerRef}
         type="button"
         className="model-effort-trigger"
         aria-label={`Model and Effort: ${label}`}
         aria-haspopup="listbox"
         aria-expanded={open}
         disabled={disabled}
-        onClick={() => setOpen((current) => !current)}
+        onClick={toggle}
       >
         <span>{selectedModel.displayName}</span>
         <strong>{selection.reasoningEffort}</strong>
@@ -121,7 +116,7 @@ export function ModelEffortPicker({
                   checked={effort.value === selection.reasoningEffort}
                   onChange={() => {
                     onChange(normalizeModelSelection(selectedModel, effort.value));
-                    setOpen(false);
+                    close({ restoreFocus: true });
                   }}
                 />
                 <span>{effort.value}</span>

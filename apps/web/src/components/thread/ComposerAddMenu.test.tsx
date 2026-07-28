@@ -61,4 +61,29 @@ describe("ComposerAddMenu", () => {
     expect(onSelect).toHaveBeenCalledWith(CAPABILITIES[0]);
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
+
+  test("closes when the user clicks outside the menu", () => {
+    render(
+      <div>
+        <ComposerAddMenu capabilities={CAPABILITIES} onSelect={vi.fn()} />
+        <button type="button">Outside</button>
+      </div>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Add files and more" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Outside" }));
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  test("closes on Escape and restores focus to the trigger", () => {
+    render(<ComposerAddMenu capabilities={CAPABILITIES} onSelect={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: "Add files and more" });
+
+    fireEvent.click(trigger);
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
 });

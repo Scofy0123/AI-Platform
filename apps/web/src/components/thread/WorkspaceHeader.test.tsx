@@ -54,7 +54,29 @@ describe("WorkspaceHeader", () => {
   test("does not offer Archive for an active Thread", () => {
     renderHeader(false);
 
-    fireEvent.click(screen.getByRole("button", { name: "Thread actions" }));
+    const trigger = screen.getByRole("button", { name: "Thread actions" });
+    fireEvent.click(trigger);
     expect(screen.queryByRole("menuitem", { name: "Archive Thread" })).not.toBeInTheDocument();
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("closes the Thread menu when the user clicks outside", () => {
+    renderHeader();
+
+    fireEvent.click(screen.getByRole("button", { name: "Thread actions" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Toggle pinned summary" }));
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  test("closes the Thread menu on Escape and restores focus", () => {
+    renderHeader();
+    const trigger = screen.getByRole("button", { name: "Thread actions" });
+
+    fireEvent.click(trigger);
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
   });
 });
