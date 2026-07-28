@@ -319,6 +319,22 @@ function registerRoutes(
     return reply.code(201).send(await platform.createDraft(actor.user.id, body));
   });
 
+  app.get("/api/threads/:id/draft", async (request, reply) => {
+    const actor = requireSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    const draft = await platform.getDraft(id, actor.user.id);
+    return draft ?? reply.code(404).send({ error: "Draft not found" });
+  });
+
+  app.get("/api/threads/:id/composer", async (request, reply) => {
+    const actor = requireSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    const composer = await platform.getThreadComposer(id, actor.user.id);
+    return composer ?? reply.code(404).send({ error: "Composer state not found" });
+  });
+
   app.delete("/api/threads/:id/draft", async (request, reply) => {
     const actor = requireWriteSession(request, reply, auth);
     if (!actor) return;

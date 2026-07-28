@@ -747,6 +747,27 @@ describe("LocalPlatformService", () => {
     await expect(service.listThreadEvents(draft.id, "user-1", 0)).resolves.toBeNull();
   });
 
+  test("restores a hidden Draft only to its owner with its Composer state", async () => {
+    const project = await service.createProject("user-1", { name: "Restore Draft" });
+    const draft = await service.createDraft("user-1", { projectId: project.id });
+    await service.patchThreadComposer(draft.id, "user-1", {
+      planMode: true,
+      revision: 0,
+    });
+
+    await expect(service.getDraft(draft.id, "user-1")).resolves.toEqual({
+      id: draft.id,
+      projectId: project.id,
+      lifecycleState: "DRAFT",
+    });
+    await expect(service.getThreadComposer(draft.id, "user-1")).resolves.toEqual({
+      planMode: true,
+      revision: 1,
+    });
+    await expect(service.getDraft(draft.id, "user-2")).resolves.toBeNull();
+    await expect(service.getThreadComposer(draft.id, "user-2")).resolves.toBeNull();
+  });
+
   test("maintenance expires Drafts with their files idempotently using its supplied clock", async () => {
     const project = await service.createProject("user-1", { name: "Draft maintenance" });
     const draft = await service.createDraft("user-1", { projectId: project.id });

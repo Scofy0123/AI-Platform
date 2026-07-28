@@ -2188,6 +2188,7 @@ tbody tr:hover {
 }
 
 .v11-composer {
+  position: relative;
   width: min(760px, calc(100vw - var(--v11-sidebar-width) - 80px));
   padding: 13px 14px 11px;
   border: 1px solid #3b383f;
@@ -2241,16 +2242,44 @@ tbody tr:hover {
   font-size: 12px;
 }
 
-.composer-resources:empty {
-  display: none;
-}
-
 .composer-resources {
   display: grid;
   gap: 8px;
   margin: 0 5px 9px;
   padding: 0;
   border: 0;
+}
+
+.composer-resources.is-dragging {
+  position: absolute;
+  z-index: 54;
+  inset: 6px;
+  min-height: 72px;
+  place-items: center;
+  margin: 0;
+  padding: 10px;
+  border: 1px dashed rgba(174, 139, 236, 0.72);
+  border-radius: 15px;
+  background: rgba(34, 33, 38, 0.94);
+  backdrop-filter: blur(4px);
+}
+
+.composer-resources.is-dragging > :not(.composer-drop-hint) {
+  visibility: hidden;
+}
+
+.composer-drop-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #c8b4ee;
+  font-size: 12px;
+  font-weight: 560;
+}
+
+.composer-drop-hint svg {
+  width: 16px;
+  height: 16px;
 }
 
 .composer-attachment-chips {

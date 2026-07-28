@@ -442,6 +442,7 @@ function NewThreadPage() {
       return created.id;
     },
     onSuccess: async (id) => {
+      composer.markActivated();
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["projects"] }),
         queryClient.invalidateQueries({ queryKey: ["threads"] }),
@@ -491,6 +492,7 @@ function NewThreadPage() {
           goal={composer.goal}
           goalEditorOpen={composer.goalEditorOpen}
           onChooseFiles={(files) => void composer.chooseFiles(files)}
+          onDropError={composer.reportError}
           onRemoveAttachment={(attachment) => void composer.removeAttachment(attachment)}
           onSaveGoal={(input) => void composer.saveGoal(input)}
           onGoalAction={(action) => void composer.goalAction(action)}
@@ -1043,6 +1045,7 @@ function ThreadPage() {
                 goal={composer.goal}
                 goalEditorOpen={composer.goalEditorOpen}
                 onChooseFiles={(files) => void composer.chooseFiles(files)}
+                onDropError={composer.reportError}
                 onRemoveAttachment={(attachment) => void composer.removeAttachment(attachment)}
                 onSaveGoal={(input) => void composer.saveGoal(input)}
                 onGoalAction={(goalAction) => void composer.goalAction(goalAction)}

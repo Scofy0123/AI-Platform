@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 
 import type { DraftAttachment, ThreadGoalView } from "@codexplatform/contracts";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { ComposerResources } from "./ComposerResources.js";
+import { ComposerResources, readDroppedFiles } from "./ComposerResources.js";
 
 afterEach(cleanup);
 
@@ -50,12 +50,73 @@ describe("ComposerResources", () => {
       />,
     );
 
-    expect(screen.getByRole("listitem", { name: "spec.md · 1 KB · Ready" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("listitem", { name: "spec.md · Markdown · 1 KB · Ready" }),
+    ).toBeInTheDocument();
     const dropped = new File(["draft"], "draft.md", { type: "text/markdown" });
     fireEvent.drop(screen.getByTestId("composer-drop-zone"), {
       dataTransfer: { files: [dropped] },
     });
-    expect(onChooseFiles).toHaveBeenCalledWith([dropped]);
+    return waitFor(() => expect(onChooseFiles).toHaveBeenCalledWith([dropped]));
+  });
+
+  test("keeps an invisible empty drop target and shows compact drag-over feedback", async () => {
+    render(
+      <ComposerResources
+        attachments={[]}
+        goal={null}
+        goalEditorOpen={false}
+        onChooseFiles={vi.fn()}
+        onDropError={vi.fn()}
+        onRemoveAttachment={vi.fn()}
+        onSaveGoal={vi.fn()}
+        onGoalAction={vi.fn()}
+        onClearGoal={vi.fn()}
+        onCloseGoal={vi.fn()}
+      />,
+    );
+
+    const zone = screen.getByTestId("composer-drop-zone");
+    expect(zone).toBeInTheDocument();
+    expect(zone).toHaveAttribute("data-drag-active", "false");
+
+    fireEvent.dragEnter(document, { dataTransfer: { types: ["Files"] } });
+    await waitFor(() => expect(zone).toHaveAttribute("data-drag-active", "true"));
+    expect(screen.getByText("Drop files or folders")).toBeVisible();
+  });
+
+  test("recursively reads dropped directories and preserves relative paths", async () => {
+    const nested = new File(["nested"], "nested.md", { type: "text/markdown" });
+    const top = new File(["top"], "top.txt", { type: "text/plain" });
+    const directory = directoryEntry("reports", [
+      fileEntry("top.txt", top),
+      directoryEntry("assets", [fileEntry("nested.md", nested)]),
+    ]);
+    const dataTransfer = {
+      items: [{ kind: "file", webkitGetAsEntry: () => directory }],
+      files: [top, nested],
+    } as unknown as DataTransfer;
+
+    const files = await readDroppedFiles(dataTransfer);
+
+    expect(files).toEqual([top, nested]);
+    expect(files.map((file) => file.webkitRelativePath)).toEqual([
+      "reports/top.txt",
+      "reports/assets/nested.md",
+    ]);
+  });
+
+  test("rejects oversized dropped files with an explicit client limit", async () => {
+    const oversized = new File(["x"], "huge.bin");
+    Object.defineProperty(oversized, "size", { value: 50 * 1024 * 1024 + 1 });
+    const dataTransfer = {
+      items: [],
+      files: [oversized],
+    } as unknown as DataTransfer;
+
+    await expect(readDroppedFiles(dataTransfer)).rejects.toThrow(
+      "huge.bin exceeds the 50 MiB file limit",
+    );
   });
 
   test("keeps failed scanning visible and reports that submission is blocked", () => {
@@ -103,7 +164,7 @@ describe("ComposerResources", () => {
       />,
     );
 
-    expect(screen.getAllByText("60 min · 200k tokens · Synced")).toHaveLength(2);
+    expect(screen.getByText("ACTIVE · 10/60 min · 10k/200k tokens · Synced")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Goal objective"), {
       target: { value: "持续完成真实 UAT" },
     });
@@ -118,3 +179,40 @@ describe("ComposerResources", () => {
     expect(onGoalAction).toHaveBeenCalledWith("PAUSE");
   });
 });
+
+interface TestEntry {
+  isFile: boolean;
+  isDirectory: boolean;
+  name: string;
+}
+
+function fileEntry(name: string, file: File): TestEntry {
+  return {
+    isFile: true,
+    isDirectory: false,
+    name,
+    file(success: (value: File) => void) {
+      success(file);
+    },
+  } as TestEntry;
+}
+
+function directoryEntry(name: string, children: TestEntry[]): TestEntry {
+  let delivered = false;
+  return {
+    isFile: false,
+    isDirectory: true,
+    name,
+    createReader() {
+      return {
+        readEntries(success: (entries: TestEntry[]) => void) {
+          if (delivered) success([]);
+          else {
+            delivered = true;
+            success(children);
+          }
+        },
+      };
+    },
+  } as TestEntry;
+}

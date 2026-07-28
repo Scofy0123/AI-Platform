@@ -1306,6 +1306,34 @@ describe("CodexPlatform HTTP API", () => {
     expect(platform.deleteDraft).toHaveBeenCalledWith("draft-1", "user-1");
   });
 
+  test("restores an owner-scoped hidden Draft and its Composer state", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const draft = await app.inject({
+      method: "GET",
+      url: "/api/threads/draft-1/draft",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const composer = await app.inject({
+      method: "GET",
+      url: "/api/threads/draft-1/composer",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    expect(draft.statusCode).toBe(200);
+    expect(draft.json()).toEqual({
+      id: "draft-1",
+      projectId: "project-1",
+      lifecycleState: "DRAFT",
+    });
+    expect(composer.statusCode).toBe(200);
+    expect(composer.json()).toEqual({ planMode: true, revision: 2 });
+    expect(platform.getDraft).toHaveBeenCalledWith("draft-1", "user-1");
+    expect(platform.getThreadComposer).toHaveBeenCalledWith("draft-1", "user-1");
+  });
+
   test("does not expose a Draft through legacy task detail or event routes", async () => {
     const { auth, platform } = services();
     platform.getTask.mockResolvedValue(null);
@@ -1901,6 +1929,12 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       lifecycleState: "DRAFT" as const,
       expiresAt: "2026-07-28T13:00:00.000Z",
     })),
+    getDraft: vi.fn(async () => ({
+      id: "draft-1",
+      projectId: "project-1",
+      lifecycleState: "DRAFT" as const,
+    })),
+    getThreadComposer: vi.fn(async () => ({ planMode: true, revision: 2 })),
     deleteDraft: vi.fn(async () => undefined),
     uploadAttachment: vi.fn(async () => ({
       id: "attachment-1",

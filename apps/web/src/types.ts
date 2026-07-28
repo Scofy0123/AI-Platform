@@ -206,6 +206,11 @@ export interface PlatformApi {
     config?: EffectiveConfigOverride;
   }): Promise<Thread>;
   createDraft?(input: { projectId: string }): Promise<{ id: string }>;
+  getDraft?(threadId: string): Promise<{
+    id: string;
+    projectId: string;
+    lifecycleState: "DRAFT";
+  }>;
   deleteDraft?(threadId: string): Promise<void>;
   uploadAttachments?(threadId: string, files: readonly File[]): Promise<DraftAttachment>;
   listThreadAttachments?(threadId: string): Promise<DraftAttachment[]>;
@@ -216,6 +221,7 @@ export interface PlatformApi {
   deleteThreadGoal?(
     threadId: string,
   ): Promise<{ cleared: true; runtimeSyncState: "PENDING" | "SYNCED" }>;
+  getThreadComposer?(threadId: string): Promise<ComposerState>;
   patchThreadComposer?(threadId: string, patch: ComposerStatePatch): Promise<ComposerState>;
   startThreadTurn?(
     threadId: string,

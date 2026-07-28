@@ -42,6 +42,7 @@ try {
     DATABASE_PATH: databasePath,
     RUNTIME_DATA_DIR: runtimeDataDirectory,
     RUNTIME_MODE: "fake",
+    CODEXPLATFORM_FAKE_WORKFLOW_DELAY_MS: "2000",
     FEISHU_APP_ID: "cli_e2e_fake",
     FEISHU_APP_SECRET: e2eCanaries.credentialSecret,
     FEISHU_TENANT_KEY: e2eIdentity.tenantKey,

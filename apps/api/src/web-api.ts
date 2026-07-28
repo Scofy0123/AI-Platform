@@ -48,6 +48,11 @@ export interface PlatformApi {
     input: { projectId: string; title: string; config?: EffectiveConfigOverride },
   ): Promise<Thread>;
   createDraft(userId: string, input: { projectId: string }): Promise<unknown>;
+  getDraft(
+    threadId: string,
+    userId: string,
+  ): Promise<{ id: string; projectId: string; lifecycleState: "DRAFT" } | null>;
+  getThreadComposer(threadId: string, userId: string): Promise<ComposerState | null>;
   deleteDraft(threadId: string, userId: string): Promise<void>;
   uploadAttachment(
     threadId: string,

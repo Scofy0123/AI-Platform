@@ -553,6 +553,20 @@ export class LocalPlatformService implements PlatformApi {
     });
   }
 
+  async getDraft(
+    threadId: string,
+    userId: string,
+  ): Promise<{ id: string; projectId: string; lifecycleState: "DRAFT" } | null> {
+    const task = this.options.store.getTaskForUser(threadId, userId);
+    return task?.lifecycleState === "DRAFT"
+      ? { id: task.id, projectId: task.projectId, lifecycleState: "DRAFT" }
+      : null;
+  }
+
+  async getThreadComposer(threadId: string, userId: string): Promise<ComposerState | null> {
+    return this.options.store.getComposerState(threadId, userId);
+  }
+
   async deleteDraft(threadId: string, userId: string): Promise<void> {
     this.options.store.deleteDraft(threadId, userId, this.now());
     await this.processAttachmentCleanupJobs(this.now());

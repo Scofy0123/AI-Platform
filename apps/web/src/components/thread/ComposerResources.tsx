@@ -24,6 +24,7 @@ interface ComposerResourcesProps {
   goal: ThreadGoalView | null;
   goalEditorOpen: boolean;
   onChooseFiles(files: readonly File[]): void;
+  onDropError?(message: string): void;
   onRemoveAttachment(attachment: ComposerAttachment): void;
   onSaveGoal(input: ThreadGoalInput): void;
   onGoalAction(action: NonNullable<ThreadGoalPatch["action"]>): void;
@@ -37,6 +38,7 @@ export function ComposerResources({
   goal,
   goalEditorOpen,
   onChooseFiles,
+  onDropError,
   onRemoveAttachment,
   onSaveGoal,
   onGoalAction,
@@ -45,34 +47,71 @@ export function ComposerResources({
   goalBusy = false,
 }: ComposerResourcesProps) {
   const [objective, setObjective] = useState(goal?.objective ?? "");
+  const [dragActive, setDragActive] = useState(false);
 
   useEffect(() => {
     setObjective(goal?.objective ?? "");
   }, [goal?.objective]);
 
+  useEffect(() => {
+    const showDropTarget = (event: DragEvent) => {
+      if (event.dataTransfer?.types.includes("Files")) setDragActive(true);
+    };
+    const hideDropTarget = () => setDragActive(false);
+    document.addEventListener("dragenter", showDropTarget);
+    document.addEventListener("dragend", hideDropTarget);
+    document.addEventListener("drop", hideDropTarget);
+    return () => {
+      document.removeEventListener("dragenter", showDropTarget);
+      document.removeEventListener("dragend", hideDropTarget);
+      document.removeEventListener("drop", hideDropTarget);
+    };
+  }, []);
+
   return (
     <fieldset
-      className="composer-resources"
+      className={`composer-resources${dragActive ? " is-dragging" : ""}`}
       data-testid="composer-drop-zone"
+      data-drag-active={dragActive}
       aria-label="Composer resources"
       onDragOver={(event) => {
         if (event.dataTransfer.types.includes("Files")) event.preventDefault();
       }}
+      onDragLeave={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+          setDragActive(false);
+        }
+      }}
       onDrop={(event) => {
         event.preventDefault();
-        const files = Array.from(event.dataTransfer.files);
-        if (files.length > 0) onChooseFiles(files);
+        setDragActive(false);
+        void readDroppedFiles(event.dataTransfer)
+          .then((files) => {
+            if (files.length > 0) onChooseFiles(files);
+          })
+          .catch((cause: unknown) => {
+            onDropError?.(cause instanceof Error ? cause.message : "Unable to read dropped files");
+          });
       }}
     >
+      {dragActive ? (
+        <span className="composer-drop-hint" aria-live="polite">
+          <Icon name="file" />
+          Drop files or folders
+        </span>
+      ) : null}
       {attachments.length > 0 ? (
         <ul className="composer-attachment-chips" aria-label="Attached files">
           {attachments.map((attachment) => {
             const key = "id" in attachment ? attachment.id : attachment.localId;
             const state = attachmentStateLabel(attachment.scanStatus);
+            const type = attachmentTypeLabel(attachment);
             return (
               <li
                 className={`composer-attachment-chip status-${attachment.scanStatus.toLowerCase()}`}
-                aria-label={`${attachment.name} · ${formatBytes(attachment.sizeBytes)} · ${state}`}
+                aria-label={`${attachment.name} · ${type} · ${formatBytes(
+                  attachment.sizeBytes,
+                )} · ${state}`}
                 key={key}
               >
                 <Icon
@@ -81,7 +120,7 @@ export function ComposerResources({
                 <span>
                   <strong>{attachment.name}</strong>
                   <small>
-                    {formatBytes(attachment.sizeBytes)} · {state}
+                    {type} · {formatBytes(attachment.sizeBytes)} · {state}
                   </small>
                 </span>
                 <button
@@ -124,7 +163,8 @@ export function ComposerResources({
           </label>
           <div className="composer-goal-actions">
             <span>
-              60 min · 200k tokens · {goal ? syncLabel(goal.runtimeSyncState) : "Pending"}
+              60 min limit · 200k token limit ·{" "}
+              {goal ? syncLabel(goal.runtimeSyncState) : "Pending"}
             </span>
             <button type="button" onClick={onCloseGoal}>
               Cancel
@@ -224,7 +264,134 @@ function syncLabel(state: ThreadGoalView["runtimeSyncState"]) {
 }
 
 function goalBudgetLabel(goal: ThreadGoalView) {
-  return `${Math.round(goal.timeBudgetSeconds / 60)} min · ${Math.round(
-    goal.tokenBudget / 1_000,
-  )}k tokens · ${syncLabel(goal.runtimeSyncState)}`;
+  const status = goal.runtimeSyncState === "NEEDS_RECOVERY" ? "NEEDS_RECOVERY" : goal.status;
+  return `${status} · ${Math.round(goal.timeUsedSeconds / 60)}/${Math.round(
+    goal.timeBudgetSeconds / 60,
+  )} min · ${formatTokenCount(goal.tokensUsed)}/${formatTokenCount(
+    goal.tokenBudget,
+  )} tokens · ${syncLabel(goal.runtimeSyncState)}`;
+}
+
+function formatTokenCount(tokens: number) {
+  if (tokens < 1_000) return String(tokens);
+  return `${Math.round(tokens / 1_000)}k`;
+}
+
+function attachmentTypeLabel(attachment: ComposerAttachment) {
+  if (attachment.mimeType === "application/x-directory") return "Folder";
+  const extension = attachment.name.split(".").at(-1)?.toLowerCase();
+  const known = {
+    "application/pdf": "PDF",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "Word",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "Excel",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "PowerPoint",
+    "text/markdown": "Markdown",
+    "text/plain": "Text",
+    "application/json": "JSON",
+  } as const;
+  if (attachment.mimeType in known) {
+    return known[attachment.mimeType as keyof typeof known];
+  }
+  if (attachment.mimeType.startsWith("image/")) {
+    return extension ? `${extension.toUpperCase()} image` : "Image";
+  }
+  return extension && extension !== attachment.name.toLowerCase()
+    ? extension.toUpperCase()
+    : "File";
+}
+
+const MAX_DROPPED_ROOTS = 32;
+const MAX_DROPPED_FILES = 500;
+const MAX_DROPPED_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_DROPPED_TOTAL_BYTES = 200 * 1024 * 1024;
+
+interface LegacyFileSystemEntry {
+  isFile: boolean;
+  isDirectory: boolean;
+  name: string;
+}
+
+interface LegacyFileSystemFileEntry extends LegacyFileSystemEntry {
+  file(success: (file: File) => void, error?: (cause: DOMException) => void): void;
+}
+
+interface LegacyFileSystemDirectoryEntry extends LegacyFileSystemEntry {
+  createReader(): {
+    readEntries(
+      success: (entries: LegacyFileSystemEntry[]) => void,
+      error?: (cause: DOMException) => void,
+    ): void;
+  };
+}
+
+export async function readDroppedFiles(dataTransfer: DataTransfer): Promise<File[]> {
+  const items = Array.from(dataTransfer.items ?? []);
+  const entries = items.flatMap((item) => {
+    if (item.kind !== "file") return [];
+    const entry = (
+      item as DataTransferItem & {
+        webkitGetAsEntry?: () => LegacyFileSystemEntry | null;
+      }
+    ).webkitGetAsEntry?.();
+    return entry ? [entry] : [];
+  });
+  if (entries.length > MAX_DROPPED_ROOTS) {
+    throw new Error(`Drop supports at most ${MAX_DROPPED_ROOTS} attachment roots`);
+  }
+  const files =
+    entries.length > 0
+      ? (await Promise.all(entries.map((entry) => readFileSystemEntry(entry, entry.name)))).flat()
+      : Array.from(dataTransfer.files ?? []);
+  validateDroppedFiles(files);
+  return files;
+}
+
+async function readFileSystemEntry(
+  entry: LegacyFileSystemEntry,
+  relativePath: string,
+): Promise<File[]> {
+  if (entry.isFile) {
+    const file = await new Promise<File>((resolve, reject) => {
+      (entry as LegacyFileSystemFileEntry).file(resolve, reject);
+    });
+    Object.defineProperty(file, "webkitRelativePath", {
+      configurable: true,
+      value: relativePath,
+    });
+    return [file];
+  }
+  if (!entry.isDirectory) return [];
+  const reader = (entry as LegacyFileSystemDirectoryEntry).createReader();
+  const children: LegacyFileSystemEntry[] = [];
+  while (true) {
+    const batch = await new Promise<LegacyFileSystemEntry[]>((resolve, reject) => {
+      reader.readEntries(resolve, reject);
+    });
+    if (batch.length === 0) break;
+    children.push(...batch);
+    if (children.length > MAX_DROPPED_FILES) {
+      throw new Error(`Dropped folder exceeds the ${MAX_DROPPED_FILES} file limit`);
+    }
+  }
+  return (
+    await Promise.all(
+      children.map((child) => readFileSystemEntry(child, `${relativePath}/${child.name}`)),
+    )
+  ).flat();
+}
+
+function validateDroppedFiles(files: readonly File[]) {
+  if (files.length > MAX_DROPPED_FILES) {
+    throw new Error(`Dropped folder exceeds the ${MAX_DROPPED_FILES} file limit`);
+  }
+  let totalBytes = 0;
+  for (const file of files) {
+    if (file.size > MAX_DROPPED_FILE_BYTES) {
+      throw new Error(`${file.name} exceeds the 50 MiB file limit`);
+    }
+    totalBytes += file.size;
+  }
+  if (totalBytes > MAX_DROPPED_TOTAL_BYTES) {
+    throw new Error("Dropped files exceed the 200 MiB Turn limit");
+  }
 }

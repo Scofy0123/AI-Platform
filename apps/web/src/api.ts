@@ -188,6 +188,7 @@ export const httpApi: PlatformApi = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  getDraft: (threadId) => request(`/api/threads/${encodeURIComponent(threadId)}/draft`),
   deleteDraft: (threadId) =>
     request<void>(`/api/threads/${encodeURIComponent(threadId)}/draft`, {
       method: "DELETE",
@@ -224,6 +225,7 @@ export const httpApi: PlatformApi = {
     request(`/api/threads/${encodeURIComponent(threadId)}/goal`, {
       method: "DELETE",
     }),
+  getThreadComposer: (threadId) => request(`/api/threads/${encodeURIComponent(threadId)}/composer`),
   patchThreadComposer: (threadId, patch) =>
     request(`/api/threads/${encodeURIComponent(threadId)}/composer`, {
       method: "PATCH",

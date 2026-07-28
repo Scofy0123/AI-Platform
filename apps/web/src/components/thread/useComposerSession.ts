@@ -5,13 +5,15 @@ import type {
   ThreadGoalPatch,
   ThreadGoalView,
 } from "@codexplatform/contracts";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { PlatformApi } from "../../types.js";
 import {
   type ComposerAttachment,
   composerAttachmentsBlockSubmission,
   type PendingComposerAttachment,
 } from "./ComposerResources.js";
+
+const DRAFT_SESSION_KEY = "codexplatform.composer-draft.v1";
 
 interface UseComposerSessionInput {
   api: PlatformApi;
@@ -36,6 +38,8 @@ export function useComposerSession({
   const [error, setError] = useState<string | null>(null);
   const resourceThreadIdRef = useRef(threadId ?? null);
   const draftPromiseRef = useRef<Promise<string> | null>(null);
+  const restorePromiseRef = useRef<Promise<string | null> | null>(null);
+  const restoreAttemptedRef = useRef(false);
   const revisionRef = useRef(initialComposerState?.revision ?? 0);
   const pendingSequenceRef = useRef(0);
   const initialPlanMode = initialComposerState?.planMode ?? false;
@@ -51,7 +55,62 @@ export function useComposerSession({
     setComposerRevision(initialComposerRevision);
     revisionRef.current = initialComposerRevision;
     draftPromiseRef.current = null;
+    restorePromiseRef.current = null;
+    restoreAttemptedRef.current = false;
   }, [initialComposerRevision, initialPlanMode, threadId]);
+
+  const restoreStoredDraft = useCallback(async (): Promise<string | null> => {
+    if (threadId || restoreAttemptedRef.current) return resourceThreadIdRef.current;
+    if (restorePromiseRef.current) return restorePromiseRef.current;
+    restoreAttemptedRef.current = true;
+    const stored = readStoredDraft();
+    if (!stored || !api.getDraft) return null;
+    const pending = (async () => {
+      try {
+        const restored = await api.getDraft?.(stored.draftId);
+        if (!restored || restored.projectId !== stored.projectId) {
+          clearStoredDraft();
+          return null;
+        }
+        const [loadedAttachments, loadedGoal, loadedComposer] = await Promise.all([
+          api.listThreadAttachments?.(restored.id) ?? Promise.resolve([]),
+          api.getThreadGoal
+            ? api.getThreadGoal(restored.id).catch((cause: unknown) => {
+                if (hasStatus(cause, 404)) return null;
+                throw cause;
+              })
+            : Promise.resolve(null),
+          api.getThreadComposer?.(restored.id) ?? Promise.resolve({ planMode: false, revision: 0 }),
+        ]);
+        resourceThreadIdRef.current = restored.id;
+        setResourceThreadId(restored.id);
+        setAttachments(loadedAttachments);
+        setGoal(loadedGoal);
+        revisionRef.current = loadedComposer.revision;
+        setComposerRevision(loadedComposer.revision);
+        setPlanMode(loadedComposer.planMode);
+        return restored.id;
+      } catch (cause) {
+        if (hasStatus(cause, 404)) {
+          clearStoredDraft();
+          return null;
+        }
+        setError(errorMessage(cause));
+        return null;
+      }
+    })();
+    restorePromiseRef.current = pending;
+    try {
+      return await pending;
+    } finally {
+      restorePromiseRef.current = null;
+    }
+  }, [api, threadId]);
+
+  useEffect(() => {
+    if (threadId) return;
+    void restoreStoredDraft();
+  }, [restoreStoredDraft, threadId]);
 
   useEffect(() => {
     if (!threadId || !api.getThreadGoal) {
@@ -105,6 +164,8 @@ export function useComposerSession({
 
   const ensureResourceThread = async (): Promise<string> => {
     if (resourceThreadIdRef.current) return resourceThreadIdRef.current;
+    const restored = await restoreStoredDraft();
+    if (restored) return restored;
     if (draftPromiseRef.current) return draftPromiseRef.current;
     if (!api.createDraft) throw new Error("Draft endpoint unavailable");
     const pending = (async () => {
@@ -113,6 +174,7 @@ export function useComposerSession({
       if (!created) throw new Error("Draft endpoint unavailable");
       resourceThreadIdRef.current = created.id;
       setResourceThreadId(created.id);
+      storeDraft({ draftId: created.id, projectId });
       return created.id;
     })();
     draftPromiseRef.current = pending;
@@ -129,8 +191,7 @@ export function useComposerSession({
     await runBusy(async () => {
       const targetThreadId = await ensureResourceThread();
       if (!api.uploadAttachments) throw new Error("Attachment upload endpoint unavailable");
-      const folderSelection = files.some((file) => Boolean(file.webkitRelativePath?.length));
-      const groups = folderSelection ? [Array.from(files)] : files.map((file) => [file]);
+      const groups = groupFilesByAttachmentRoot(files);
       await Promise.all(
         groups.map(async (group) => {
           const localId = `upload-${++pendingSequenceRef.current}`;
@@ -265,7 +326,36 @@ export function useComposerSession({
     clearGoal,
     togglePlanMode,
     clearSubmittedAttachments,
+    markActivated: clearStoredDraft,
+    reportError: (message: string) => setError(message),
   };
+}
+
+function readStoredDraft(): { draftId: string; projectId: string } | null {
+  if (typeof sessionStorage === "undefined") return null;
+  const raw = sessionStorage.getItem(DRAFT_SESSION_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof parsed.draftId !== "string" || typeof parsed.projectId !== "string") {
+      clearStoredDraft();
+      return null;
+    }
+    return { draftId: parsed.draftId, projectId: parsed.projectId };
+  } catch {
+    clearStoredDraft();
+    return null;
+  }
+}
+
+function storeDraft(value: { draftId: string; projectId: string }) {
+  if (typeof sessionStorage === "undefined") return;
+  sessionStorage.setItem(DRAFT_SESSION_KEY, JSON.stringify(value));
+}
+
+function clearStoredDraft() {
+  if (typeof sessionStorage === "undefined") return;
+  sessionStorage.removeItem(DRAFT_SESSION_KEY);
 }
 
 function pendingAttachment(localId: string, files: readonly File[]): PendingComposerAttachment {
@@ -303,4 +393,17 @@ function mergeComposerAttachments(
 
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : "Composer operation failed";
+}
+
+function groupFilesByAttachmentRoot(files: readonly File[]): File[][] {
+  const groups = new Map<string, File[]>();
+  files.forEach((file, index) => {
+    const relativePath = file.webkitRelativePath;
+    const root = relativePath ? relativePath.split("/")[0] || file.name : `file:${index}`;
+    const key = relativePath ? `folder:${root}` : root;
+    const group = groups.get(key) ?? [];
+    group.push(file);
+    groups.set(key, group);
+  });
+  return [...groups.values()];
 }

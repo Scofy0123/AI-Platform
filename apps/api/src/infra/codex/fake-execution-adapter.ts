@@ -19,6 +19,7 @@ import type { WeeklyQuota } from "./codex-runtime.js";
 export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionAdapter {
   private readonly active = new Map<string, { taskId: string; turnId: string }>();
   private readonly goalByThread = new Map<string, ThreadGoalSnapshot>();
+  private readonly workflowDelayMs = readFakeWorkflowDelay();
 
   async readGoalCapability(_account: InternalAccount): Promise<GoalRuntimeCapability> {
     return { availability: "AVAILABLE", reasonCode: null, reason: null };
@@ -126,7 +127,16 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
     }
     const turnId = `fake-turn-${randomUUID()}`;
     this.active.set(threadId, { taskId: input.taskId, turnId });
-    setImmediate(() => this.emitWorkflow(input.taskId, threadId, turnId, input.prompt, input.cwd));
+    if (this.workflowDelayMs > 0) {
+      setTimeout(
+        () => this.emitWorkflow(input.taskId, threadId, turnId, input.prompt, input.cwd),
+        this.workflowDelayMs,
+      );
+    } else {
+      setImmediate(() =>
+        this.emitWorkflow(input.taskId, threadId, turnId, input.prompt, input.cwd),
+      );
+    }
     return { threadId, turnId };
   }
 
@@ -288,6 +298,11 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
     for (const event of events) this.emit("taskEvent", event);
     this.active.delete(threadId);
   }
+}
+
+function readFakeWorkflowDelay(): number {
+  const configured = Number(process.env.CODEXPLATFORM_FAKE_WORKFLOW_DELAY_MS ?? 0);
+  return Number.isFinite(configured) && configured > 0 ? Math.min(configured, 10_000) : 0;
 }
 
 const FAKE_MODEL_OPTIONS = [

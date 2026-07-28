@@ -131,6 +131,29 @@ describe("HTTP API adapter", () => {
     );
   });
 
+  test("validates and restores an owner Draft with its Composer state", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({ id: "draft-1", projectId: "project-1", lifecycleState: "DRAFT" }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ planMode: true, revision: 3 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(httpApi.getDraft?.("draft-1")).resolves.toMatchObject({
+      id: "draft-1",
+      lifecycleState: "DRAFT",
+    });
+    await expect(httpApi.getThreadComposer?.("draft-1")).resolves.toEqual({
+      planMode: true,
+      revision: 3,
+    });
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/threads/draft-1/draft",
+      "/api/threads/draft-1/composer",
+    ]);
+  });
+
   test("uses Goal and sticky Composer endpoints and carries attachments into Turn and Steer", async () => {
     const goal = {
       threadId: "thread-1",
