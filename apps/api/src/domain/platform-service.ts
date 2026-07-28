@@ -163,6 +163,15 @@ export class InvalidThreadResumeResponseError extends ThreadResumeSafetyError {
   }
 }
 
+export class GoalMutationBlockedByPendingTurnError extends Error {
+  readonly code = "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN";
+
+  constructor(readonly turnStatus: "ALLOCATING" | "QUEUED") {
+    super(`A ${turnStatus} Turn already froze the Goal input snapshot`);
+    this.name = "GoalMutationBlockedByPendingTurnError";
+  }
+}
+
 export interface GoalRuntimeCapability {
   availability: "AVAILABLE" | "UNAVAILABLE";
   reasonCode: string | null;
@@ -1655,7 +1664,11 @@ export class LocalPlatformService implements PlatformApi {
 
   private async interruptGoalMutationTurn(task: TaskRecord): Promise<void> {
     const active = this.options.store.getActiveTurnForTask(task.id, task.ownerId);
-    if (!active || !task.threadId || !task.currentTurnId) return;
+    if (!active) return;
+    if (active.status === "ALLOCATING" || active.status === "QUEUED") {
+      throw new GoalMutationBlockedByPendingTurnError(active.status);
+    }
+    if (!task.threadId || !task.currentTurnId) return;
     await this.options.execution.interruptTask(task.threadId, task.currentTurnId);
   }
 

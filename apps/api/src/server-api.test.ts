@@ -12,6 +12,7 @@ import type {
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   ActiveTurnResumeConflictError,
+  GoalMutationBlockedByPendingTurnError,
   InvalidThreadResumeResponseError,
   ModelCatalogUnavailableError,
 } from "./domain/platform-service.js";
@@ -1137,6 +1138,33 @@ describe("CodexPlatform HTTP API", () => {
     });
     expect(deleted.statusCode).toBe(200);
     expect(deleted.json()).toEqual({ cleared: true, runtimeSyncState: "SYNCED" });
+  });
+
+  test("returns a machine-readable conflict when a pending Turn freezes the Goal snapshot", async () => {
+    const { auth, platform } = services();
+    platform.patchThreadGoal.mockRejectedValueOnce(
+      new GoalMutationBlockedByPendingTurnError("QUEUED"),
+    );
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/threads/thread-1/goal",
+      cookies: {
+        codexplatform_session: "valid-session",
+        codexplatform_csrf: "valid-csrf",
+      },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { action: "PAUSE" },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN",
+      code: "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN",
+      message: "A QUEUED Turn already froze the Goal input snapshot",
+    });
   });
 
   test("returns not found when archive routes target a Draft or expired Draft", async () => {

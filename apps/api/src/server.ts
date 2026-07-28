@@ -16,6 +16,7 @@ import type { FeishuConnectionStatus, PlatformUser } from "./auth/auth-store.js"
 import { MAX_TURN_ATTACHMENT_BYTES } from "./domain/attachments.js";
 import {
   AllocatedModelSelectionChangedError,
+  GoalMutationBlockedByPendingTurnError,
   ModelCatalogUnavailableError,
   ThreadResumeSafetyError,
 } from "./domain/platform-service.js";
@@ -82,6 +83,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     if (error instanceof AllocatedModelSelectionChangedError) {
       return reply.code(409).send({
         error: "MODEL_SELECTION_CHANGED",
+        message: error.message,
+      });
+    }
+    if (error instanceof GoalMutationBlockedByPendingTurnError) {
+      return reply.code(409).send({
+        error: error.code,
+        code: error.code,
         message: error.message,
       });
     }

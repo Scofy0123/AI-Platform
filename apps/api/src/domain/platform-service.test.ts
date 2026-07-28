@@ -671,6 +671,63 @@ describe("LocalPlatformService", () => {
     });
   });
 
+  test.each([
+    ["PUT", "ALLOCATING"],
+    ["PATCH", "QUEUED"],
+    ["DELETE", "QUEUED"],
+  ] as const)(
+    "rejects Goal %s while a %s Turn owns an immutable input snapshot",
+    async (operation, turnStatus) => {
+      const project = await service.createProject("user-1", { name: "Frozen Goal" });
+      const task = await service.createTask("user-1", {
+        projectId: project.id,
+        title: "Frozen Goal",
+      });
+      await service.putThreadGoal(task.id, "user-1", {
+        objective: "已冻结的目标",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      });
+      const turn = store.createTurn({
+        id: `pending-goal-${operation.toLowerCase()}`,
+        taskId: task.id,
+        ownerId: "user-1",
+        prompt: "使用旧 Goal 执行",
+        status: turnStatus,
+        now: NOW,
+      });
+      execution.interruptTask.mockClear();
+      execution.syncThreadGoal.mockClear();
+      execution.clearThreadGoal.mockClear();
+
+      const mutation =
+        operation === "PUT"
+          ? service.putThreadGoal(task.id, "user-1", {
+              objective: "不能覆盖",
+              tokenBudget: 100_000,
+              timeBudgetSeconds: 1_800,
+            })
+          : operation === "PATCH"
+            ? service.patchThreadGoal(task.id, "user-1", { objective: "不能修改" })
+            : service.deleteThreadGoal(task.id, "user-1");
+      await expect(mutation).rejects.toMatchObject({
+        code: "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN",
+      });
+
+      expect(store.getThreadGoal(task.id, "user-1")).toMatchObject({
+        objective: "已冻结的目标",
+        status: "ACTIVE",
+      });
+      expect(store.getTurnInputSnapshot(turn.id)?.goal).toMatchObject({
+        objective: "已冻结的目标",
+      });
+      expect(store.getTurn(turn.id)).toMatchObject({ status: turnStatus });
+      expect(execution.interruptTask).not.toHaveBeenCalled();
+      expect(execution.syncThreadGoal).not.toHaveBeenCalled();
+      expect(execution.clearThreadGoal).not.toHaveBeenCalled();
+    },
+  );
+
   test("keeps a durable cleanup job when file deletion fails and maintenance retries it", async () => {
     const project = await service.createProject("user-1", { name: "Cleanup retry" });
     const draft = await service.createDraft("user-1", { projectId: project.id });
@@ -2183,6 +2240,45 @@ describe("LocalPlatformService", () => {
       }),
     );
     expect(leases.getQueue()).toEqual([]);
+  });
+
+  test("keeps a queued Turn and its frozen Goal unchanged when a mutation is rejected", async () => {
+    const project = await service.createProject("user-1", { name: "Queued Goal" });
+    const tasks = await Promise.all(
+      [1, 2, 3].map((index) =>
+        service.createTask("user-1", {
+          projectId: project.id,
+          title: `Queued Goal ${index}`,
+        }),
+      ),
+    );
+    const queuedTask = tasks[2];
+    if (!queuedTask) throw new Error("Missing queued task");
+    await service.putThreadGoal(queuedTask.id, "user-1", {
+      objective: "排队时冻结",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await service.startTurn(tasks[0]?.id ?? "missing", "user-1", "占用槽位 1");
+    await service.startTurn(tasks[1]?.id ?? "missing", "user-1", "占用槽位 2");
+    const queued = await service.startTurn(queuedTask.id, "user-1", "稍后执行");
+    expect(queued).toMatchObject({ status: "QUEUED", position: 1 });
+    const queuedTurn = store.getActiveTurnForTask(queuedTask.id, "user-1");
+    expect(queuedTurn).toMatchObject({ status: "QUEUED" });
+
+    await expect(
+      service.patchThreadGoal(queuedTask.id, "user-1", { objective: "不得穿透队列快照" }),
+    ).rejects.toMatchObject({ code: "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN" });
+
+    expect(leases.getQueue()).toEqual([
+      expect.objectContaining({ taskId: queuedTask.id, turnId: queuedTurn?.id }),
+    ]);
+    expect(store.getTurnInputSnapshot(queuedTurn?.id ?? "")?.goal).toMatchObject({
+      objective: "排队时冻结",
+    });
+    expect(store.getThreadGoal(queuedTask.id, "user-1")).toMatchObject({
+      objective: "排队时冻结",
+    });
   });
 
   test("never returns the private CODEX_HOME from account administration", async () => {
