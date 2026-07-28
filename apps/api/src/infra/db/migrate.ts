@@ -379,12 +379,14 @@ CREATE TABLE IF NOT EXISTS platform_settings (
 `;
 
 export function migrateDatabase(sqlite: Database.Database): void {
-  const steerSnapshotColumns = new Set(
-    (sqlite.pragma("table_info(steer_input_snapshots)") as Array<{ name: string }>).map(
-      (column) => column.name,
-    ),
-  );
-  const trackedSteerOutcomeUncertainty = steerSnapshotColumns.has("unknown_at");
+  const existingSteerSnapshotTable = sqlite
+    .prepare(
+      `SELECT sql FROM sqlite_master
+       WHERE type = 'table' AND name = 'steer_input_snapshots'`,
+    )
+    .get() as { sql: string } | undefined;
+  const steerSnapshotNeedsUnknownMigration =
+    existingSteerSnapshotTable !== undefined && !/\bUNKNOWN\b/.test(existingSteerSnapshotTable.sql);
   sqlite.exec(INITIAL_SCHEMA);
   ensureColumn(sqlite, "codex_accounts", "codex_home", "TEXT");
   ensureColumn(sqlite, "codex_accounts", "quota_resets_at", "INTEGER");
@@ -462,16 +464,10 @@ export function migrateDatabase(sqlite: Database.Database): void {
   ensureColumn(sqlite, "steer_input_snapshots", "delivery_error", "TEXT");
   ensureColumn(sqlite, "steer_input_snapshots", "delivered_at", "INTEGER");
   ensureColumn(sqlite, "steer_input_snapshots", "failed_at", "INTEGER");
-  ensureColumn(sqlite, "steer_input_snapshots", "unknown_at", "INTEGER");
-  if (!trackedSteerOutcomeUncertainty) {
-    sqlite
-      .prepare(
-        `UPDATE steer_input_snapshots
-         SET delivery_status = 'UNKNOWN',
-             delivery_error = 'Legacy Steer delivery outcome is unknown'
-         WHERE delivery_status = 'PENDING'`,
-      )
-      .run();
+  if (steerSnapshotNeedsUnknownMigration) {
+    rebuildSteerInputSnapshotsForUnknownDelivery(sqlite);
+  } else {
+    ensureColumn(sqlite, "steer_input_snapshots", "unknown_at", "INTEGER");
   }
   ensureColumn(sqlite, "queue_entries", "required_account_id", "TEXT");
   ensureColumn(sqlite, "sessions", "persistent_at", "INTEGER");
@@ -481,6 +477,50 @@ export function migrateDatabase(sqlite: Database.Database): void {
   backfillQueuedThreadAccountAffinity(sqlite);
   backfillTaskEventItemIds(sqlite);
   migrateApprovalsTable(sqlite);
+}
+
+function rebuildSteerInputSnapshotsForUnknownDelivery(sqlite: Database.Database): void {
+  sqlite.exec("BEGIN IMMEDIATE");
+  try {
+    sqlite.exec(`
+      DROP INDEX IF EXISTS steer_input_snapshots_turn_idx;
+      ALTER TABLE steer_input_snapshots RENAME TO steer_input_snapshots_legacy;
+      CREATE TABLE steer_input_snapshots (
+        id TEXT PRIMARY KEY,
+        turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+        prompt TEXT NOT NULL,
+        attachments_json TEXT NOT NULL,
+        delivery_status TEXT NOT NULL DEFAULT 'PENDING'
+          CHECK(delivery_status IN ('PENDING', 'DELIVERED', 'FAILED', 'UNKNOWN')),
+        delivery_error TEXT,
+        delivered_at INTEGER,
+        failed_at INTEGER,
+        unknown_at INTEGER,
+        captured_at INTEGER NOT NULL
+      );
+      INSERT INTO steer_input_snapshots (
+        id, turn_id, prompt, attachments_json, delivery_status, delivery_error,
+        delivered_at, failed_at, unknown_at, captured_at
+      )
+      SELECT
+        id, turn_id, prompt, attachments_json,
+        CASE WHEN delivery_status = 'PENDING' THEN 'UNKNOWN' ELSE delivery_status END,
+        CASE
+          WHEN delivery_status = 'PENDING'
+            THEN 'Legacy Steer delivery outcome is unknown'
+          ELSE delivery_error
+        END,
+        delivered_at, failed_at, NULL, captured_at
+      FROM steer_input_snapshots_legacy;
+      DROP TABLE steer_input_snapshots_legacy;
+      CREATE INDEX steer_input_snapshots_turn_idx
+        ON steer_input_snapshots(turn_id, captured_at, id);
+    `);
+    sqlite.exec("COMMIT");
+  } catch (error) {
+    sqlite.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function backfillQueuedThreadAccountAffinity(sqlite: Database.Database): void {

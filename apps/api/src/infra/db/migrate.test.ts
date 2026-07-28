@@ -216,39 +216,85 @@ describe("migrateDatabase", () => {
       );
       CREATE TABLE steer_input_snapshots (
         id TEXT PRIMARY KEY,
-        turn_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
         prompt TEXT NOT NULL,
         attachments_json TEXT NOT NULL,
-        delivery_status TEXT NOT NULL DEFAULT 'PENDING',
+        delivery_status TEXT NOT NULL DEFAULT 'PENDING'
+          CHECK(delivery_status IN ('PENDING', 'DELIVERED', 'FAILED')),
         delivery_error TEXT,
         delivered_at INTEGER,
         failed_at INTEGER,
         captured_at INTEGER NOT NULL
       );
+      CREATE INDEX steer_input_snapshots_turn_idx
+        ON steer_input_snapshots(turn_id, captured_at, id);
       INSERT INTO turns (
         id, task_id, prompt, status, started_at
       ) VALUES ('legacy-turn', 'legacy-task', 'Initial', 'RUNNING', 1);
       INSERT INTO steer_input_snapshots (
         id, turn_id, prompt, attachments_json, captured_at
       ) VALUES ('legacy-steer', 'legacy-turn', 'Maybe delivered', '[]', 2);
+      INSERT INTO steer_input_snapshots (
+        id, turn_id, prompt, attachments_json, delivery_status, delivered_at, captured_at
+      ) VALUES ('legacy-delivered', 'legacy-turn', 'Delivered', '[]', 'DELIVERED', 3, 3);
     `);
 
-    migrateDatabase(database);
     migrateDatabase(database);
 
     expect(
       database
         .prepare(
-          `SELECT delivery_status, delivery_error, delivered_at, failed_at
-           FROM steer_input_snapshots WHERE id = 'legacy-steer'`,
+          `SELECT id, delivery_status, delivery_error, delivered_at, failed_at, unknown_at
+           FROM steer_input_snapshots ORDER BY captured_at`,
+        )
+        .all(),
+    ).toEqual([
+      {
+        id: "legacy-steer",
+        delivery_status: "UNKNOWN",
+        delivery_error: "Legacy Steer delivery outcome is unknown",
+        delivered_at: null,
+        failed_at: null,
+        unknown_at: null,
+      },
+      {
+        id: "legacy-delivered",
+        delivery_status: "DELIVERED",
+        delivery_error: null,
+        delivered_at: 3,
+        failed_at: null,
+        unknown_at: null,
+      },
+    ]);
+    expect(
+      database
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'steer_input_snapshots_turn_idx'",
         )
         .get(),
-    ).toEqual({
-      delivery_status: "UNKNOWN",
-      delivery_error: "Legacy Steer delivery outcome is unknown",
-      delivered_at: null,
-      failed_at: null,
-    });
+    ).toEqual({ name: "steer_input_snapshots_turn_idx" });
+    expect(
+      database
+        .prepare("SELECT `table`, on_delete FROM pragma_foreign_key_list('steer_input_snapshots')")
+        .all(),
+    ).toContainEqual({ table: "turns", on_delete: "CASCADE" });
+
+    database
+      .prepare(
+        `INSERT INTO steer_input_snapshots (
+          id, turn_id, prompt, attachments_json, delivery_status, captured_at
+         ) VALUES ('current-pending', 'legacy-turn', 'In flight', '[]', 'PENDING', 4)`,
+      )
+      .run();
+    migrateDatabase(database);
+    expect(
+      database
+        .prepare(
+          `SELECT delivery_status FROM steer_input_snapshots
+           WHERE id = 'current-pending'`,
+        )
+        .get(),
+    ).toEqual({ delivery_status: "PENDING" });
   });
 
   test("adds persistent session and Feishu connection state without deleting identities", () => {
