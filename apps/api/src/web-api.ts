@@ -1,6 +1,8 @@
 import type {
   Bootstrap,
   ComposerCapability,
+  ComposerState,
+  ComposerStatePatch,
   DraftAttachment,
   EffectiveConfigOverride,
   ModelCatalog,
@@ -66,6 +68,11 @@ export interface PlatformApi {
     threadId: string,
     userId: string,
   ): Promise<{ cleared: true; runtimeSyncState: "PENDING" | "SYNCED" }>;
+  patchThreadComposer(
+    threadId: string,
+    userId: string,
+    patch: ComposerStatePatch,
+  ): Promise<ComposerState>;
   listThreads(userId: string, projectId?: string): Promise<Thread[]>;
   listArchivedThreads(userId: string): Promise<Thread[]>;
   archiveThread(threadId: string, userId: string): Promise<{ ok: true }>;

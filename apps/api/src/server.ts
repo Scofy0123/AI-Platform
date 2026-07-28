@@ -1,4 +1,5 @@
 import {
+  ComposerStatePatchSchema,
   EffectiveConfigOverrideSchema,
   type TaskEvent,
   type Thread,
@@ -400,6 +401,15 @@ function registerRoutes(
     if (!actor) return;
     const { id } = request.params as { id: string };
     return platform.deleteThreadGoal(id, actor.user.id);
+  });
+
+  app.patch("/api/threads/:id/composer", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const { id } = request.params as { id: string };
+    const body = parseBody(ComposerStatePatchSchema, request.body, reply);
+    if (!body) return;
+    return platform.patchThreadComposer(id, actor.user.id, body);
   });
 
   app.post("/api/threads/:id/archive", async (request, reply) => {

@@ -161,6 +161,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   lifecycle_state TEXT NOT NULL DEFAULT 'ACTIVE'
     CHECK(lifecycle_state IN ('DRAFT', 'ACTIVE', 'EXPIRED')),
   draft_expires_at INTEGER,
+  plan_mode INTEGER NOT NULL DEFAULT 0 CHECK(plan_mode IN (0, 1)),
+  composer_revision INTEGER NOT NULL DEFAULT 0 CHECK(composer_revision >= 0),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -205,6 +207,7 @@ CREATE TABLE IF NOT EXISTS turn_input_snapshots (
   prompt TEXT NOT NULL,
   attachments_json TEXT NOT NULL,
   goal_json TEXT,
+  plan_mode INTEGER NOT NULL DEFAULT 0 CHECK(plan_mode IN (0, 1)),
   captured_at INTEGER NOT NULL
 );
 
@@ -417,6 +420,8 @@ export function migrateDatabase(sqlite: Database.Database): void {
   ensureColumn(sqlite, "tasks", "archived_at", "INTEGER");
   ensureColumn(sqlite, "tasks", "lifecycle_state", "TEXT NOT NULL DEFAULT 'ACTIVE'");
   ensureColumn(sqlite, "tasks", "draft_expires_at", "INTEGER");
+  ensureColumn(sqlite, "tasks", "plan_mode", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(sqlite, "tasks", "composer_revision", "INTEGER NOT NULL DEFAULT 0");
   sqlite.exec(
     `CREATE INDEX IF NOT EXISTS tasks_owner_archived_updated_idx
        ON tasks(owner_id, archived_at, updated_at DESC)`,
@@ -503,6 +508,7 @@ export function migrateDatabase(sqlite: Database.Database): void {
     "TEXT NOT NULL DEFAULT 'PENDING'",
   );
   ensureColumn(sqlite, "turn_input_snapshots", "goal_json", "TEXT");
+  ensureColumn(sqlite, "turn_input_snapshots", "plan_mode", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(sqlite, "thread_goals", "runtime_updated_at", "INTEGER");
   ensureColumn(sqlite, "thread_goals", "revision", "INTEGER NOT NULL DEFAULT 1");
   ensureColumn(sqlite, "thread_goals", "deleted_at", "INTEGER");
@@ -719,6 +725,8 @@ function ensureColumn(
     | "failed_at"
     | "unknown_at"
     | "goal_json"
+    | "plan_mode"
+    | "composer_revision"
     | "runtime_updated_at"
     | "revision"
     | "deleted_at",
@@ -726,6 +734,7 @@ function ensureColumn(
     | "TEXT"
     | "INTEGER"
     | "INTEGER NOT NULL DEFAULT 1"
+    | "INTEGER NOT NULL DEFAULT 0"
     | "TEXT NOT NULL DEFAULT 'CONNECTED'"
     | "TEXT NOT NULL DEFAULT 'ACTIVE'"
     | "TEXT NOT NULL DEFAULT 'PENDING'",

@@ -103,6 +103,11 @@ describe("CodexAppServerRuntime", () => {
       reasonCode: null,
       reason: null,
     });
+    expect(runtime.readPlanProtocolCapability()).toEqual({
+      availability: "AVAILABLE",
+      reasonCode: null,
+      reason: null,
+    });
   });
 
   test("does not advertise Goal before initialization or from an older App Server handshake", async () => {
@@ -123,6 +128,10 @@ describe("CodexAppServerRuntime", () => {
 
     await runtime.initialize();
     expect(runtime.readGoalProtocolCapability()).toMatchObject({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+    });
+    expect(runtime.readPlanProtocolCapability()).toMatchObject({
       availability: "UNAVAILABLE",
       reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
     });
@@ -249,6 +258,69 @@ describe("CodexAppServerRuntime", () => {
         params: { cursor: "page-2", limit: 100, includeHidden: false },
       },
     ]);
+  });
+
+  test("strictly reads the locked collaboration mode directory and resolves complete presets", async () => {
+    const rpc = new FakeRpc({
+      "collaborationMode/list": {
+        data: [
+          { name: "Default", mode: "default", model: null, reasoning_effort: null },
+          { name: "Plan", mode: "plan", model: "gpt-5.6-sol", reasoning_effort: "high" },
+        ],
+      },
+    });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await expect(
+      runtime.listCollaborationModes({
+        model: "gpt-5.5",
+        reasoningEffort: "medium",
+      }),
+    ).resolves.toEqual([
+      {
+        name: "Default",
+        mode: "default",
+        settings: {
+          model: "gpt-5.5",
+          reasoningEffort: "medium",
+          developerInstructions: null,
+        },
+      },
+      {
+        name: "Plan",
+        mode: "plan",
+        settings: {
+          model: "gpt-5.6-sol",
+          reasoningEffort: "high",
+          developerInstructions: null,
+        },
+      },
+    ]);
+    expect(rpc.requests).toEqual([{ method: "collaborationMode/list", params: {} }]);
+  });
+
+  test("fails closed on an unknown or incomplete collaboration mode response", async () => {
+    const unknownMode = new CodexAppServerRuntime(
+      new FakeRpc({
+        "collaborationMode/list": {
+          data: [{ name: "Plan", mode: "future", model: null, reasoning_effort: null }],
+        },
+      }),
+    );
+    await expect(
+      unknownMode.listCollaborationModes({ model: "gpt-5.5", reasoningEffort: "medium" }),
+    ).rejects.toThrow("Invalid collaborationMode/list response");
+
+    const unresolvedModel = new CodexAppServerRuntime(
+      new FakeRpc({
+        "collaborationMode/list": {
+          data: [{ name: "Plan", mode: "plan", model: null, reasoning_effort: null }],
+        },
+      }),
+    );
+    await expect(
+      unresolvedModel.listCollaborationModes({ model: null, reasoningEffort: "medium" }),
+    ).rejects.toThrow("cannot resolve a model");
   });
 
   test("fails closed when model pagination repeats a cursor", async () => {
@@ -637,6 +709,62 @@ describe("CodexAppServerRuntime", () => {
       },
     ]);
   });
+
+  test.each([
+    ["plan", "Plan"],
+    ["default", "Default"],
+  ] as const)(
+    "sends an explicit complete %s collaboration mode on every Turn",
+    async (mode, name) => {
+      const rpc = new FakeRpc({
+        "thread/memoryMode/set": {},
+        "turn/start": { turn: { id: "turn-1" } },
+      });
+      const runtime = new CodexAppServerRuntime(rpc);
+      const config = {
+        model: "gpt-5.6-sol",
+        reasoningEffort: "HIGH",
+        permissionMode: "READ_ONLY",
+        approvalMode: "ASK",
+        personality: "NONE",
+        instructions: "requested instructions",
+        sourceVersion: "org-policy-v1",
+        requestedConfig: {
+          model: "gpt-5.5",
+          reasoningEffort: "medium",
+          instructions: "requested instructions",
+        },
+        collaborationPreset: {
+          name,
+          mode,
+          settings: {
+            model: "gpt-5.6-sol",
+            reasoningEffort: "high",
+            developerInstructions: null,
+          },
+        },
+      } as const;
+      await runtime.disableThreadMemory("thread-1");
+      await runtime.startTurn("thread-1", "Inspect", {
+        cwd: "/workspace",
+        effectiveConfig: config,
+      });
+
+      expect(rpc.requests.at(-1)).toEqual({
+        method: "turn/start",
+        params: expect.objectContaining({
+          collaborationMode: {
+            mode,
+            settings: {
+              model: "gpt-5.6-sol",
+              reasoning_effort: "high",
+              developer_instructions: null,
+            },
+          },
+        }),
+      });
+    },
+  );
 
   test("maps controlled image and file references into Codex Turn inputs", async () => {
     const rpc = new FakeRpc({

@@ -178,6 +178,8 @@ export const tasks = sqliteTable("tasks", {
   archivedAt: integer("archived_at", { mode: "timestamp_ms" }),
   lifecycleState: text("lifecycle_state").notNull().default("ACTIVE"),
   draftExpiresAt: integer("draft_expires_at", { mode: "timestamp_ms" }),
+  planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
+  composerRevision: integer("composer_revision").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });
@@ -224,6 +226,7 @@ export const turnInputSnapshots = sqliteTable("turn_input_snapshots", {
   prompt: text("prompt").notNull(),
   attachmentsJson: text("attachments_json").notNull(),
   goalJson: text("goal_json"),
+  planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
   capturedAt: integer("captured_at", { mode: "timestamp_ms" }).notNull(),
 });
 

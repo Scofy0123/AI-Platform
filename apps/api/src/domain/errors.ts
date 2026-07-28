@@ -55,3 +55,27 @@ export class GoalMutationBlockedByPendingTurnError extends DomainError {
     this.name = "GoalMutationBlockedByPendingTurnError";
   }
 }
+
+export class PlanModeMutationBlockedError extends DomainError {
+  constructor(readonly turnStatus: "ALLOCATING" | "QUEUED" | "RUNNING" | "WAITING_APPROVAL") {
+    super(
+      "PLAN_MODE_MUTATION_BLOCKED_BY_PENDING_TURN",
+      `A ${turnStatus} Turn already froze the Plan mode input snapshot`,
+    );
+    this.name = "PlanModeMutationBlockedError";
+  }
+}
+
+export class ComposerRevisionConflictError extends DomainError {
+  constructor() {
+    super("COMPOSER_REVISION_CONFLICT", "Composer state changed; reload before editing");
+    this.name = "ComposerRevisionConflictError";
+  }
+}
+
+export class PlanModeCapabilityChangedError extends DomainError {
+  constructor(message = "Plan mode capability changed on the allocated Codex account") {
+    super("PLAN_MODE_CAPABILITY_CHANGED", message);
+    this.name = "PlanModeCapabilityChangedError";
+  }
+}

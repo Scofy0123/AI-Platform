@@ -13,6 +13,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   GoalCapabilityUnavailableError,
   GoalMutationBlockedByPendingTurnError,
+  PlanModeMutationBlockedError,
 } from "./domain/errors.js";
 import {
   ActiveTurnResumeConflictError,
@@ -1170,6 +1171,45 @@ describe("CodexPlatform HTTP API", () => {
     });
   });
 
+  test("patches Thread Composer state with CSRF and returns typed Plan conflicts", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const cookies = {
+      codexplatform_session: "valid-session",
+      codexplatform_csrf: "valid-csrf",
+    };
+    const headers = { "x-csrf-token": "valid-csrf" };
+
+    const updated = await app.inject({
+      method: "PATCH",
+      url: "/api/threads/thread-1/composer",
+      cookies,
+      headers,
+      payload: { planMode: true, revision: 2 },
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toEqual({ planMode: true, revision: 3 });
+    expect(platform.patchThreadComposer).toHaveBeenCalledWith("thread-1", "user-1", {
+      planMode: true,
+      revision: 2,
+    });
+
+    platform.patchThreadComposer.mockRejectedValueOnce(new PlanModeMutationBlockedError("RUNNING"));
+    const blocked = await app.inject({
+      method: "PATCH",
+      url: "/api/threads/thread-1/composer",
+      cookies,
+      headers,
+      payload: { planMode: false, revision: 3 },
+    });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({
+      error: "PLAN_MODE_MUTATION_BLOCKED_BY_PENDING_TURN",
+      code: "PLAN_MODE_MUTATION_BLOCKED_BY_PENDING_TURN",
+    });
+  });
+
   test.each([
     ["RUNTIME_VERSION_UNSUPPORTED", 409],
     ["RUNTIME_CAPABILITY_PROBE_FAILED", 503],
@@ -1894,6 +1934,10 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
     deleteThreadGoal: vi.fn(async () => ({
       cleared: true as const,
       runtimeSyncState: "SYNCED" as const,
+    })),
+    patchThreadComposer: vi.fn(async (_threadId, _userId, input) => ({
+      planMode: input.planMode,
+      revision: input.revision + 1,
     })),
     listThreads: vi.fn(async () => []),
     listArchivedThreads: vi.fn(async (): Promise<Thread[]> => []),

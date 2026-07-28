@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { CollaborationModePresetSchema, ComposerStateSchema } from "./composer.js";
 
 export * from "./composer.js";
 
@@ -200,6 +201,15 @@ export const EffectiveThreadConfigSnapshotSchema = z
     personality: z.enum(["NONE", "FRIENDLY", "PRAGMATIC"]),
     instructions: z.string(),
     sourceVersion: z.string().min(1),
+    requestedConfig: z
+      .object({
+        model: z.string().trim().min(1).nullable(),
+        reasoningEffort: z.string().trim().min(1),
+        instructions: z.string(),
+      })
+      .strict()
+      .optional(),
+    collaborationPreset: CollaborationModePresetSchema.nullable().optional(),
   })
   .strict();
 export type EffectiveThreadConfigSnapshot = z.infer<typeof EffectiveThreadConfigSnapshotSchema>;
@@ -279,6 +289,7 @@ export const ThreadSchema = z
     turns: z.array(TurnSchema),
     queue: QueueStateSchema.nullable(),
     items: z.array(ThreadItemSchema),
+    composerState: ComposerStateSchema.optional(),
   })
   .strict();
 export type Thread = z.infer<typeof ThreadSchema>;

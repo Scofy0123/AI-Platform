@@ -1,4 +1,5 @@
 import type {
+  CollaborationModePreset,
   EffectiveThreadConfigSnapshot,
   ExecutionPermissionSelection,
 } from "@codexplatform/contracts";
@@ -6,6 +7,7 @@ import type { Personality } from "./generated/Personality.js";
 import type { JsonValue } from "./generated/serde_json/JsonValue.js";
 import type { ApprovalsReviewer } from "./generated/v2/ApprovalsReviewer.js";
 import type { AskForApproval } from "./generated/v2/AskForApproval.js";
+import type { CollaborationModeListResponse } from "./generated/v2/CollaborationModeListResponse.js";
 import type { Model } from "./generated/v2/Model.js";
 import type { ModelListParams } from "./generated/v2/ModelListParams.js";
 import type { ModelListResponse } from "./generated/v2/ModelListResponse.js";
@@ -73,6 +75,13 @@ interface RateLimitsResponse {
 
 const MAX_MODEL_CATALOG_PAGES = 100;
 export const LOCKED_GOAL_PROTOCOL_VERSION = "0.144.6";
+export const LOCKED_PLAN_PROTOCOL_VERSION = "0.144.6";
+
+interface LockedProtocolCapability {
+  availability: "AVAILABLE" | "UNAVAILABLE";
+  reasonCode: string | null;
+  reason: string | null;
+}
 
 export class CodexAppServerRuntime {
   private readonly memoryDisabledThreadIds = new Set<string>();
@@ -108,11 +117,18 @@ export class CodexAppServerRuntime {
     return response;
   }
 
-  readGoalProtocolCapability(): {
-    availability: "AVAILABLE" | "UNAVAILABLE";
-    reasonCode: string | null;
-    reason: string | null;
-  } {
+  readGoalProtocolCapability(): LockedProtocolCapability {
+    return this.readLockedProtocolCapability("Goal", LOCKED_GOAL_PROTOCOL_VERSION);
+  }
+
+  readPlanProtocolCapability(): LockedProtocolCapability {
+    return this.readLockedProtocolCapability("Plan", LOCKED_PLAN_PROTOCOL_VERSION);
+  }
+
+  private readLockedProtocolCapability(
+    featureName: string,
+    lockedVersion: string,
+  ): LockedProtocolCapability {
     const userAgent = this.initializeResponse?.userAgent;
     if (!userAgent) {
       return {
@@ -122,13 +138,13 @@ export class CodexAppServerRuntime {
       };
     }
     const version = /(?:^|[/ ])(\d+\.\d+\.\d+)(?:$|[ )])/.exec(userAgent)?.[1] ?? null;
-    if (version !== LOCKED_GOAL_PROTOCOL_VERSION) {
+    if (version !== lockedVersion) {
       return {
         availability: "UNAVAILABLE",
         reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
         reason: version
-          ? `Codex App Server ${version} does not match the locked Goal protocol ${LOCKED_GOAL_PROTOCOL_VERSION}`
-          : `Codex App Server did not report a compatible version for Goal protocol ${LOCKED_GOAL_PROTOCOL_VERSION}`,
+          ? `Codex App Server ${version} does not match the locked ${featureName} protocol ${lockedVersion}`
+          : `Codex App Server did not report a compatible version for ${featureName} protocol ${lockedVersion}`,
       };
     }
     return { availability: "AVAILABLE", reasonCode: null, reason: null };
@@ -200,6 +216,44 @@ export class CodexAppServerRuntime {
     } while (cursor !== null);
 
     return models;
+  }
+
+  async listCollaborationModes(input: {
+    model: string | null;
+    reasoningEffort: string;
+  }): Promise<CollaborationModePreset[]> {
+    const response = await this.rpc.request<CollaborationModeListResponse>(
+      "collaborationMode/list",
+      {},
+    );
+    if (!isStrictRecord(response, ["data"]) || !Array.isArray(response.data)) {
+      throw new Error("Invalid collaborationMode/list response");
+    }
+    return response.data.map((value) => {
+      if (
+        !isStrictRecord(value, ["name", "mode", "model", "reasoning_effort"]) ||
+        typeof value.name !== "string" ||
+        value.name.trim().length === 0 ||
+        (value.mode !== "default" && value.mode !== "plan") ||
+        (value.model !== null && typeof value.model !== "string") ||
+        (value.reasoning_effort !== null && typeof value.reasoning_effort !== "string")
+      ) {
+        throw new Error("Invalid collaborationMode/list response");
+      }
+      const model = value.model ?? input.model;
+      if (!model) {
+        throw new Error(`Collaboration mode ${value.name} cannot resolve a model`);
+      }
+      return {
+        name: value.name,
+        mode: value.mode,
+        settings: {
+          model,
+          reasoningEffort: value.reasoning_effort ?? input.reasoningEffort.toLowerCase(),
+          developerInstructions: null,
+        },
+      } satisfies CollaborationModePreset;
+    });
   }
 
   async startThread(input: {
@@ -549,6 +603,18 @@ function threadConfigParams(config: EffectiveThreadConfigSnapshot) {
 }
 
 function turnConfigParams(cwd: string, config: EffectiveThreadConfigSnapshot) {
+  const collaborationMode = config.collaborationPreset
+    ? {
+        collaborationMode: {
+          mode: config.collaborationPreset.mode,
+          settings: {
+            model: config.collaborationPreset.settings.model,
+            reasoning_effort: config.collaborationPreset.settings.reasoningEffort,
+            developer_instructions: config.collaborationPreset.settings.developerInstructions,
+          },
+        },
+      }
+    : {};
   if (config.permissionMode === "READ_ONLY") {
     return {
       model: config.model,
@@ -558,6 +624,7 @@ function turnConfigParams(cwd: string, config: EffectiveThreadConfigSnapshot) {
       approvalsReviewer: "user" as const,
       sandboxPolicy: { type: "readOnly" as const, networkAccess: false },
       personality: personality(config),
+      ...collaborationMode,
     } satisfies Partial<TurnStartParams>;
   }
   const permission = codexPermissionParams(selectionFromConfig(config), cwd);
@@ -567,7 +634,15 @@ function turnConfigParams(cwd: string, config: EffectiveThreadConfigSnapshot) {
     summary: "auto" as const,
     ...permission.turn,
     personality: personality(config),
+    ...collaborationMode,
   } satisfies Partial<TurnStartParams>;
+}
+
+function isStrictRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
 function selectionFromConfig(config: EffectiveThreadConfigSnapshot): ExecutionPermissionSelection {

@@ -24,6 +24,38 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
     return { availability: "AVAILABLE", reasonCode: null, reason: null };
   }
 
+  async readPlanModeCatalog(
+    _account: InternalAccount,
+    requested = { model: "fake-codex-standard", reasoningEffort: "medium" },
+  ) {
+    const model = requested.model ?? "fake-codex-standard";
+    return {
+      availability: "AVAILABLE" as const,
+      reasonCode: null,
+      reason: null,
+      presets: [
+        {
+          name: "Default",
+          mode: "default" as const,
+          settings: {
+            model,
+            reasoningEffort: requested.reasoningEffort.toLowerCase(),
+            developerInstructions: null,
+          },
+        },
+        {
+          name: "Plan",
+          mode: "plan" as const,
+          settings: {
+            model,
+            reasoningEffort: "high",
+            developerInstructions: null,
+          },
+        },
+      ],
+    };
+  }
+
   async setThreadGoal(
     threadId: string,
     goal: ThreadGoalSnapshot,

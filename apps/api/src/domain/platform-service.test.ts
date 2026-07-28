@@ -159,6 +159,157 @@ describe("LocalPlatformService", () => {
     unsubscribe();
   });
 
+  test("enables Plan only from the eligible-account preset intersection and freezes the actual preset", async () => {
+    const project = await service.createProject("user-1", { name: "Plan mode" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Plan mode",
+    });
+
+    expect(
+      (await service.listComposerCapabilities("user-1", task.id)).find(
+        (capability) => capability.id === "plan-mode",
+      ),
+    ).toMatchObject({ availability: "AVAILABLE" });
+    await expect(
+      service.patchThreadComposer(task.id, "user-1", {
+        planMode: true,
+        revision: 0,
+      }),
+    ).resolves.toEqual({ planMode: true, revision: 1 });
+
+    await service.startTurn(task.id, "user-1", "Plan before acting", {
+      model: "fake-codex-standard",
+      reasoningEffort: "medium",
+      instructions: "requested",
+    });
+
+    expect(execution.startTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        effectiveConfig: expect.objectContaining({
+          model: "fake-codex-standard",
+          reasoningEffort: "high",
+          requestedConfig: {
+            model: "fake-codex-standard",
+            reasoningEffort: "medium",
+            instructions: expect.stringContaining("requested"),
+          },
+          collaborationPreset: {
+            name: "Plan",
+            mode: "plan",
+            settings: {
+              model: "fake-codex-standard",
+              reasoningEffort: "high",
+              developerInstructions: null,
+            },
+          },
+        }),
+      }),
+    );
+    const turn = database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+      id: string;
+    };
+    expect(store.getTurnInputSnapshot(turn.id)).toMatchObject({ planMode: true });
+  });
+
+  test("sends the explicit default preset after Plan is turned off", async () => {
+    const project = await service.createProject("user-1", { name: "Default mode" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Default mode",
+    });
+    await service.patchThreadComposer(task.id, "user-1", { planMode: true, revision: 0 });
+    await service.patchThreadComposer(task.id, "user-1", { planMode: false, revision: 1 });
+    await service.startTurn(task.id, "user-1", "Act", {
+      model: "fake-codex-standard",
+      reasoningEffort: "medium",
+    });
+    expect(execution.startTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        effectiveConfig: expect.objectContaining({
+          collaborationPreset: expect.objectContaining({ mode: "default", name: "Default" }),
+        }),
+      }),
+    );
+  });
+
+  test("fails closed when the allocated account Plan directory changed after capability display", async () => {
+    const project = await service.createProject("user-1", { name: "Changed Plan" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Changed Plan",
+    });
+    await service.listComposerCapabilities("user-1", task.id);
+    await service.patchThreadComposer(task.id, "user-1", { planMode: true, revision: 0 });
+    execution.readPlanModeCatalog.mockResolvedValueOnce({
+      availability: "UNAVAILABLE",
+      reasonCode: "PLAN_PRESET_MISSING",
+      reason: "Plan preset disappeared",
+      presets: [],
+    });
+
+    await expect(
+      service.startTurn(task.id, "user-1", "Do not silently downgrade"),
+    ).rejects.toMatchObject({ code: "PLAN_MODE_CAPABILITY_CHANGED" });
+    expect(execution.startTask).not.toHaveBeenCalled();
+  });
+
+  test("advertises Plan only when every eligible account supports both collaboration presets", async () => {
+    leases.addAccount({
+      id: "account-2",
+      alias: "Codex B",
+      codexHome: "/tmp/codexplatform-test/account-2",
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+      maxActiveUsers: 4,
+      weeklyRemaining: 70,
+      quotaUpdatedAt: NOW,
+      allowUnknownQuota: false,
+      healthScore: 100,
+    });
+    execution.readPlanModeCatalog.mockImplementation(async (account, requested) => {
+      if (account.id === "account-2") {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+          reason: "Account B uses an older Runtime",
+          presets: [],
+        };
+      }
+      const model = requested?.model ?? "fake-codex-standard";
+      return {
+        availability: "AVAILABLE",
+        reasonCode: null,
+        reason: null,
+        presets: [
+          {
+            name: "Default",
+            mode: "default",
+            settings: {
+              model,
+              reasoningEffort: requested?.reasoningEffort ?? "medium",
+              developerInstructions: null,
+            },
+          },
+          {
+            name: "Plan",
+            mode: "plan",
+            settings: { model, reasoningEffort: "high", developerInstructions: null },
+          },
+        ],
+      };
+    });
+
+    expect(
+      (await service.listComposerCapabilities("user-1")).find(
+        (capability) => capability.id === "plan-mode",
+      ),
+    ).toMatchObject({
+      availability: "UNSUPPORTED",
+      unavailableReasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+    });
+  });
+
   test("persists a Steer only after the runtime accepts it and replays it as a platform Turn item", async () => {
     const project = await service.createProject("user-1", { name: "Steer persistence" });
     const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
@@ -248,6 +399,7 @@ describe("LocalPlatformService", () => {
         prompt: "",
         attachments: [attachment],
         goal: null,
+        planMode: false,
         capturedAt: NOW.toISOString(),
         deliveryStatus: "DELIVERED",
         deliveryError: null,
@@ -1215,7 +1367,7 @@ describe("LocalPlatformService", () => {
       currentTurn: {
         configSnapshot: {
           model: "fake-codex-standard",
-          reasoningEffort: "MEDIUM",
+          reasoningEffort: "medium",
         },
       },
     });
@@ -1420,7 +1572,7 @@ describe("LocalPlatformService", () => {
           id: schedulerTurn.id,
           prompt: "Inspect the repository",
           configSnapshot: expect.objectContaining({
-            reasoningEffort: "MEDIUM",
+            reasoningEffort: "medium",
             approvalMode: "ASK",
           }),
         }),
@@ -1690,7 +1842,7 @@ describe("LocalPlatformService", () => {
       1,
       expect.objectContaining({
         effectiveConfig: expect.objectContaining({
-          reasoningEffort: "HIGH",
+          reasoningEffort: "high",
           permissionMode: "READ_ONLY",
           approvalMode: "ASK",
           personality: "FRIENDLY",
@@ -1714,7 +1866,7 @@ describe("LocalPlatformService", () => {
       2,
       expect.objectContaining({
         effectiveConfig: expect.objectContaining({
-          reasoningEffort: "LOW",
+          reasoningEffort: "low",
           permissionMode: "WORKSPACE_WRITE",
           approvalMode: "ASK",
           personality: "NONE",
@@ -1766,6 +1918,21 @@ describe("LocalPlatformService", () => {
       instructions:
         "Apply organization policy and use the authenticated employee identity for enterprise tools.",
       sourceVersion: "org-policy-1.1a-v1",
+      requestedConfig: {
+        model: "fake-codex-deep",
+        reasoningEffort: "xhigh",
+        instructions:
+          "Apply organization policy and use the authenticated employee identity for enterprise tools.",
+      },
+      collaborationPreset: {
+        name: "Default",
+        mode: "default",
+        settings: {
+          model: "fake-codex-deep",
+          reasoningEffort: "xhigh",
+          developerInstructions: null,
+        },
+      },
     });
     expect(execution.startTask).toHaveBeenLastCalledWith(
       expect.objectContaining({
@@ -3442,6 +3609,36 @@ class FakeExecution extends EventEmitter implements TaskExecutionAdapter {
     reasonCode: null,
     reason: null,
   }));
+  readonly readPlanModeCatalog = vi.fn<TaskExecutionAdapter["readPlanModeCatalog"]>(
+    async (_account, requested = { model: "fake-codex-standard", reasoningEffort: "medium" }) => {
+      const model = requested.model ?? "fake-codex-standard";
+      return {
+        availability: "AVAILABLE",
+        reasonCode: null,
+        reason: null,
+        presets: [
+          {
+            name: "Default",
+            mode: "default",
+            settings: {
+              model,
+              reasoningEffort: requested.reasoningEffort.toLowerCase(),
+              developerInstructions: null,
+            },
+          },
+          {
+            name: "Plan",
+            mode: "plan",
+            settings: {
+              model,
+              reasoningEffort: "high",
+              developerInstructions: null,
+            },
+          },
+        ],
+      };
+    },
+  );
   readonly setThreadGoal = vi.fn<TaskExecutionAdapter["setThreadGoal"]>(
     async (_threadId, goal) => ({
       attachment: "ATTACHED",

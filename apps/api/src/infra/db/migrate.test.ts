@@ -82,8 +82,14 @@ describe("migrateDatabase", () => {
 
     const taskColumns = database.pragma("table_info(tasks)") as Array<{ name: string }>;
     const turnColumns = database.pragma("table_info(turns)") as Array<{ name: string }>;
-    expect(taskColumns.map((column) => column.name)).toContain("thread_config_json");
+    expect(taskColumns.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["thread_config_json", "plan_mode", "composer_revision"]),
+    );
     expect(turnColumns.map((column) => column.name)).toContain("config_snapshot_json");
+    const inputColumns = database.pragma("table_info(turn_input_snapshots)") as Array<{
+      name: string;
+    }>;
+    expect(inputColumns.map((column) => column.name)).toContain("plan_mode");
     expect(
       database
         .prepare(

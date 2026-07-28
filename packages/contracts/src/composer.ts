@@ -70,6 +70,37 @@ export const ComposerCapabilitySchema = z
   });
 export type ComposerCapability = z.infer<typeof ComposerCapabilitySchema>;
 
+export const ComposerStateSchema = z
+  .object({
+    planMode: z.boolean(),
+    revision: z.number().int().nonnegative(),
+  })
+  .strict();
+export type ComposerState = z.infer<typeof ComposerStateSchema>;
+
+export const ComposerStatePatchSchema = z
+  .object({
+    planMode: z.boolean(),
+    revision: z.number().int().nonnegative(),
+  })
+  .strict();
+export type ComposerStatePatch = z.infer<typeof ComposerStatePatchSchema>;
+
+export const CollaborationModePresetSchema = z
+  .object({
+    name: z.string().trim().min(1),
+    mode: z.enum(["default", "plan"]),
+    settings: z
+      .object({
+        model: z.string().trim().min(1),
+        reasoningEffort: z.string().trim().min(1).nullable(),
+        developerInstructions: z.string().nullable(),
+      })
+      .strict(),
+  })
+  .strict();
+export type CollaborationModePreset = z.infer<typeof CollaborationModePresetSchema>;
+
 export const AttachmentScanStatusSchema = z.enum([
   "UPLOADING",
   "SCANNING",
@@ -159,6 +190,7 @@ export const EffectiveTurnInputSnapshotSchema = z
     prompt: z.string(),
     attachments: z.array(DraftAttachmentSchema).max(32),
     goal: ThreadGoalSnapshotSchema.nullable().default(null),
+    planMode: z.boolean().default(false),
     capturedAt: z.iso.datetime(),
   })
   .strict();

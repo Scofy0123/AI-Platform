@@ -547,6 +547,113 @@ describe("AppServerExecutionAdapter", () => {
     expect(runtime.readGoalProtocolCapability).toHaveBeenCalledTimes(2);
   });
 
+  test("does not negative-cache a transient Plan directory failure", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.listCollaborationModes)
+      .mockRejectedValueOnce(new Error("temporary pipe failure"))
+      .mockResolvedValueOnce([
+        {
+          name: "Default",
+          mode: "default",
+          settings: {
+            model: "gpt-5.5",
+            reasoningEffort: "medium",
+            developerInstructions: null,
+          },
+        },
+        {
+          name: "Plan",
+          mode: "plan",
+          settings: {
+            model: "gpt-5.6-sol",
+            reasoningEffort: "high",
+            developerInstructions: null,
+          },
+        },
+      ]);
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const account = {
+      id: "account-1",
+      alias: "Codex A",
+      status: "AVAILABLE" as const,
+      authStatus: "AUTHENTICATED" as const,
+      maxActiveUsers: 4,
+      activeUsers: 0,
+      activeTurns: 0,
+      healthScore: 100,
+      weeklyRemaining: null,
+      quotaUpdatedAt: null,
+      quotaResetsAt: null,
+      allowUnknownQuota: true,
+      codexHome: "/tmp/account-1",
+    };
+
+    await expect(
+      adapter.readPlanModeCatalog(account, { model: "gpt-5.5", reasoningEffort: "medium" }),
+    ).resolves.toMatchObject({ reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED" });
+    await expect(
+      adapter.readPlanModeCatalog(account, { model: "gpt-5.5", reasoningEffort: "medium" }),
+    ).resolves.toMatchObject({
+      availability: "AVAILABLE",
+      presets: [
+        expect.objectContaining({ mode: "default" }),
+        expect.objectContaining({ mode: "plan" }),
+      ],
+    });
+    expect(runtime.listCollaborationModes).toHaveBeenCalledTimes(2);
+  });
+
+  test("fails closed before reading Plan presets when the locked protocol is unavailable", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.readPlanProtocolCapability).mockReturnValue({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "old Runtime",
+    });
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const account = {
+      id: "account-1",
+      alias: "Codex A",
+      status: "AVAILABLE" as const,
+      authStatus: "AUTHENTICATED" as const,
+      maxActiveUsers: 4,
+      activeUsers: 0,
+      activeTurns: 0,
+      healthScore: 100,
+      weeklyRemaining: null,
+      quotaUpdatedAt: null,
+      quotaResetsAt: null,
+      allowUnknownQuota: true,
+      codexHome: "/tmp/account-1",
+    };
+
+    await expect(
+      adapter.readPlanModeCatalog(account, { model: "gpt-5.5", reasoningEffort: "medium" }),
+    ).resolves.toEqual({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "old Runtime",
+      presets: [],
+    });
+    expect(runtime.listCollaborationModes).not.toHaveBeenCalled();
+  });
+
   test("clears a deterministic Goal capability cache when the Runtime generation changes", async () => {
     const rpc1 = new FakeRpc();
     const rpc2 = new FakeRpc();
@@ -2215,6 +2322,11 @@ function runtimePort(threadId = "thread-1", turnId = "turn-1"): ManagedRuntimePo
       reasonCode: null,
       reason: null,
     })),
+    readPlanProtocolCapability: vi.fn(() => ({
+      availability: "AVAILABLE" as const,
+      reasonCode: null,
+      reason: null,
+    })),
     startThread: vi.fn(async () => ({ thread: { id: threadId } })),
     resumeThread: vi.fn(async () => resumeResponse(threadId, { type: "idle" }, [])),
     startTurn: vi.fn(async () => ({ turn: { id: turnId } })),
@@ -2245,6 +2357,26 @@ function runtimePort(threadId = "thread-1", turnId = "turn-1"): ManagedRuntimePo
       authUrl: "https://auth.example.test/codex",
     })),
     listModels: vi.fn(async () => []),
+    listCollaborationModes: vi.fn(async ({ model, reasoningEffort }) => [
+      {
+        name: "Default",
+        mode: "default" as const,
+        settings: {
+          model: model ?? "fake-codex-standard",
+          reasoningEffort,
+          developerInstructions: null,
+        },
+      },
+      {
+        name: "Plan",
+        mode: "plan" as const,
+        settings: {
+          model: model ?? "fake-codex-standard",
+          reasoningEffort: "high",
+          developerInstructions: null,
+        },
+      },
+    ]),
     readWeeklyQuota: vi.fn(async () => ({
       status: "KNOWN" as const,
       limitId: "codex",

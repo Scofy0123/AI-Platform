@@ -65,6 +65,117 @@ describe("SQLitePlatformStore", () => {
     ]);
   });
 
+  test("persists a revisioned sticky Plan mode and freezes it into each Turn input", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Plan", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Plan",
+      now: NOW,
+    });
+
+    expect(store.getComposerState(task.id, "user-1")).toEqual({
+      planMode: false,
+      revision: 0,
+    });
+    expect(
+      store.patchComposerState({
+        threadId: task.id,
+        ownerId: "user-1",
+        planMode: true,
+        expectedRevision: 0,
+        now: NOW,
+      }),
+    ).toEqual({ planMode: true, revision: 1 });
+
+    const turn = store.createTurn({
+      id: "planned-turn",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Plan first",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    expect(store.getTurnInputSnapshot(turn.id)).toMatchObject({ planMode: true });
+    expect(() =>
+      store.patchComposerState({
+        threadId: task.id,
+        ownerId: "user-1",
+        planMode: false,
+        expectedRevision: 1,
+        now: new Date(NOW.getTime() + 1),
+      }),
+    ).toThrowError(expect.objectContaining({ code: "PLAN_MODE_MUTATION_BLOCKED_BY_PENDING_TURN" }));
+    expect(store.getComposerState(task.id, "user-1")).toEqual({
+      planMode: true,
+      revision: 1,
+    });
+    store.completeTurn(turn.id, "COMPLETED", new Date(NOW.getTime() + 2));
+    const next = store.createTurn({
+      id: "planned-turn-2",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Continue planning",
+      status: "ALLOCATING",
+      now: new Date(NOW.getTime() + 3),
+    });
+    expect(store.getTurnInputSnapshot(next.id)).toMatchObject({ planMode: true });
+  });
+
+  test.each(["QUEUED", "RUNNING", "WAITING_APPROVAL"] as const)(
+    "blocks Plan mode mutation while a %s Turn owns the frozen snapshot",
+    (status) => {
+      const project = store.createProject({ ownerId: "user-1", name: status, now: NOW });
+      const task = store.createTask({
+        ownerId: "user-1",
+        projectId: project.id,
+        title: status,
+        now: NOW,
+      });
+      const turn = store.createTurn({
+        id: `plan-lock-${status}`,
+        taskId: task.id,
+        ownerId: "user-1",
+        prompt: "Run",
+        status: "ALLOCATING",
+        now: NOW,
+      });
+      store.setTurnStatus(turn.id, status);
+
+      expect(() =>
+        store.patchComposerState({
+          threadId: task.id,
+          ownerId: "user-1",
+          planMode: true,
+          expectedRevision: 0,
+          now: NOW,
+        }),
+      ).toThrowError(
+        expect.objectContaining({ code: "PLAN_MODE_MUTATION_BLOCKED_BY_PENDING_TURN" }),
+      );
+    },
+  );
+
+  test("rejects stale Composer revisions and cross-owner reads", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Revision", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Revision",
+      now: NOW,
+    });
+    expect(store.getComposerState(task.id, "user-2")).toBeNull();
+    expect(() =>
+      store.patchComposerState({
+        threadId: task.id,
+        ownerId: "user-1",
+        planMode: true,
+        expectedRevision: 7,
+        now: NOW,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "COMPOSER_REVISION_CONFLICT" }));
+  });
+
   test("deletes only an owned unactivated Draft and expires stale Drafts", () => {
     const project = store.createProject({ ownerId: "user-1", name: "Drafts", now: NOW });
     const mine = store.createDraft({
@@ -124,6 +235,7 @@ describe("SQLitePlatformStore", () => {
       prompt: "",
       attachments: [attachment],
       goal: null,
+      planMode: false,
       capturedAt: NOW.toISOString(),
     });
     expect(store.getTaskForUser(draft.id, "user-1")).toMatchObject({
@@ -194,6 +306,7 @@ describe("SQLitePlatformStore", () => {
       prompt: "",
       attachments: [ready],
       goal: null,
+      planMode: false,
       capturedAt: NOW.toISOString(),
     });
     expect(() =>

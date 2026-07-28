@@ -118,7 +118,7 @@ test("new Thread exposes governed Composer capabilities and submits its Runtime 
   await page.getByRole("button", { name: "Add files and more" }).click();
   await expect(page.getByRole("menuitem", { name: /Files and folders/ })).toBeEnabled();
   await expect(page.getByRole("menuitem", { name: /Goal/ })).toBeEnabled();
-  await expect(page.getByRole("menuitem", { name: /Plan mode/ })).toBeDisabled();
+  await expect(page.getByRole("menuitem", { name: /Plan mode/ })).toBeEnabled();
   await expect(page.getByRole("menuitem", { name: /Record a skill/ })).toHaveCount(0);
   if (process.env.CODEXPLATFORM_CAPTURE_UAT === "1") {
     await page.screenshot({ path: testInfo.outputPath("composer-add-menu.png") });

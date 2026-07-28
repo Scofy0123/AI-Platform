@@ -13,6 +13,7 @@ import type {
   ApprovalDraft,
   AttachedGoalRuntimeResult,
   GoalRuntimeCapability,
+  PlanModeCatalogCapability,
   RuntimeGoalProjection,
   TaskEventDraft,
   TaskExecutionAdapter,
@@ -46,6 +47,7 @@ interface RpcPort extends EventEmitter {
 
 interface RuntimePort {
   readGoalProtocolCapability(): GoalRuntimeCapability;
+  readPlanProtocolCapability(): GoalRuntimeCapability;
   startThread(input: {
     cwd: string;
     dynamicTools: ReturnType<ToolRuntimePort["definitions"]>;
@@ -95,6 +97,10 @@ interface RuntimePort {
   startChatGptLogin(): Promise<{ loginId: string; authUrl: string }>;
   readWeeklyQuota(): Promise<WeeklyQuota>;
   listModels(): Promise<Model[]>;
+  listCollaborationModes(input: {
+    model: string | null;
+    reasoningEffort: string;
+  }): Promise<import("@codexplatform/contracts").CollaborationModePreset[]>;
 }
 
 export interface ManagedRuntimePort {
@@ -202,6 +208,45 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         availability: "UNAVAILABLE",
         reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
         reason: error instanceof Error ? error.message : "Goal Runtime capability probe failed",
+      };
+    }
+  }
+
+  async readPlanModeCatalog(
+    account: InternalAccount,
+    requested?: { model: string | null; reasoningEffort: string },
+  ): Promise<PlanModeCatalogCapability> {
+    try {
+      const managed = await this.options.supervisor.startAccount({
+        accountId: account.id,
+        codexHome: account.codexHome,
+      });
+      this.attach(managed);
+      const protocol = managed.runtime.readPlanProtocolCapability();
+      if (protocol.availability !== "AVAILABLE") {
+        return { ...protocol, presets: [] };
+      }
+      const fallback = requested ?? (await planFallbackFromModels(managed.runtime.listModels()));
+      const presets = await managed.runtime.listCollaborationModes(fallback);
+      if (
+        !presets.some((preset) => preset.mode === "plan") ||
+        !presets.some((preset) => preset.mode === "default")
+      ) {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "PLAN_PRESET_MISSING",
+          reason: "Runtime collaboration mode directory is incomplete",
+          presets: [],
+        };
+      }
+      return { availability: "AVAILABLE", reasonCode: null, reason: null, presets };
+    } catch (error) {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+        reason:
+          error instanceof Error ? error.message : "Plan mode Runtime capability probe failed",
+        presets: [],
       };
     }
   }
@@ -1020,6 +1065,18 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       }
     }
   }
+}
+
+async function planFallbackFromModels(
+  modelsPromise: Promise<Model[]>,
+): Promise<{ model: string | null; reasoningEffort: string }> {
+  const models = await modelsPromise;
+  const selected = models.find((model) => model.isDefault) ?? models[0];
+  if (!selected) throw new Error("Runtime model catalog is empty");
+  return {
+    model: selected.model,
+    reasoningEffort: selected.defaultReasoningEffort,
+  };
 }
 
 function mapRuntimeModel(model: Model): ModelOption {

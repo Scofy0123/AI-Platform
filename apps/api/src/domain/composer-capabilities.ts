@@ -18,6 +18,7 @@ export interface ComposerCapabilityContext {
   goalUnavailableReasonCode?: string;
   planModeAvailable: boolean;
   planModeUnavailableReason?: string;
+  planModeUnavailableReasonCode?: string;
   skillRecorderAvailable: boolean;
   skillRecorderUnavailableReason?: string;
   approvedSkills: readonly CatalogItem[];
@@ -60,6 +61,9 @@ export function listComposerCapabilities(context: ComposerCapabilityContext): Co
       available: context.planModeAvailable,
       unavailableReason:
         context.planModeUnavailableReason ?? "Runtime version does not support plan mode",
+      ...(context.planModeUnavailableReasonCode
+        ? { unavailableReasonCode: context.planModeUnavailableReasonCode }
+        : {}),
       unavailableAvailability: "UNSUPPORTED",
     }),
   ];

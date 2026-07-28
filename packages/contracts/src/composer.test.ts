@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import {
+  CollaborationModePresetSchema,
   ComposerCapabilitySchema,
+  ComposerStateSchema,
   DraftAttachmentSchema,
   EffectiveTurnInputSnapshotSchema,
   ExecutionPermissionSelectionSchema,
@@ -60,6 +62,35 @@ describe("ComposerCapabilitySchema", () => {
 });
 
 describe("TurnInputBundleSchema", () => {
+  test("defines a revisioned sticky Composer state", () => {
+    expect(ComposerStateSchema.parse({ planMode: true, revision: 3 })).toEqual({
+      planMode: true,
+      revision: 3,
+    });
+  });
+
+  test("captures the exact runtime collaboration preset without pretending built-in instructions are known", () => {
+    expect(
+      CollaborationModePresetSchema.parse({
+        name: "Plan",
+        mode: "plan",
+        settings: {
+          model: "gpt-5.6-sol",
+          reasoningEffort: "high",
+          developerInstructions: null,
+        },
+      }),
+    ).toEqual({
+      name: "Plan",
+      mode: "plan",
+      settings: {
+        model: "gpt-5.6-sol",
+        reasoningEffort: "high",
+        developerInstructions: null,
+      },
+    });
+  });
+
   test("accepts a text-only turn with an explicit permission selection", () => {
     expect(
       TurnInputBundleSchema.parse({
@@ -126,11 +157,13 @@ describe("TurnInputBundleSchema", () => {
       EffectiveTurnInputSnapshotSchema.parse({
         prompt: "",
         attachments: [attachment],
+        planMode: true,
         capturedAt: "2026-07-28T12:00:01.000Z",
       }),
     ).toMatchObject({
       prompt: "",
       attachments: [{ id: "attachment-1", scanStatus: "READY" }],
+      planMode: true,
     });
   });
 

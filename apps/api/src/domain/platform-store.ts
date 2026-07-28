@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import {
+  type ComposerState,
   type DraftAttachment,
   DraftAttachmentSchema,
   type EffectiveConfigOverride,
@@ -37,7 +38,12 @@ import {
   MAX_FOLDER_FILES,
   MAX_TURN_ATTACHMENT_BYTES,
 } from "./attachments.js";
-import { GoalMutationBlockedByPendingTurnError, GoalMutationSupersededError } from "./errors.js";
+import {
+  ComposerRevisionConflictError,
+  GoalMutationBlockedByPendingTurnError,
+  GoalMutationSupersededError,
+  PlanModeMutationBlockedError,
+} from "./errors.js";
 
 export interface ProjectRecord {
   id: string;
@@ -119,6 +125,8 @@ export interface TaskRecord {
   archivedAt: string | null;
   lifecycleState: "DRAFT" | "ACTIVE" | "EXPIRED";
   draftExpiresAt: string | null;
+  planMode: boolean;
+  composerRevision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -229,6 +237,8 @@ interface TaskRow {
   archived_at: number | null;
   lifecycle_state: "DRAFT" | "ACTIVE" | "EXPIRED";
   draft_expires_at: number | null;
+  plan_mode: number;
+  composer_revision: number;
   created_at: number;
   updated_at: number;
 }
@@ -444,6 +454,73 @@ export class SQLitePlatformStore {
       .prepare("SELECT * FROM tasks WHERE id = ? AND owner_id = ?")
       .get(taskId, ownerId) as TaskRow | undefined;
     return row ? mapTask(row) : null;
+  }
+
+  getComposerState(threadId: string, ownerId: string): ComposerState | null {
+    const row = this.sqlite
+      .prepare(
+        `SELECT plan_mode, composer_revision
+         FROM tasks
+         WHERE id = ? AND owner_id = ? AND lifecycle_state IN ('DRAFT', 'ACTIVE')
+           AND archived_at IS NULL`,
+      )
+      .get(threadId, ownerId) as { plan_mode: number; composer_revision: number } | undefined;
+    return row ? { planMode: row.plan_mode === 1, revision: row.composer_revision } : null;
+  }
+
+  patchComposerState(input: {
+    threadId: string;
+    ownerId: string;
+    planMode: boolean;
+    expectedRevision: number;
+    now: Date;
+  }): ComposerState {
+    return this.immediateTransaction(() => {
+      const task = this.sqlite
+        .prepare(
+          `SELECT plan_mode, composer_revision
+           FROM tasks
+           WHERE id = ? AND owner_id = ? AND lifecycle_state IN ('DRAFT', 'ACTIVE')
+             AND archived_at IS NULL`,
+        )
+        .get(input.threadId, input.ownerId) as
+        | { plan_mode: number; composer_revision: number }
+        | undefined;
+      if (!task) throw new Error("Thread not found");
+      if (task.composer_revision !== input.expectedRevision) {
+        throw new ComposerRevisionConflictError();
+      }
+      const pending = this.sqlite
+        .prepare(
+          `SELECT status FROM turns
+           WHERE task_id = ?
+             AND status IN ('ALLOCATING', 'QUEUED', 'RUNNING', 'WAITING_APPROVAL')
+           ORDER BY started_at DESC, rowid DESC LIMIT 1`,
+        )
+        .get(input.threadId) as
+        | {
+            status: "ALLOCATING" | "QUEUED" | "RUNNING" | "WAITING_APPROVAL";
+          }
+        | undefined;
+      if (pending) throw new PlanModeMutationBlockedError(pending.status);
+      const nextRevision = task.composer_revision + 1;
+      const updated = this.sqlite
+        .prepare(
+          `UPDATE tasks
+           SET plan_mode = ?, composer_revision = ?, updated_at = ?
+           WHERE id = ? AND owner_id = ? AND composer_revision = ?`,
+        )
+        .run(
+          input.planMode ? 1 : 0,
+          nextRevision,
+          input.now.getTime(),
+          input.threadId,
+          input.ownerId,
+          input.expectedRevision,
+        );
+      if (updated.changes !== 1) throw new ComposerRevisionConflictError();
+      return { planMode: input.planMode, revision: nextRevision };
+    });
   }
 
   activateDraft(threadId: string, ownerId: string, now: Date): TaskRecord {
@@ -699,9 +776,13 @@ export class SQLitePlatformStore {
   }): TurnRecord {
     this.immediateTransaction(() => {
       const task = this.sqlite
-        .prepare("SELECT owner_id, lifecycle_state FROM tasks WHERE id = ?")
+        .prepare("SELECT owner_id, lifecycle_state, plan_mode FROM tasks WHERE id = ?")
         .get(input.taskId) as
-        | { owner_id: string; lifecycle_state: "DRAFT" | "ACTIVE" | "EXPIRED" }
+        | {
+            owner_id: string;
+            lifecycle_state: "DRAFT" | "ACTIVE" | "EXPIRED";
+            plan_mode: number;
+          }
         | undefined;
       if (!task || task.owner_id !== input.ownerId) throw new Error("Task not found");
       const attachmentIds = [...new Set(input.attachmentIds ?? [])];
@@ -732,7 +813,7 @@ export class SQLitePlatformStore {
       const active = this.sqlite
         .prepare(
           `SELECT 1 FROM turns
-           WHERE task_id = ? AND status IN ('ALLOCATING', 'QUEUED', 'RUNNING')
+           WHERE task_id = ? AND status IN ('ALLOCATING', 'QUEUED', 'RUNNING', 'WAITING_APPROVAL')
            LIMIT 1`,
         )
         .get(input.taskId);
@@ -762,14 +843,15 @@ export class SQLitePlatformStore {
       this.sqlite
         .prepare(
           `INSERT INTO turn_input_snapshots (
-            turn_id, prompt, attachments_json, goal_json, captured_at
-           ) VALUES (?, ?, ?, ?, ?)`,
+            turn_id, prompt, attachments_json, goal_json, plan_mode, captured_at
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.id,
           input.prompt,
           JSON.stringify(attachments),
           goal ? JSON.stringify(goal) : null,
+          task.plan_mode,
           input.now.getTime(),
         );
       if (attachmentIds.length > 0) {
@@ -800,6 +882,7 @@ export class SQLitePlatformStore {
           prompt: string;
           attachments_json: string;
           goal_json: string | null;
+          plan_mode: number;
           captured_at: number;
         }
       | undefined;
@@ -808,6 +891,7 @@ export class SQLitePlatformStore {
           prompt: row.prompt,
           attachments: JSON.parse(row.attachments_json),
           goal: row.goal_json ? JSON.parse(row.goal_json) : null,
+          planMode: row.plan_mode === 1,
           capturedAt: new Date(row.captured_at).toISOString(),
         })
       : null;
@@ -905,6 +989,7 @@ export class SQLitePlatformStore {
         prompt: input.prompt,
         attachments,
         goal: this.readThreadGoalSnapshot(input.taskId, input.ownerId),
+        planMode: this.getTurnInputSnapshot(input.turnId)?.planMode ?? false,
         capturedAt: input.now.toISOString(),
       });
     });
@@ -2897,6 +2982,8 @@ function mapTask(row: TaskRow): TaskRecord {
     lifecycleState: row.lifecycle_state,
     draftExpiresAt:
       row.draft_expires_at === null ? null : new Date(row.draft_expires_at).toISOString(),
+    planMode: row.plan_mode === 1,
+    composerRevision: row.composer_revision,
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
   };

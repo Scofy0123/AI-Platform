@@ -6,7 +6,10 @@ import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
   type ActorContext,
   type Bootstrap,
+  type CollaborationModePreset,
   type ComposerCapability,
+  type ComposerState,
+  type ComposerStatePatch,
   type DraftAttachment,
   type EffectiveConfigOverride,
   EffectiveConfigOverrideSchema,
@@ -51,7 +54,11 @@ import {
   MAX_TURN_ATTACHMENT_BYTES,
 } from "./attachments.js";
 import { listComposerCapabilities as buildComposerCapabilities } from "./composer-capabilities.js";
-import { GoalCapabilityUnavailableError, GoalMutationBlockedByPendingTurnError } from "./errors.js";
+import {
+  GoalCapabilityUnavailableError,
+  GoalMutationBlockedByPendingTurnError,
+  PlanModeCapabilityChangedError,
+} from "./errors.js";
 import type { LeasedTurn, SQLiteLeaseStore } from "./lease-store.js";
 import type {
   ApprovalTransportIdentity,
@@ -172,6 +179,13 @@ export interface GoalRuntimeCapability {
   reason: string | null;
 }
 
+export interface PlanModeCatalogCapability {
+  availability: "AVAILABLE" | "UNAVAILABLE";
+  reasonCode: string | null;
+  reason: string | null;
+  presets: CollaborationModePreset[];
+}
+
 export type AttachedGoalRuntimeResult<T> =
   | { attachment: "DETACHED" }
   | ({ attachment: "ATTACHED" } & T);
@@ -184,6 +198,10 @@ export interface RuntimeGoalProjection {
 export interface TaskExecutionAdapter {
   listModels(account: InternalAccount): Promise<ModelOption[]>;
   readGoalCapability(account: InternalAccount): Promise<GoalRuntimeCapability>;
+  readPlanModeCatalog(
+    account: InternalAccount,
+    requested?: { model: string | null; reasoningEffort: string },
+  ): Promise<PlanModeCatalogCapability>;
   setThreadGoal(
     threadId: string,
     goal: ThreadGoalSnapshot,
@@ -476,6 +494,7 @@ export class LocalPlatformService implements PlatformApi {
     const task = threadId ? this.options.store.getTaskForUser(threadId, userId) : null;
     if (threadId && !task) throw new Error("Thread not found");
     const goalCapability = await this.readGoalCapabilityForUser(userId, task?.accountId ?? null);
+    const planCapability = await this.readPlanCapabilityForUser(userId, task?.accountId ?? null);
     return buildComposerCapabilities({
       stagingAvailable: true,
       goalAvailable: goalCapability.availability === "AVAILABLE",
@@ -484,13 +503,40 @@ export class LocalPlatformService implements PlatformApi {
       ...(goalCapability.reasonCode
         ? { goalUnavailableReasonCode: goalCapability.reasonCode }
         : {}),
-      planModeAvailable: false,
-      planModeUnavailableReason: "Plan mode is awaiting locked-version protocol validation",
+      planModeAvailable: planCapability.availability === "AVAILABLE",
+      planModeUnavailableReason:
+        planCapability.reason ?? "Plan mode is unavailable for this Runtime",
+      ...(planCapability.reasonCode
+        ? { planModeUnavailableReasonCode: planCapability.reasonCode }
+        : {}),
       skillRecorderAvailable: false,
       skillRecorderUnavailableReason: "Requires an isolated Computer Use Worker",
       approvedSkills: [],
       approvedApps: [],
       recentThreads: [],
+    });
+  }
+
+  async patchThreadComposer(
+    threadId: string,
+    userId: string,
+    patch: ComposerStatePatch,
+  ): Promise<ComposerState> {
+    const task = this.requireTask(threadId, userId);
+    if (patch.planMode) {
+      const capability = await this.readPlanCapabilityForUser(userId, task.accountId);
+      if (capability.availability !== "AVAILABLE") {
+        throw new PlanModeCapabilityChangedError(
+          capability.reason ?? "Plan mode is unavailable for this Runtime",
+        );
+      }
+    }
+    return this.options.store.patchComposerState({
+      threadId,
+      ownerId: userId,
+      planMode: patch.planMode,
+      expectedRevision: patch.revision,
+      now: this.now(),
     });
   }
 
@@ -1302,6 +1348,10 @@ export class LocalPlatformService implements PlatformApi {
           }
         : null,
       items: events.map((event) => eventToThreadItem(task.id, event)),
+      composerState: {
+        planMode: task.planMode,
+        revision: task.composerRevision,
+      },
     };
   }
 
@@ -1673,6 +1723,58 @@ export class LocalPlatformService implements PlatformApi {
       if (capability.availability !== "AVAILABLE") return capability;
     }
     return { availability: "AVAILABLE", reasonCode: null, reason: null };
+  }
+
+  private async readPlanCapabilityForUser(
+    userId: string,
+    requiredAccountId: string | null,
+  ): Promise<PlanModeCatalogCapability> {
+    this.options.store.getUserIdentity(userId);
+    const accountIds = this.options.leases.listModelRoutingAccountIdsForUser(
+      userId,
+      this.now(),
+      requiredAccountId,
+    );
+    if (accountIds.length === 0) {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "NO_ROUTABLE_CODEX_ACCOUNT",
+        reason: "No routable Codex account can provide Plan mode",
+        presets: [],
+      };
+    }
+    let representative: CollaborationModePreset[] | null = null;
+    for (const accountId of accountIds) {
+      const account = this.options.accounts.getInternal(accountId);
+      if (!account) {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "CODEX_ACCOUNT_UNAVAILABLE",
+          reason: `Codex account ${accountId} is unavailable`,
+          presets: [],
+        };
+      }
+      const capability = await this.options.execution.readPlanModeCatalog(account);
+      if (capability.availability !== "AVAILABLE") return capability;
+      if (
+        !capability.presets.some((preset) => preset.mode === "plan") ||
+        !capability.presets.some((preset) => preset.mode === "default")
+      ) {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "PLAN_PRESET_MISSING",
+          reason: "Runtime must expose both plan and default collaboration presets",
+          presets: [],
+        };
+      }
+      representative ??= capability.presets.map(cloneCollaborationPreset);
+    }
+    return {
+      availability: "AVAILABLE",
+      reasonCode: null,
+      reason: null,
+      presets: representative ?? [],
+    };
   }
 
   private async ensureGoalCapability(
@@ -2122,9 +2224,38 @@ export class LocalPlatformService implements PlatformApi {
       if (!this.isAccountModelRoutingEligible(queuedTurn.ownerId, account.id)) {
         throw new AllocatedAccountIneligibleError();
       }
-      if (effectiveConfig.model !== queuedTurn.configSnapshot.model) {
-        this.options.store.updateTurnConfigSnapshot(allocation.turnId, effectiveConfig);
+      const turnInput = this.options.store.getTurnInputSnapshot(allocation.turnId);
+      if (!turnInput) throw new Error("Turn input snapshot is unavailable");
+      const planCapability = await this.options.execution.readPlanModeCatalog(account, {
+        model: effectiveConfig.model,
+        reasoningEffort: effectiveConfig.reasoningEffort,
+      });
+      if (planCapability.availability !== "AVAILABLE") {
+        throw new PlanModeCapabilityChangedError(
+          planCapability.reason ?? "Plan mode directory is unavailable on the allocated account",
+        );
       }
+      const targetMode = turnInput.planMode ? "plan" : "default";
+      const preset = planCapability.presets.find((candidate) => candidate.mode === targetMode);
+      if (!preset) {
+        throw new PlanModeCapabilityChangedError(
+          `The allocated Codex account no longer exposes the ${targetMode} preset`,
+        );
+      }
+      const requestedConfig = {
+        model: effectiveConfig.model,
+        reasoningEffort: effectiveConfig.reasoningEffort.toLowerCase(),
+        instructions: effectiveConfig.instructions,
+      };
+      effectiveConfig = EffectiveThreadConfigSnapshotSchema.parse({
+        ...effectiveConfig,
+        model: preset.settings.model,
+        reasoningEffort:
+          preset.settings.reasoningEffort ?? effectiveConfig.reasoningEffort.toLowerCase(),
+        requestedConfig,
+        collaborationPreset: cloneCollaborationPreset(preset),
+      });
+      this.options.store.updateTurnConfigSnapshot(allocation.turnId, effectiveConfig);
     } catch (error) {
       const accountBecameIneligible =
         error instanceof AllocatedAccountIneligibleError ||
@@ -2142,6 +2273,7 @@ export class LocalPlatformService implements PlatformApi {
             : "The selected model or Effort became unavailable before execution.",
       );
       if (error instanceof ModelCatalogUnavailableError && !accountBecameIneligible) throw error;
+      if (error instanceof PlanModeCapabilityChangedError) throw error;
       throw new AllocatedModelSelectionChangedError(
         accountBecameIneligible
           ? "Allocated Codex account became unavailable; submit the Turn again"
@@ -2474,6 +2606,14 @@ const ORGANIZATION_TOOL_SCOPES = [
   "demo_db_query",
   "demo_business_get",
 ] as const;
+
+function cloneCollaborationPreset(preset: CollaborationModePreset): CollaborationModePreset {
+  return {
+    name: preset.name,
+    mode: preset.mode,
+    settings: { ...preset.settings },
+  };
+}
 
 function withSettingsPolicy(settings: UserSettings): UserSettingsView {
   return {
