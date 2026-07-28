@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 
+import type { ExecutionPermissionSelection } from "@codexplatform/contracts";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { PermissionModePicker } from "./PermissionModePicker.js";
 
@@ -71,6 +73,39 @@ describe("PermissionModePicker", () => {
       profileId: null,
     });
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  test("uses a distinct icon for every permission mode and updates the trigger after selection", () => {
+    function StatefulPicker() {
+      const [value, setValue] = useState<ExecutionPermissionSelection>({
+        mode: "ASK_FOR_APPROVAL",
+        profileId: null,
+      });
+      return <PermissionModePicker value={value} options={OPTIONS} onChange={setValue} />;
+    }
+
+    render(<StatefulPicker />);
+
+    const trigger = screen.getByRole("button", { name: "Execution permissions" });
+    expect(trigger).toHaveAttribute("data-permission-icon", "hand");
+
+    fireEvent.click(trigger);
+    expect(screen.getByRole("menuitem", { name: /Ask for approval/ })).toHaveAttribute(
+      "data-permission-icon",
+      "hand",
+    );
+    expect(screen.getByRole("menuitem", { name: /Approve for me/ })).toHaveAttribute(
+      "data-permission-icon",
+      "approval-terminal",
+    );
+    expect(screen.getByRole("menuitem", { name: /Full access/ })).toHaveAttribute(
+      "data-permission-icon",
+      "shield-alert",
+    );
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Approve for me/ }));
+    expect(trigger).toHaveAttribute("data-permission-icon", "approval-terminal");
+    expect(trigger).toHaveAttribute("title", "Approve for me");
   });
 
   test("does not select policy-blocked Full access and shows why", () => {
