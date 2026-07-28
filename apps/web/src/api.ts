@@ -23,6 +23,9 @@ import type {
 
 interface RawSession {
   user: Session["user"];
+  expiresAt?: string;
+  persistent?: boolean;
+  feishuConnectionStatus?: Session["feishuConnectionStatus"];
 }
 
 interface RawProject extends Omit<ProjectSummary, "taskCount"> {
@@ -113,9 +116,20 @@ function readCookie(name: string): string | null {
 
 export const httpApi: PlatformApi = {
   getSession: async () => {
-    const session = await request<RawSession>("/api/auth/session");
-    return { authenticated: true, user: session.user };
+    let session = await request<RawSession>("/api/auth/session");
+    if (session.persistent === false) {
+      session = await request<RawSession>("/api/auth/session/persist", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    }
+    return normalizeSession(session);
   },
+  logout: () =>
+    request<void>("/api/auth/logout", {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
   getBootstrap: () => request<Bootstrap>("/api/bootstrap"),
   listModels: (threadId) =>
     request<ModelCatalog>(
@@ -247,6 +261,16 @@ export const httpApi: PlatformApi = {
     }));
   },
 };
+
+function normalizeSession(session: RawSession): Session {
+  return {
+    authenticated: true,
+    user: session.user,
+    expiresAt: session.expiresAt ?? "",
+    persistent: session.persistent ?? false,
+    feishuConnectionStatus: session.feishuConnectionStatus ?? "REAUTH_REQUIRED",
+  };
+}
 
 function normalizeTaskStatus(status: string): TaskSummary["status"] {
   const supported = new Set<TaskSummary["status"]>([

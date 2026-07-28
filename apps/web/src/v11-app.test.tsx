@@ -9,11 +9,17 @@ import type { Session } from "./types.js";
 
 const adminSession = {
   authenticated: true as const,
+  expiresAt: "2026-08-20T10:00:00.000Z",
+  persistent: true,
+  feishuConnectionStatus: "CONNECTED" as const,
   user: { id: "user-1", name: "林可", role: "ADMIN" as const },
 };
 
 const memberSession = {
   authenticated: true as const,
+  expiresAt: "2026-08-20T10:00:00.000Z",
+  persistent: true,
+  feishuConnectionStatus: "CONNECTED" as const,
   user: { id: "user-2", name: "周宁", role: "MEMBER" as const },
 };
 
@@ -124,6 +130,7 @@ const thread = {
 function createApi(session: Session = adminSession) {
   return {
     getSession: vi.fn().mockResolvedValue(session),
+    logout: vi.fn().mockResolvedValue(undefined),
     getBootstrap: vi.fn().mockResolvedValue({
       platformVersion: "0.1.0",
       defaultMode: "CODEX",
@@ -1482,6 +1489,18 @@ describe("CodexPlatform 1.1 Thread archive", () => {
 });
 
 describe("CodexPlatform 1.1 personal settings", () => {
+  test("shows the trusted-device session and revokes it from Profile", async () => {
+    const api = createApi();
+    render(<App initialEntries={["/settings/profile"]} api={api} />);
+
+    expect(await screen.findByText("Managed by your organization")).toBeInTheDocument();
+    expect(screen.getByText("Trusted device · 30 days")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "退出登录" }));
+
+    await waitFor(() => expect(api.logout).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("link", { name: "使用飞书登录" })).toBeInTheDocument();
+  });
+
   test("contains only the approved personal sections and uses the Runtime model catalog", async () => {
     render(<App initialEntries={["/settings/execution"]} api={createApi()} />);
 

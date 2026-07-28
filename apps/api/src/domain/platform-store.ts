@@ -129,7 +129,7 @@ export interface UserConnectionRecord {
   managed: true;
   connected: boolean;
   scopes: string[];
-  status: "CONNECTED" | "NOT_CONNECTED";
+  status: "CONNECTED" | "REFRESHING" | "REAUTH_REQUIRED" | "NOT_CONNECTED";
 }
 
 interface ProjectRow {
@@ -977,16 +977,21 @@ export class SQLitePlatformStore {
   getUserConnections(userId: string): UserConnectionRecord[] {
     this.requireUser(userId);
     const row = this.sqlite
-      .prepare("SELECT scopes FROM feishu_credentials WHERE user_id = ?")
-      .get(userId) as { scopes: string } | undefined;
+      .prepare("SELECT scopes, status FROM feishu_credentials WHERE user_id = ?")
+      .get(userId) as
+      | {
+          scopes: string;
+          status: "CONNECTED" | "REFRESHING" | "REAUTH_REQUIRED";
+        }
+      | undefined;
     return [
       {
         id: "feishu",
         name: "飞书",
         managed: true,
-        connected: Boolean(row),
+        connected: Boolean(row && row.status !== "REAUTH_REQUIRED"),
         scopes: row ? safeStringArray(row.scopes) : [],
-        status: row ? "CONNECTED" : "NOT_CONNECTED",
+        status: row?.status ?? "NOT_CONNECTED",
       },
     ];
   }

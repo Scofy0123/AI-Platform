@@ -12,7 +12,7 @@ import type {
   UserSettingsPatch,
   UserSettingsView,
 } from "@codexplatform/contracts";
-import type { PlatformUser } from "./auth/auth-store.js";
+import type { PlatformUser, ResolvedAuthSession } from "./auth/auth-store.js";
 
 export interface AuthApi {
   startLogin(): { state: string; browserBinding: string; authorizationUrl: string };
@@ -21,10 +21,11 @@ export interface AuthApi {
     sessionToken: string;
     csrfToken: string;
   }>;
-  resolveSession(
-    sessionToken: string,
-  ): { user: PlatformUser; csrfHash: string; expiresAt: Date } | null;
+  resolveSession(sessionToken: string): ResolvedAuthSession | null;
   verifyCsrf(expectedHash: string, providedToken: string): boolean;
+  persistSession(sessionToken: string): ResolvedAuthSession | null;
+  revokeSession(sessionToken: string): void;
+  refreshExpiringCredentials(): Promise<void>;
 }
 
 export interface PlatformApi {

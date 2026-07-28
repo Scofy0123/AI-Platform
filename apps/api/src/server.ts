@@ -9,7 +9,7 @@ import cors from "@fastify/cors";
 import sensible from "@fastify/sensible";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
-import type { PlatformUser } from "./auth/auth-store.js";
+import type { FeishuConnectionStatus, PlatformUser } from "./auth/auth-store.js";
 import {
   AllocatedModelSelectionChangedError,
   ModelCatalogUnavailableError,
@@ -32,10 +32,15 @@ interface ActorSession {
   user: PlatformUser;
   csrfHash: string;
   expiresAt: Date;
+  persistent: boolean;
+  feishuConnectionStatus: FeishuConnectionStatus;
 }
 
 const OAUTH_BINDING_COOKIE = "codexplatform_oauth_binding";
 const OAUTH_BINDING_COOKIE_PATH = "/api/auth/feishu/callback";
+const SESSION_COOKIE = "codexplatform_session";
+const CSRF_COOKIE = "codexplatform_csrf";
+const TRUSTED_DEVICE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const runtimePathContext: RuntimePathRedactionContext = options.runtimeDataDir
@@ -113,6 +118,7 @@ function registerRoutes(
   webOrigin: string,
   runtimePathContext: RuntimePathRedactionContext,
 ): void {
+  const secureCookies = new URL(webOrigin).protocol === "https:";
   app.get("/api/bootstrap", async () => platform.getBootstrap());
 
   app.get("/api/models", async (request, reply) => {
@@ -161,25 +167,41 @@ function registerRoutes(
       state: query.data.state,
       browserBinding,
     });
-    reply.setCookie("codexplatform_session", result.sessionToken, {
-      path: "/",
-      httpOnly: true,
-      sameSite: "strict",
-      secure: false,
-    });
-    reply.setCookie("codexplatform_csrf", result.csrfToken, {
-      path: "/",
-      httpOnly: false,
-      sameSite: "strict",
-      secure: false,
-    });
+    setAuthCookies(reply, result.sessionToken, result.csrfToken, secureCookies);
     return reply.redirect(webOrigin);
   });
 
   app.get("/api/auth/session", async (request, reply) => {
     const session = requireSession(request, reply, auth);
     if (!session) return;
-    return { user: session.user };
+    return serializeSession(session);
+  });
+
+  app.post("/api/auth/session/persist", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const sessionToken = request.cookies[SESSION_COOKIE];
+    const csrfToken = request.cookies[CSRF_COOKIE];
+    if (!sessionToken || !csrfToken) {
+      clearAuthCookies(reply, secureCookies);
+      return reply.code(401).send({ error: "Authentication required" });
+    }
+    const persisted = auth.persistSession(sessionToken);
+    if (!persisted) {
+      clearAuthCookies(reply, secureCookies);
+      return reply.code(401).send({ error: "Authentication required" });
+    }
+    setAuthCookies(reply, sessionToken, csrfToken, secureCookies);
+    return serializeSession(persisted);
+  });
+
+  app.post("/api/auth/logout", async (request, reply) => {
+    const actor = requireWriteSession(request, reply, auth);
+    if (!actor) return;
+    const sessionToken = request.cookies[SESSION_COOKIE];
+    if (sessionToken) auth.revokeSession(sessionToken);
+    clearAuthCookies(reply, secureCookies);
+    return reply.code(204).send();
   });
 
   app.get("/api/projects", async (request, reply) => {
@@ -603,6 +625,9 @@ function requireSession(
   const token = request.cookies.codexplatform_session;
   const session = token ? auth.resolveSession(token) : null;
   if (!session) {
+    if (token || request.cookies.codexplatform_csrf) {
+      clearAuthCookies(reply, request.protocol === "https");
+    }
     reply.code(401).send({ error: "Authentication required" });
     return null;
   }
@@ -704,6 +729,17 @@ export async function streamTaskEvents(
     cleanup();
     if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.end();
   };
+  const scheduleExpiry = () => {
+    if (closed) return;
+    const remaining = input.sessionExpiresAt.getTime() - Date.now();
+    if (remaining <= 0) {
+      expire();
+      return;
+    }
+    // Node timers use a signed 32-bit delay. A 30 day trusted-device
+    // session must therefore be checked in bounded segments.
+    expiry = setTimeout(scheduleExpiry, Math.min(remaining, 2_147_000_000));
+  };
   heartbeat = setInterval(() => {
     let valid = false;
     try {
@@ -717,7 +753,7 @@ export async function streamTaskEvents(
     }
     reply.raw.write(": heartbeat\n\n");
   }, 15_000);
-  expiry = setTimeout(expire, Math.max(0, input.sessionExpiresAt.getTime() - Date.now()));
+  scheduleExpiry();
   reply.raw.once("close", cleanup);
   try {
     unsubscribe = await subscribeWithReplay({
@@ -977,6 +1013,54 @@ function clearOAuthBindingCookie(reply: FastifyReply): void {
     sameSite: "lax",
     secure: false,
   });
+}
+
+function setAuthCookies(
+  reply: FastifyReply,
+  sessionToken: string,
+  csrfToken: string,
+  secure: boolean,
+): void {
+  reply.setCookie(SESSION_COOKIE, sessionToken, {
+    path: "/",
+    maxAge: TRUSTED_DEVICE_MAX_AGE_SECONDS,
+    httpOnly: true,
+    sameSite: "strict",
+    secure,
+  });
+  reply.setCookie(CSRF_COOKIE, csrfToken, {
+    path: "/",
+    maxAge: TRUSTED_DEVICE_MAX_AGE_SECONDS,
+    httpOnly: false,
+    sameSite: "strict",
+    secure,
+  });
+}
+
+function clearAuthCookies(reply: FastifyReply, secure: boolean): void {
+  reply.setCookie(SESSION_COOKIE, "", {
+    path: "/",
+    maxAge: 0,
+    httpOnly: true,
+    sameSite: "strict",
+    secure,
+  });
+  reply.setCookie(CSRF_COOKIE, "", {
+    path: "/",
+    maxAge: 0,
+    httpOnly: false,
+    sameSite: "strict",
+    secure,
+  });
+}
+
+function serializeSession(session: ActorSession) {
+  return {
+    user: session.user,
+    expiresAt: session.expiresAt.toISOString(),
+    persistent: session.persistent,
+    feishuConnectionStatus: session.feishuConnectionStatus,
+  };
 }
 
 function once(callback: () => void): () => void {

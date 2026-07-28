@@ -2242,6 +2242,19 @@ function GeneralSettings({ value }: { value: UserSettingsView }) {
 }
 
 function ProfileSettings({ session }: { session: Session }) {
+  const api = useApi();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const logout = useMutation({
+    mutationFn: () => {
+      if (!api.logout) throw new Error("Logout endpoint unavailable");
+      return api.logout();
+    },
+    onSuccess: () => {
+      queryClient.clear();
+      navigate("/login", { replace: true });
+    },
+  });
   return (
     <SettingsCard title="Feishu profile">
       <SettingRow label="Name">
@@ -2250,6 +2263,20 @@ function ProfileSettings({ session }: { session: Session }) {
       <SettingRow label="Identity">
         <span>Managed by your organization</span>
       </SettingRow>
+      <SettingRow label="Session">
+        <span>{session.persistent ? "Trusted device · 30 days" : "Browser session"}</span>
+      </SettingRow>
+      <SettingRow label="Feishu connection">
+        <span>{formatFeishuConnectionStatus(session.feishuConnectionStatus)}</span>
+      </SettingRow>
+      <button type="button" disabled={logout.isPending} onClick={() => logout.mutate()}>
+        退出登录
+      </button>
+      {logout.isError ? (
+        <InlineError
+          copy={logout.error instanceof Error ? logout.error.message : "退出登录失败，请重试。"}
+        />
+      ) : null}
     </SettingsCard>
   );
 }
@@ -2384,13 +2411,25 @@ function ConnectionsSettings() {
       {ready
         ? connections.data.map((item) => (
             <SettingRow label={item.name} key={item.id}>
-              <strong>{item.connected ? "Connected" : "Not connected"}</strong>
+              <strong>{formatConnectionStatus(item.status, item.connected)}</strong>
               <span>{item.managed ? "Managed by organization" : "Personal"}</span>
             </SettingRow>
           ))
         : null}
     </SettingsCard>
   );
+}
+
+function formatFeishuConnectionStatus(status: Session["feishuConnectionStatus"]): string {
+  if (status === "REFRESHING") return "Refreshing";
+  if (status === "REAUTH_REQUIRED") return "Reconnect Feishu";
+  return "Connected";
+}
+
+function formatConnectionStatus(status: string, connected: boolean): string {
+  if (status === "REFRESHING") return "Refreshing";
+  if (status === "REAUTH_REQUIRED") return "Reconnect Feishu";
+  return connected ? "Connected" : "Not connected";
 }
 
 function PluginsSettings() {

@@ -3,9 +3,61 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { httpApi } from "./api.js";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  Reflect.set(document, "cookie", "codexplatform_csrf=; Max-Age=0; Path=/");
+});
 
 describe("HTTP API adapter", () => {
+  test("upgrades an existing non-persistent session once without another OAuth login", async () => {
+    Reflect.set(document, "cookie", "codexplatform_csrf=csrf-1; Path=/");
+    const session = {
+      user: { id: "user-1", name: "林可", role: "ADMIN", avatarUrl: null },
+      expiresAt: "2026-07-21T22:00:00.000Z",
+      persistent: false,
+      feishuConnectionStatus: "CONNECTED",
+    };
+    const persisted = {
+      ...session,
+      expiresAt: "2026-08-20T10:00:00.000Z",
+      persistent: true,
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(session))
+      .mockResolvedValueOnce(jsonResponse(persisted));
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(httpApi.getSession()).resolves.toMatchObject({
+      authenticated: true,
+      persistent: true,
+      expiresAt: "2026-08-20T10:00:00.000Z",
+    });
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/auth/session",
+      "/api/auth/session/persist",
+    ]);
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({ method: "POST" });
+  });
+
+  test("revokes the server session when the user logs out", async () => {
+    Reflect.set(document, "cookie", "codexplatform_csrf=csrf-1; Path=/");
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await httpApi.logout?.();
+
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/auth/logout",
+      expect.objectContaining({
+        method: "POST",
+        credentials: "include",
+      }),
+    );
+  });
+
   test("reads account-independent model catalogs for new and bound Threads", async () => {
     const fetcher = vi
       .fn<typeof fetch>()

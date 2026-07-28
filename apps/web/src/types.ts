@@ -32,6 +32,9 @@ export type UserRole = "ADMIN" | "MEMBER";
 
 export interface Session {
   authenticated: boolean;
+  expiresAt: string;
+  persistent: boolean;
+  feishuConnectionStatus: "CONNECTED" | "REFRESHING" | "REAUTH_REQUIRED";
   user: {
     id: string;
     name: string;
@@ -169,6 +172,7 @@ export interface RuntimeHealth {
 
 export interface PlatformApi {
   getSession(): Promise<Session>;
+  logout?(): Promise<void>;
   getBootstrap?(): Promise<Bootstrap>;
   listModels?(threadId?: string): Promise<ModelCatalog>;
   listComposerCapabilities?(threadId?: string): Promise<ComposerCapability[]>;

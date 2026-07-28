@@ -8,6 +8,9 @@ import type { TaskEvent, Thread } from "./types.js";
 
 const session = {
   authenticated: true as const,
+  expiresAt: "2026-08-20T10:00:00.000Z",
+  persistent: true,
+  feishuConnectionStatus: "CONNECTED" as const,
   user: { id: "user-1", name: "林可", role: "ADMIN" as const },
 };
 
@@ -28,6 +31,7 @@ const tasks = [
 function createApi() {
   return {
     getSession: vi.fn().mockResolvedValue(session),
+    logout: vi.fn().mockResolvedValue(undefined),
     getBootstrap: vi.fn().mockResolvedValue({
       platformVersion: "0.1.0",
       defaultMode: "CODEX",

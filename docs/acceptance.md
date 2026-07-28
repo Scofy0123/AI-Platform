@@ -383,6 +383,16 @@ unset FEISHU_E2E_USER_ACCESS_TOKEN
 
 完成后清理 Shell 环境和终端滚屏。测试通过只证明该 Token 的 Feishu Client 链路，不证明 Codex Dynamic Tool、另一名用户权限隔离或真实共享账号已通过。
 
+真实 Refresh Token 轮换使用同一命令的独立门禁。先停止 API，避免与后台刷新循环竞争，然后复用平台真实数据库和 `.env.local`：
+
+```bash
+export REAL_FEISHU_REFRESH_E2E=1
+export DATABASE_PATH=/absolute/path/to/real-codexplatform.sqlite
+pnpm test:real-feishu
+```
+
+该 Smoke 不输出或导出 Token；它通过平台 AES-GCM SecretStore 解密当前活跃用户凭证，调用飞书刷新接口，并在同一数据库事务中验证新 Refresh Token、到期时间和 `CONNECTED` 状态。完成后重新启动 API。
+
 ## 验收记录模板
 
 | 项目 | Runtime | 执行时间 | 操作者 | 结果 | 证据 |

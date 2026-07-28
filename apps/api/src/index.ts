@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createApplication } from "./composition.js";
 import { loadConfig } from "./config.js";
 
@@ -20,6 +21,10 @@ try {
   application.app.log.info(
     {
       runtimeMode: config.runtime.mode,
+      storageFingerprint: createHash("sha256")
+        .update(`${config.storage.databasePath}\0${config.storage.runtimeDataDir}`)
+        .digest("hex")
+        .slice(0, 12),
       credentialIsolation: application.safetyProbe?.status ?? "SIMULATED",
     },
     "CodexPlatform is ready",

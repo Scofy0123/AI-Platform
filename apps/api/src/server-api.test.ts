@@ -71,9 +71,11 @@ describe("CodexPlatform HTTP API", () => {
     expect(cookies).toEqual(
       expect.arrayContaining([
         expect.stringContaining(
-          "codexplatform_session=valid-session; Path=/; HttpOnly; SameSite=Strict",
+          "codexplatform_session=valid-session; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict",
         ),
-        expect.stringContaining("codexplatform_csrf=valid-csrf; Path=/; SameSite=Strict"),
+        expect.stringContaining(
+          "codexplatform_csrf=valid-csrf; Max-Age=2592000; Path=/; SameSite=Strict",
+        ),
         expect.stringContaining(
           "codexplatform_oauth_binding=; Max-Age=0; Path=/api/auth/feishu/callback; HttpOnly; SameSite=Lax",
         ),
@@ -85,12 +87,102 @@ describe("CodexPlatform HTTP API", () => {
       browserBinding: "binding-1",
     });
 
+    const session = await app.inject({
+      method: "GET",
+      url: "/api/auth/session",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    expect(session.json()).toMatchObject({
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      persistent: false,
+      feishuConnectionStatus: "CONNECTED",
+    });
+
+    const persist = await app.inject({
+      method: "POST",
+      url: "/api/auth/session/persist",
+      headers: { "x-csrf-token": "valid-csrf" },
+      cookies: {
+        codexplatform_session: "valid-session",
+        codexplatform_csrf: "valid-csrf",
+      },
+    });
+    expect(persist.statusCode).toBe(200);
+    expect(auth.persistSession).toHaveBeenCalledWith("valid-session");
+    expect(persist.headers["set-cookie"]).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("codexplatform_session=valid-session; Max-Age=2592000"),
+        expect.stringContaining("codexplatform_csrf=valid-csrf; Max-Age=2592000"),
+      ]),
+    );
+
+    const logout = await app.inject({
+      method: "POST",
+      url: "/api/auth/logout",
+      headers: { "x-csrf-token": "valid-csrf" },
+      cookies: {
+        codexplatform_session: "valid-session",
+        codexplatform_csrf: "valid-csrf",
+      },
+    });
+    expect(logout.statusCode).toBe(204);
+    expect(auth.revokeSession).toHaveBeenCalledWith("valid-session");
+    expect(logout.headers["set-cookie"]).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("codexplatform_session=; Max-Age=0"),
+        expect.stringContaining("codexplatform_csrf=; Max-Age=0"),
+      ]),
+    );
+
     const replay = await app.inject({
       method: "GET",
       url: "/api/auth/feishu/callback?code=code-1&state=state-1",
       cookies: { codexplatform_oauth_binding: "binding-1" },
     });
     expect(replay.statusCode).toBe(400);
+  });
+
+  test("clears stale authentication cookies when the server session is invalid", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform, webOrigin: "http://127.0.0.1:5173" });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/auth/session",
+      cookies: { codexplatform_session: "expired-session" },
+    });
+
+    expect(response.statusCode).toBe(401);
+    expect(response.headers["set-cookie"]).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("codexplatform_session=; Max-Age=0"),
+        expect.stringContaining("codexplatform_csrf=; Max-Age=0"),
+      ]),
+    );
+  });
+
+  test("marks authentication cookies Secure for an HTTPS web origin", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform, webOrigin: "https://localhost:5173" });
+    apps.push(app);
+
+    const callback = await app.inject({
+      method: "GET",
+      url: "/api/auth/feishu/callback?code=code-1&state=state-1",
+      cookies: { codexplatform_oauth_binding: "binding-1" },
+    });
+
+    expect(callback.headers["set-cookie"]).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          "codexplatform_session=valid-session; Max-Age=2592000; Path=/; HttpOnly; Secure; SameSite=Strict",
+        ),
+        expect.stringContaining(
+          "codexplatform_csrf=valid-csrf; Max-Age=2592000; Path=/; Secure; SameSite=Strict",
+        ),
+      ]),
+    );
   });
 
   test("buffers events published during replay and emits every sequence once", async () => {
@@ -153,6 +245,35 @@ describe("CodexPlatform HTTP API", () => {
 
       expect(raw.end).toHaveBeenCalledOnce();
       expect(unsubscribe).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not overflow the SSE expiry timer for a 30 day trusted session", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-21T12:00:00.000Z"));
+    try {
+      const raw = Object.assign(new EventEmitter(), {
+        destroyed: false,
+        writableEnded: false,
+        writeHead: vi.fn(),
+        write: vi.fn(() => true),
+        end: vi.fn(),
+        destroy: vi.fn(),
+      });
+
+      await streamTaskEvents({ hijack: vi.fn(), raw } as never, {
+        afterSequence: 0,
+        loadReplay: async () => [],
+        subscribe: () => vi.fn(),
+        sessionExpiresAt: new Date("2026-08-20T12:00:00.000Z"),
+        isSessionValid: () => true,
+      });
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(raw.end).not.toHaveBeenCalled();
+      raw.emit("close");
     } finally {
       vi.useRealTimers();
     }
@@ -1242,9 +1363,28 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
     }),
     resolveSession: (token) =>
       token === "valid-session"
-        ? { user, csrfHash: "csrf-hash", expiresAt: new Date("2099-01-01T00:00:00.000Z") }
+        ? {
+            user,
+            csrfHash: "csrf-hash",
+            expiresAt: new Date("2099-01-01T00:00:00.000Z"),
+            persistent: false,
+            feishuConnectionStatus: "CONNECTED" as const,
+          }
         : null,
     verifyCsrf: (_hash, token) => token === "valid-csrf",
+    persistSession: vi.fn((token) =>
+      token === "valid-session"
+        ? {
+            user,
+            csrfHash: "csrf-hash",
+            expiresAt: new Date("2099-01-01T00:00:00.000Z"),
+            persistent: true,
+            feishuConnectionStatus: "CONNECTED" as const,
+          }
+        : null,
+    ),
+    revokeSession: vi.fn(),
+    refreshExpiringCredentials: vi.fn(async () => undefined),
   };
   const event = {
     taskId: "task-1",

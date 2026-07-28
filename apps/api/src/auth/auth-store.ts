@@ -13,10 +13,21 @@ export interface PlatformUser {
   role: "ADMIN" | "MEMBER";
 }
 
+export type FeishuConnectionStatus = "CONNECTED" | "REFRESHING" | "REAUTH_REQUIRED";
+
 export interface StoredFeishuCredentials extends FeishuTokenSet {
   userId: string;
   accessExpiresAt: Date;
   refreshExpiresAt: Date;
+  status: FeishuConnectionStatus;
+}
+
+export interface ResolvedAuthSession {
+  user: PlatformUser;
+  csrfHash: string;
+  expiresAt: Date;
+  persistent: boolean;
+  feishuConnectionStatus: FeishuConnectionStatus;
 }
 
 interface UserRow {
@@ -37,6 +48,7 @@ interface CredentialRow {
   refresh_expires_at: number;
   scopes: string;
   token_type: string;
+  status: FeishuConnectionStatus;
 }
 
 export class SQLiteAuthStore {
@@ -118,25 +130,57 @@ export class SQLiteAuthStore {
     });
   }
 
-  resolveSession(
-    sessionToken: string,
-    now: Date,
-  ): { user: PlatformUser; csrfHash: string; expiresAt: Date } | null {
+  resolveSession(sessionToken: string, now: Date): ResolvedAuthSession | null {
     const row = this.sqlite
       .prepare(
-        `SELECT u.*, s.csrf_hash, s.expires_at
-         FROM sessions s JOIN users u ON u.id = s.user_id
+        `SELECT u.*, s.csrf_hash, s.expires_at, s.persistent_at,
+                COALESCE(c.status, 'REAUTH_REQUIRED') AS feishu_connection_status
+         FROM sessions s
+         JOIN users u ON u.id = s.user_id
+         LEFT JOIN feishu_credentials c ON c.user_id = s.user_id
          WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?`,
       )
       .get(hash(sessionToken), now.getTime()) as
-      | (UserRow & { csrf_hash: string; expires_at: number })
+      | (UserRow & {
+          csrf_hash: string;
+          expires_at: number;
+          persistent_at: number | null;
+          feishu_connection_status: FeishuConnectionStatus;
+        })
       | undefined;
     if (!row) return null;
     return {
       user: mapUser(row),
       csrfHash: row.csrf_hash,
       expiresAt: new Date(row.expires_at),
+      persistent: row.persistent_at !== null,
+      feishuConnectionStatus: row.feishu_connection_status,
     };
+  }
+
+  persistSession(sessionToken: string, now: Date, ttlMs: number): ResolvedAuthSession | null {
+    this.immediateTransaction(() => {
+      this.sqlite
+        .prepare(
+          `UPDATE sessions
+           SET persistent_at = ?, expires_at = ?
+           WHERE token_hash = ?
+             AND revoked_at IS NULL
+             AND expires_at > ?
+             AND persistent_at IS NULL`,
+        )
+        .run(now.getTime(), now.getTime() + ttlMs, hash(sessionToken), now.getTime());
+    });
+    return this.resolveSession(sessionToken, now);
+  }
+
+  revokeSession(sessionToken: string, now: Date): void {
+    this.sqlite
+      .prepare(
+        `UPDATE sessions SET revoked_at = ?
+         WHERE token_hash = ? AND revoked_at IS NULL`,
+      )
+      .run(now.getTime(), hash(sessionToken));
   }
 
   verifyCsrf(expectedHash: string, providedToken: string): boolean {
@@ -158,6 +202,7 @@ export class SQLiteAuthStore {
       refreshTokenExpiresIn: Math.max(0, Math.round((row.refresh_expires_at - Date.now()) / 1_000)),
       scopes: JSON.parse(row.scopes) as string[],
       tokenType: row.token_type,
+      status: row.status,
     };
   }
 
@@ -169,6 +214,55 @@ export class SQLiteAuthStore {
       if (!exists) throw new Error(`Missing Feishu credentials for user ${userId}`);
       this.upsertCredentials(userId, tokens, now);
     });
+  }
+
+  markCredentialsRefreshing(userId: string, now: Date): void {
+    this.sqlite
+      .prepare(
+        `UPDATE feishu_credentials
+         SET status = 'REFRESHING', last_refresh_error_code = NULL, updated_at = ?
+         WHERE user_id = ? AND status != 'REAUTH_REQUIRED'`,
+      )
+      .run(now.getTime(), userId);
+  }
+
+  markCredentialsConnected(userId: string, now: Date, errorCode: string | null = null): void {
+    this.sqlite
+      .prepare(
+        `UPDATE feishu_credentials
+         SET status = 'CONNECTED', last_refresh_error_code = ?,
+             reauth_required_at = NULL, updated_at = ?
+         WHERE user_id = ?`,
+      )
+      .run(errorCode, now.getTime(), userId);
+  }
+
+  markCredentialsReauthRequired(userId: string, now: Date, errorCode: string): void {
+    this.sqlite
+      .prepare(
+        `UPDATE feishu_credentials
+         SET status = 'REAUTH_REQUIRED', last_refresh_error_code = ?,
+             reauth_required_at = ?, updated_at = ?
+         WHERE user_id = ?`,
+      )
+      .run(errorCode, now.getTime(), now.getTime(), userId);
+  }
+
+  listCredentialRefreshCandidates(now: Date, threshold: Date): string[] {
+    return (
+      this.sqlite
+        .prepare(
+          `SELECT DISTINCT c.user_id
+           FROM feishu_credentials c
+           JOIN sessions s ON s.user_id = c.user_id
+           WHERE c.status = 'CONNECTED'
+             AND c.access_expires_at <= ?
+             AND c.refresh_expires_at > ?
+             AND s.revoked_at IS NULL
+             AND s.expires_at > ?`,
+        )
+        .all(threshold.getTime(), now.getTime(), now.getTime()) as Array<{ user_id: string }>
+    ).map((row) => row.user_id);
   }
 
   countUsers(): number {
@@ -205,6 +299,9 @@ export class SQLiteAuthStore {
            refresh_expires_at = excluded.refresh_expires_at,
            scopes = excluded.scopes,
            token_type = excluded.token_type,
+           status = 'CONNECTED',
+           last_refresh_error_code = NULL,
+           reauth_required_at = NULL,
            updated_at = excluded.updated_at`,
       )
       .run(
