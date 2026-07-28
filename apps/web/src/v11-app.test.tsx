@@ -1102,7 +1102,7 @@ describe("CodexPlatform 1.1 user workspace", () => {
       expect(api.startThreadTurn).toHaveBeenCalledWith("thread-created", "整理知识库", {
         model: "fake-codex-deep",
         reasoningEffort: "xhigh",
-        permissionMode: "DEFAULT",
+        permissionMode: "ASK_FOR_APPROVAL",
       }),
     );
   });
@@ -1129,6 +1129,10 @@ describe("CodexPlatform 1.1 user workspace", () => {
     api.getMySettings.mockResolvedValue({
       ...settings,
       general: { ...settings.general, defaultProjectId: "default-project" },
+      policy: {
+        ...settings.policy,
+        allowedPermissionModes: ["ASK_FOR_APPROVAL", "APPROVE_FOR_ME"],
+      },
     });
     render(<App initialEntries={["/threads/new?project=project-1"]} api={api} />);
 
@@ -1137,13 +1141,11 @@ describe("CodexPlatform 1.1 user workspace", () => {
         name: "Model and Effort: Fake Codex Standard · medium",
       }),
     );
-    const permission = screen.getByLabelText("Turn permission mode");
     expect(screen.queryByRole("radio", { name: "ultra" })).not.toBeInTheDocument();
-    expect(
-      within(permission).queryByRole("option", { name: "FULL_ACCESS" }),
-    ).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("radio", { name: "high" }));
-    fireEvent.change(permission, { target: { value: "READ_ONLY" } });
+    fireEvent.click(screen.getByRole("button", { name: "Execution permissions" }));
+    expect(screen.getByRole("menuitem", { name: /Full access/ })).toBeDisabled();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Approve for me/ }));
     fireEvent.change(screen.getByLabelText("Message Codex"), {
       target: { value: "整理知识库" },
     });
@@ -1156,14 +1158,14 @@ describe("CodexPlatform 1.1 user workspace", () => {
         config: {
           model: "fake-codex-standard",
           reasoningEffort: "high",
-          permissionMode: "READ_ONLY",
+          permissionMode: "APPROVE_FOR_ME",
         },
       }),
     );
     expect(api.startThreadTurn).toHaveBeenCalledWith("thread-created", "整理知识库", {
       model: "fake-codex-standard",
       reasoningEffort: "high",
-      permissionMode: "READ_ONLY",
+      permissionMode: "APPROVE_FOR_ME",
     });
   });
 
@@ -1255,9 +1257,8 @@ describe("CodexPlatform 1.1 user workspace", () => {
       }),
     );
     fireEvent.click(screen.getByRole("radio", { name: "high" }));
-    fireEvent.change(screen.getByLabelText("Turn permission mode"), {
-      target: { value: "WORKSPACE_WRITE" },
-    });
+    fireEvent.click(screen.getByRole("button", { name: "Execution permissions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Ask for approval/ }));
     fireEvent.change(screen.getByLabelText("Message Codex"), {
       target: { value: "继续完善交付物" },
     });
@@ -1267,7 +1268,7 @@ describe("CodexPlatform 1.1 user workspace", () => {
       expect(api.startThreadTurn).toHaveBeenCalledWith("thread-1", "继续完善交付物", {
         model: "fake-codex-standard",
         reasoningEffort: "high",
-        permissionMode: "WORKSPACE_WRITE",
+        permissionMode: "ASK_FOR_APPROVAL",
       }),
     );
   });
@@ -1280,7 +1281,7 @@ describe("CodexPlatform 1.1 user workspace", () => {
         name: "Model and Effort: Fake Codex Standard · medium",
       }),
     ).toBeDisabled();
-    expect(screen.getByLabelText("Turn permission mode")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Execution permissions" })).toBeDisabled();
     expect(screen.getByText(/Steer 沿用当前 Turn 的执行设置/)).toBeInTheDocument();
   });
 
@@ -1300,7 +1301,7 @@ describe("CodexPlatform 1.1 user workspace", () => {
         name: "Model and Effort: Fake Codex Standard · medium",
       }),
     ).toBeDisabled();
-    expect(screen.getByLabelText("Turn permission mode")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Execution permissions" })).toBeDisabled();
     expect(screen.getByLabelText("Message Codex")).toBeDisabled();
     expect(screen.getByText(/正在排队，暂不能提交新的 Turn/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "发送消息" })).toBeDisabled();

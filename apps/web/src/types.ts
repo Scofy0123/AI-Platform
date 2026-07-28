@@ -1,5 +1,6 @@
 import type {
   Bootstrap,
+  ComposerCapability,
   EffectiveConfigOverride,
   ModelCatalog,
   SubagentThread,
@@ -14,6 +15,7 @@ import type {
 
 export type {
   Bootstrap,
+  ComposerCapability,
   ModelCatalog,
   ModelOption,
   SubagentThread,
@@ -169,6 +171,7 @@ export interface PlatformApi {
   getSession(): Promise<Session>;
   getBootstrap?(): Promise<Bootstrap>;
   listModels?(threadId?: string): Promise<ModelCatalog>;
+  listComposerCapabilities?(threadId?: string): Promise<ComposerCapability[]>;
   listProjects(): Promise<ProjectSummary[]>;
   createProject(name: string): Promise<{ id: string }>;
   listTasks(): Promise<TaskSummary[]>;

@@ -1,8 +1,80 @@
 import { describe, expect, test, vi } from "vitest";
-import { CodexAppServerRuntime, type RpcPeer } from "./codex-runtime.js";
+import { CodexAppServerRuntime, codexPermissionParams, type RpcPeer } from "./codex-runtime.js";
 import type { Model } from "./generated/v2/Model.js";
 
 describe("CodexAppServerRuntime", () => {
+  test("maps Ask for approval to workspace sandbox and user review", () => {
+    expect(
+      codexPermissionParams({ mode: "ASK_FOR_APPROVAL", profileId: null }, "/workspace"),
+    ).toEqual({
+      thread: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        sandbox: "workspace-write",
+      },
+      turn: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: ["/workspace"],
+          networkAccess: false,
+          excludeTmpdirEnvVar: true,
+          excludeSlashTmp: true,
+        },
+      },
+    });
+  });
+
+  test("maps Approve for me to auto review without widening the sandbox", () => {
+    expect(
+      codexPermissionParams({ mode: "APPROVE_FOR_ME", profileId: null }, "/workspace"),
+    ).toMatchObject({
+      thread: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "auto_review",
+        sandbox: "workspace-write",
+      },
+      turn: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "auto_review",
+        sandboxPolicy: { type: "workspaceWrite", networkAccess: false },
+      },
+    });
+  });
+
+  test("maps Full access to danger-full-access without routine approval", () => {
+    expect(codexPermissionParams({ mode: "FULL_ACCESS", profileId: null }, "/workspace")).toEqual({
+      thread: {
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandbox: "danger-full-access",
+      },
+      turn: {
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandboxPolicy: { type: "dangerFullAccess" },
+      },
+    });
+  });
+
+  test("maps Custom to a permission profile without a sandbox policy", () => {
+    expect(
+      codexPermissionParams({ mode: "CUSTOM", profileId: "restricted-network" }, "/workspace"),
+    ).toEqual({
+      thread: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        permissions: "restricted-network",
+      },
+      turn: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        permissions: "restricted-network",
+      },
+    });
+  });
+
   test("performs the initialize then initialized handshake with experimental APIs enabled", async () => {
     const rpc = new FakeRpc({
       initialize: {

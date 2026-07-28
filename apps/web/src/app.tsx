@@ -1,4 +1,9 @@
-import type { TaskEvent, Turn } from "@codexplatform/contracts";
+import type {
+  ComposerCapability,
+  ExecutionPermissionSelection,
+  TaskEvent,
+  Turn,
+} from "@codexplatform/contracts";
 import {
   QueryClient,
   QueryClientProvider,
@@ -32,12 +37,17 @@ import {
 import { ApiError, httpApi } from "./api.js";
 import { ThreadNavItem } from "./components/navigation/ThreadNavItem.js";
 import { BottomPanel } from "./components/thread/BottomPanel.js";
+import { ComposerAddMenu } from "./components/thread/ComposerAddMenu.js";
 import { ComposerSubmitControl } from "./components/thread/ComposerSubmitControl.js";
 import {
   ModelEffortPicker,
   type ModelSelection,
   resolveCatalogSelection,
 } from "./components/thread/ModelEffortPicker.js";
+import {
+  type ExecutionPermissionOption,
+  PermissionModePicker,
+} from "./components/thread/PermissionModePicker.js";
 import { PinnedExecutionSummary } from "./components/thread/PinnedExecutionSummary.js";
 import { SidePanel } from "./components/thread/SidePanel.js";
 import { Transcript } from "./components/thread/Transcript.js";
@@ -365,25 +375,28 @@ function NewThreadPage() {
       return api.listModels();
     },
   });
+  const capabilities = useQuery({
+    queryKey: ["composer-capabilities", "new-thread"],
+    queryFn: () => api.listComposerCapabilities?.() ?? Promise.resolve([]),
+    enabled: Boolean(api.listComposerCapabilities),
+  });
   const [prompt, setPrompt] = useState("");
   const [projectId, setProjectId] = useState(routeProjectId);
   const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
-  const [permissionMode, setPermissionMode] = useState<
-    "DEFAULT" | "READ_ONLY" | "WORKSPACE_WRITE" | null
-  >(null);
+  const [permission, setPermission] = useState<ExecutionPermissionSelection | null>(null);
   const [error, setError] = useState<string | null>(null);
   const selectedModel = resolveCatalogSelection(
     models.data,
     modelSelection?.model ?? settings.data?.execution.model,
     modelSelection?.reasoningEffort ?? settings.data?.execution.reasoningEffort,
   );
-  const selectedPermissionMode =
-    permissionMode ?? settings.data?.execution.permissionMode ?? "DEFAULT";
+  const selectedPermission =
+    permission ?? permissionSelectionFromLegacy(settings.data?.execution.permissionMode);
   const turnConfig = selectedModel
     ? {
         model: selectedModel.model,
         reasoningEffort: selectedModel.reasoningEffort,
-        permissionMode: selectedPermissionMode,
+        permissionMode: permissionModeForTurn(selectedPermission),
       }
     : null;
   const create = useMutation({
@@ -450,6 +463,17 @@ function NewThreadPage() {
           }}
         />
         <div className="v11-composer-toolbar">
+          <ComposerAddMenu
+            capabilities={capabilities.data ?? EMPTY_COMPOSER_CAPABILITIES}
+            onSelect={(capability) => applyComposerCapability(capability, setPrompt)}
+            disabled={create.isPending}
+          />
+          <PermissionModePicker
+            value={selectedPermission}
+            options={permissionOptions(settings.data?.policy.allowedPermissionModes)}
+            onChange={setPermission}
+            disabled={create.isPending || settings.isPending || settings.isError}
+          />
           <select
             aria-label="Project"
             value={projectId}
@@ -470,19 +494,6 @@ function NewThreadPage() {
             error={models.isError}
             disabled={create.isPending}
           />
-          <select
-            aria-label="Turn permission mode"
-            value={selectedPermissionMode}
-            onChange={(event) =>
-              setPermissionMode(event.target.value as "DEFAULT" | "READ_ONLY" | "WORKSPACE_WRITE")
-            }
-          >
-            {(settings.data?.policy.allowedPermissionModes ?? ["DEFAULT"]).map((option) => (
-              <option value={option} key={option}>
-                {option}
-              </option>
-            ))}
-          </select>
           <button
             type="submit"
             className="v11-send-button"
@@ -609,6 +620,11 @@ function ThreadPage() {
     },
     enabled: Boolean(threadId),
   });
+  const capabilities = useQuery({
+    queryKey: ["composer-capabilities", threadId],
+    queryFn: () => api.listComposerCapabilities?.(threadId) ?? Promise.resolve([]),
+    enabled: Boolean(threadId && api.listComposerCapabilities),
+  });
   const [events, setEvents] = useState<TaskEvent[]>([]);
   const eventsRef = useRef<TaskEvent[]>([]);
   const activeThreadIdRef = useRef(threadId);
@@ -624,9 +640,7 @@ function ThreadPage() {
   const [connection, setConnection] = useState<"connected" | "reconnecting">("connected");
   const [message, setMessage] = useState("");
   const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
-  const [permissionMode, setPermissionMode] = useState<
-    "DEFAULT" | "READ_ONLY" | "WORKSPACE_WRITE" | null
-  >(null);
+  const [permission, setPermission] = useState<ExecutionPermissionSelection | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const selectedModel = resolveCatalogSelection(
     models.data,
@@ -635,13 +649,13 @@ function ThreadPage() {
       thread.data?.lastReasoningEffort ??
       settings.data?.execution.reasoningEffort,
   );
-  const selectedPermissionMode =
-    permissionMode ?? settings.data?.execution.permissionMode ?? "DEFAULT";
+  const selectedPermission =
+    permission ?? permissionSelectionFromLegacy(settings.data?.execution.permissionMode);
   const turnConfig = selectedModel
     ? {
         model: selectedModel.model,
         reasoningEffort: selectedModel.reasoningEffort,
-        permissionMode: selectedPermissionMode,
+        permissionMode: permissionModeForTurn(selectedPermission),
       }
     : null;
   const initialLastEventId =
@@ -654,7 +668,7 @@ function ThreadPage() {
     setEvents([]);
     setMessage("");
     setModelSelection(null);
-    setPermissionMode(null);
+    setPermission(null);
     setRuntimeError(null);
     setBottomTerminalSource(null);
     dispatchWorkspaceLayout({ type: "RESET_THREAD" });
@@ -931,6 +945,17 @@ function ThreadPage() {
                 }}
               />
               <div className="v11-composer-toolbar">
+                <ComposerAddMenu
+                  capabilities={capabilities.data ?? EMPTY_COMPOSER_CAPABILITIES}
+                  onSelect={(capability) => applyComposerCapability(capability, setMessage)}
+                  disabled={configLocked || archived}
+                />
+                <PermissionModePicker
+                  value={selectedPermission}
+                  options={permissionOptions(settings.data?.policy.allowedPermissionModes)}
+                  onChange={setPermission}
+                  disabled={configLocked || settings.isPending || settings.isError}
+                />
                 <ModelEffortPicker
                   catalog={models.data ?? null}
                   value={selectedModel}
@@ -939,28 +964,14 @@ function ThreadPage() {
                   error={models.isError}
                   disabled={configLocked || settings.isPending || settings.isError}
                 />
-                <select
-                  aria-label="Turn permission mode"
-                  value={selectedPermissionMode}
-                  onChange={(event) =>
-                    setPermissionMode(
-                      event.target.value as "DEFAULT" | "READ_ONLY" | "WORKSPACE_WRITE",
-                    )
-                  }
-                  disabled={configLocked || settings.isPending || settings.isError}
-                >
-                  {(settings.data?.policy.allowedPermissionModes ?? ["DEFAULT"]).map((option) => (
-                    <option value={option} key={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
                 <span className="v11-capability-note">
                   {waitingForAllocation
                     ? "正在排队，暂不能提交新的 Turn"
                     : canSteer
                       ? "Steer 沿用当前 Turn 的执行设置"
-                      : "Attachments unavailable in 1.1A"}
+                      : capabilities.isPending
+                        ? "正在读取可用能力"
+                        : "Capabilities follow organization policy"}
                 </span>
                 <ComposerSubmitControl
                   mode={canSteer && message.trim().length === 0 ? "stop" : "send"}
@@ -3281,6 +3292,68 @@ function approvalDecisionLabel(decision: string): string {
     default:
       return "已处理";
   }
+}
+
+const EMPTY_COMPOSER_CAPABILITIES: ComposerCapability[] = [];
+
+function permissionSelectionFromLegacy(
+  mode: string | null | undefined,
+): ExecutionPermissionSelection {
+  if (mode === "APPROVE_FOR_ME") return { mode: "APPROVE_FOR_ME", profileId: null };
+  if (mode === "FULL_ACCESS") return { mode: "FULL_ACCESS", profileId: null };
+  return { mode: "ASK_FOR_APPROVAL", profileId: null };
+}
+
+function permissionModeForTurn(
+  selection: ExecutionPermissionSelection,
+): "ASK_FOR_APPROVAL" | "APPROVE_FOR_ME" | "FULL_ACCESS" {
+  if (selection.mode === "CUSTOM") return "ASK_FOR_APPROVAL";
+  return selection.mode;
+}
+
+function permissionOptions(
+  allowedModes: readonly string[] | undefined,
+): ExecutionPermissionOption[] {
+  const allowed = new Set(allowedModes ?? ["ASK_FOR_APPROVAL"]);
+  return [
+    {
+      mode: "ASK_FOR_APPROVAL",
+      label: "Ask for approval",
+      description: "Always ask to edit external files and use the internet",
+      available: allowed.has("ASK_FOR_APPROVAL") || allowed.has("DEFAULT"),
+      unavailableReason: "Disabled by organization policy",
+    },
+    {
+      mode: "APPROVE_FOR_ME",
+      label: "Approve for me",
+      description: "Only ask for actions detected as potentially unsafe",
+      available: allowed.has("APPROVE_FOR_ME"),
+      unavailableReason: "Auto review is disabled by organization policy",
+    },
+    {
+      mode: "FULL_ACCESS",
+      label: "Full access",
+      description: "Unrestricted access inside the isolated Worker",
+      available: allowed.has("FULL_ACCESS"),
+      unavailableReason: "Requires the isolated Worker production gate",
+    },
+    {
+      mode: "CUSTOM",
+      profileId: null,
+      label: "Custom",
+      description: "Uses an administrator-published permission profile",
+      available: false,
+      unavailableReason: "No permission profile is available",
+    },
+  ];
+}
+
+function applyComposerCapability(
+  capability: ComposerCapability,
+  setText: (update: (current: string) => string) => void,
+): void {
+  if (capability.kind !== "THREAD_REFERENCE" && capability.kind !== "SKILL") return;
+  setText((current) => `${current}${current.trim() ? " " : ""}@${capability.label} `);
 }
 
 function deriveThreadTitle(prompt: string): string {

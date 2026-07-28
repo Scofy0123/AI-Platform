@@ -4,6 +4,7 @@ import type {
   AdminPolicies,
   AdminUsage,
   Bootstrap,
+  ComposerCapability,
   ConnectionSummary,
   ModelCatalog,
   PlatformApi,
@@ -119,6 +120,12 @@ export const httpApi: PlatformApi = {
   listModels: (threadId) =>
     request<ModelCatalog>(
       threadId ? `/api/models?threadId=${encodeURIComponent(threadId)}` : "/api/models",
+    ),
+  listComposerCapabilities: (threadId) =>
+    request<ComposerCapability[]>(
+      threadId
+        ? `/api/composer/capabilities?threadId=${encodeURIComponent(threadId)}`
+        : "/api/composer/capabilities",
     ),
   listProjects: async () => {
     const projects = await request<RawProject[]>("/api/projects");

@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export * from "./composer.js";
+
 export const PLATFORM_VERSION = "0.1.0" as const;
 
 export const TaskStatusSchema = z.enum([
@@ -186,7 +188,14 @@ export const EffectiveThreadConfigSnapshotSchema = z
   .object({
     model: z.string().trim().min(1).nullable(),
     reasoningEffort: z.string().min(1),
-    permissionMode: z.enum(["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"]),
+    permissionMode: z.enum([
+      "DEFAULT",
+      "READ_ONLY",
+      "WORKSPACE_WRITE",
+      "ASK_FOR_APPROVAL",
+      "APPROVE_FOR_ME",
+      "FULL_ACCESS",
+    ]),
     approvalMode: z.literal("ASK"),
     personality: z.enum(["NONE", "FRIENDLY", "PRAGMATIC"]),
     instructions: z.string(),
@@ -326,7 +335,13 @@ export const UserExecutionSettingsSchema = z
   .object({
     model: z.string().min(1).nullable(),
     reasoningEffort: z.string().trim().min(1).max(64),
-    permissionMode: z.enum(["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"]),
+    permissionMode: z.enum([
+      "DEFAULT",
+      "READ_ONLY",
+      "WORKSPACE_WRITE",
+      "ASK_FOR_APPROVAL",
+      "APPROVE_FOR_ME",
+    ]),
     approvalPreference: z.literal("ASK"),
   })
   .strict();

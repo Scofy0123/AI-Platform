@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type {
   Bootstrap,
+  ComposerCapability,
   ModelCatalog,
   ModelOption,
   Thread,
@@ -835,6 +836,35 @@ describe("CodexPlatform HTTP API", () => {
     expect(platform.getTask).toHaveBeenCalledWith("task-1", "user-1");
   });
 
+  test("serves actor-scoped Composer capabilities for a Thread", async () => {
+    const { auth, platform } = services();
+    platform.listComposerCapabilities.mockResolvedValueOnce([
+      {
+        id: "files-and-folders",
+        kind: "FILE_PICKER",
+        section: "ADD",
+        label: "Files and folders",
+        description: "Attach files from this device",
+        availability: "POLICY_BLOCKED",
+        unavailableReason: "File staging is not enabled",
+      },
+    ]);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/composer/capabilities?threadId=thread-1",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({ id: "files-and-folders", availability: "POLICY_BLOCKED" }),
+    ]);
+    expect(platform.listComposerCapabilities).toHaveBeenCalledWith("user-1", "thread-1");
+  });
+
   test("keeps Thread, subagent and settings access fail-closed by actor and CSRF", async () => {
     const { auth, platform } = services();
     platform.getThread.mockResolvedValueOnce(null as never);
@@ -1248,6 +1278,7 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
         stale: false,
       }),
     ),
+    listComposerCapabilities: vi.fn(async (): Promise<ComposerCapability[]> => []),
     createProject: vi.fn(async () => ({ id: "project-1" })),
     listProjects: vi.fn(async () => []),
     createTask: vi.fn(async () => ({ id: "task-1" })),

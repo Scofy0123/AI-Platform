@@ -1,5 +1,6 @@
 import type {
   Bootstrap,
+  ComposerCapability,
   EffectiveConfigOverride,
   ModelCatalog,
   SubagentThread,
@@ -29,6 +30,7 @@ export interface AuthApi {
 export interface PlatformApi {
   getBootstrap(): Promise<Bootstrap>;
   listModels(userId: string, threadId?: string): Promise<ModelCatalog>;
+  listComposerCapabilities(userId: string, threadId?: string): Promise<ComposerCapability[]>;
   createProject(userId: string, input: { name: string }): Promise<unknown>;
   listProjects(userId: string): Promise<unknown>;
   createTask(userId: string, input: { projectId: string; title: string }): Promise<unknown>;

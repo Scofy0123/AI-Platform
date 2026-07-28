@@ -122,6 +122,16 @@ function registerRoutes(
     return platform.listModels(actor.user.id, query.threadId);
   });
 
+  app.get("/api/composer/capabilities", async (request, reply) => {
+    const actor = requireSession(request, reply, auth);
+    if (!actor) return;
+    const query = z.object({ threadId: z.string().min(1).optional() }).parse(request.query);
+    if (query.threadId && !(await platform.getThread(query.threadId, actor.user.id))) {
+      return reply.code(404).send({ error: "Thread not found" });
+    }
+    return platform.listComposerCapabilities(actor.user.id, query.threadId);
+  });
+
   app.get("/api/auth/feishu/start", async (_request, reply) => {
     const login = auth.startLogin();
     reply.setCookie(OAUTH_BINDING_COOKIE, login.browserBinding, {

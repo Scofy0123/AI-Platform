@@ -2241,6 +2241,188 @@ tbody tr:hover {
   font-size: 12px;
 }
 
+.composer-add-menu,
+.composer-permission-picker {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.composer-add-trigger,
+.composer-permission-trigger {
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  color: #c9c5cd;
+  background: transparent;
+  cursor: pointer;
+}
+
+.composer-add-trigger:hover:not(:disabled),
+.composer-add-trigger[aria-expanded="true"],
+.composer-permission-trigger:hover:not(:disabled),
+.composer-permission-trigger[aria-expanded="true"] {
+  border-color: #49454e;
+  background: #343138;
+}
+
+.composer-add-trigger:disabled,
+.composer-permission-trigger:disabled {
+  color: #6d6872;
+  cursor: not-allowed;
+}
+
+.composer-add-trigger svg,
+.composer-permission-trigger svg {
+  width: 18px;
+  height: 18px;
+}
+
+.composer-permission-trigger.permission-full_access {
+  color: #ff7a3d;
+}
+
+.composer-add-popover,
+.composer-permission-popover {
+  position: absolute;
+  z-index: 55;
+  bottom: calc(100% + 10px);
+  left: 0;
+  overflow: auto;
+  border: 1px solid #4a464e;
+  border-radius: 16px;
+  color: #e8e5ea;
+  background: #2b292c;
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.46);
+}
+
+.composer-add-popover {
+  width: min(455px, calc(100vw - 32px));
+  max-height: min(560px, calc(100vh - 100px));
+  padding: 9px 0;
+}
+
+.composer-permission-popover {
+  width: min(630px, calc(100vw - 32px));
+  max-height: min(520px, calc(100vh - 100px));
+  padding: 10px;
+}
+
+.composer-permission-popover header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 3px 8px 8px;
+  color: #aaa5ae;
+  font-size: 12px;
+}
+
+.composer-permission-popover header a {
+  flex: 0 0 auto;
+  color: #c2bec6;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.composer-add-popover section {
+  padding: 0 8px 7px;
+}
+
+.composer-add-popover section + section {
+  padding-top: 7px;
+  border-top: 1px solid #3d3940;
+}
+
+.composer-add-popover h3 {
+  margin: 0;
+  padding: 5px 5px 4px;
+  color: #99949e;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.composer-add-popover button,
+.composer-permission-popover > button {
+  display: grid;
+  width: 100%;
+  grid-template-columns: 24px minmax(0, 1fr) 20px;
+  align-items: start;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 10px;
+  color: #ebe8ed;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.composer-add-popover button {
+  grid-template-columns: 24px minmax(0, 1fr);
+}
+
+.composer-add-popover button:hover:not(:disabled),
+.composer-permission-popover > button:hover:not(:disabled) {
+  background: #3a373c;
+}
+
+.composer-add-popover button:disabled,
+.composer-permission-popover > button:disabled {
+  color: #8a858e;
+  cursor: not-allowed;
+}
+
+.composer-add-popover button > svg,
+.composer-permission-popover > button > svg {
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+}
+
+.composer-add-popover button > span,
+.composer-permission-popover > button > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.composer-add-popover strong,
+.composer-permission-popover strong {
+  overflow: hidden;
+  color: inherit;
+  font-size: 13px;
+  font-weight: 560;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-add-popover small,
+.composer-permission-popover small {
+  overflow: hidden;
+  color: #9f9aa3;
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-add-popover em,
+.composer-permission-popover em {
+  color: #bd966d;
+  font-size: 10px;
+  font-style: normal;
+  line-height: 1.35;
+}
+
+.composer-permission-popover .permission-check {
+  color: #ff7a3d;
+}
+
 .model-effort-picker {
   position: relative;
   display: flex;

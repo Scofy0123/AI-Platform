@@ -883,7 +883,13 @@ describe("LocalPlatformService", () => {
       policy: {
         allowedModels: null,
         allowedReasoningEfforts: ["LOW", "MEDIUM", "HIGH", "XHIGH", "ULTRA"],
-        allowedPermissionModes: ["DEFAULT", "READ_ONLY", "WORKSPACE_WRITE"],
+        allowedPermissionModes: [
+          "DEFAULT",
+          "READ_ONLY",
+          "WORKSPACE_WRITE",
+          "ASK_FOR_APPROVAL",
+          "APPROVE_FOR_ME",
+        ],
         allowedApprovalPreferences: ["ASK"],
         lockedFields: [],
       },

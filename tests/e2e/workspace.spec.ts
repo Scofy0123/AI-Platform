@@ -110,8 +110,27 @@ test("Codex workspace completes two Turns in the same Thread with distinct Item 
   }
 });
 
-test("new Thread submits the selected Runtime model and its linked Effort", async ({ page }) => {
+test("new Thread exposes governed Composer capabilities and submits its Runtime configuration", async ({
+  page,
+}, testInfo) => {
   await page.goto("/threads/new");
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await expect(page.getByRole("menuitem", { name: /Files and folders/ })).toBeDisabled();
+  await expect(page.getByRole("menuitem", { name: /Goal/ })).toBeDisabled();
+  await expect(page.getByRole("menuitem", { name: /Plan mode/ })).toBeDisabled();
+  await expect(page.getByRole("menuitem", { name: /Record a skill/ })).toBeDisabled();
+  if (process.env.CODEXPLATFORM_CAPTURE_UAT === "1") {
+    await page.screenshot({ path: testInfo.outputPath("composer-add-menu.png") });
+  }
+  await page.getByRole("button", { name: "Add files and more" }).press("Escape");
+
+  await page.getByRole("button", { name: "Execution permissions" }).click();
+  await expect(page.getByRole("menuitem", { name: /Full access/ })).toBeDisabled();
+  if (process.env.CODEXPLATFORM_CAPTURE_UAT === "1") {
+    await page.screenshot({ path: testInfo.outputPath("composer-permissions.png") });
+  }
+  await page.getByRole("menuitem", { name: /Approve for me/ }).click();
 
   const picker = page.getByRole("button", { name: /Model and Effort:/ });
   await expect(picker).toContainText("Fake Standard");
@@ -135,12 +154,19 @@ test("new Thread submits the selected Runtime model and its linked Effort", asyn
   const response = await page.request.get(`/api/threads/${threadId}`);
   expect(response.status()).toBe(200);
   const thread = (await response.json()) as {
-    turns: Array<{ model: string | null; effort: string | null }>;
+    turns: Array<{
+      model: string | null;
+      effort: string | null;
+      configSnapshot: { permissionMode: string };
+    }>;
   };
   expect(thread.turns).toEqual([
     expect.objectContaining({
       model: "fake-codex-deep",
       effort: "xhigh",
+      configSnapshot: expect.objectContaining({
+        permissionMode: "APPROVE_FOR_ME",
+      }),
     }),
   ]);
 });

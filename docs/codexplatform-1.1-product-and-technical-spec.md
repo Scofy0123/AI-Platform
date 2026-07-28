@@ -79,11 +79,44 @@ flowchart TB
 
 Composer：
 
-- `+` 打开附件、文件、Skill、App 或企业上下文入口；1.1 只展示已真实接入的类型。
+- `+` 打开 `Add files and more`，按 Add、Plugins、Apps、Files and chats 分区。菜单由服务端
+  Capability Registry 驱动；未接入项可以显示为带原因的禁用项，但不能伪装可用。
 - 模型和 Effort 使用同一个联动选择器，选项来自当前账号的 `model/list`。
-- 权限模式、发送、停止和运行状态位于同一操作区。
+- 权限 Popover、发送、停止和运行状态位于同一操作区。
 - Turn 运行中提交文本即 Steer；配置变更只对下一 Turn 生效。
 - 发送与停止原位切换，不提供向 Runtime 发送固定“继续执行当前任务”文本的伪 Resume。
+
+### 3.2.1 权限 Popover
+
+权限选项由 Sandbox、Approval policy 和 Reviewer 三个正交维度展开：
+
+| 用户选项 | Runtime 参数 | 企业边界 |
+| --- | --- | --- |
+| Ask for approval | `workspaceWrite + on-request + user` | 外部文件、网络或越权动作由用户审批 |
+| Approve for me | `workspaceWrite + on-request + auto_review` | 只改变审批责任人，不扩大沙箱或网络范围 |
+| Full access | `dangerFullAccess + never` | 1.1A 只允许本机 operator + 显式策略；1.1B 仅允许隔离 Worker 内完全访问 |
+| Custom | `permissions=<profileId>` | 使用管理员发布的 Permission Profile，不能与 `sandboxPolicy` 同时提交 |
+
+权限选择为 Thread sticky，运行中的 Turn 锁定；Steer 沿用当前 Turn 的不可变配置快照。组织策略
+始终优先于个人偏好和 Thread 选择，前端与 API 必须同时执行门禁。
+
+### 3.2.2 Add files and more
+
+- Files and folders：浏览器只负责选择和上传；服务端扫描后将文件放入当前用户、当前 Thread 的隔离
+  staging workspace。图片映射为 `localImage`，其他文件或目录映射为受控路径引用与
+  `additionalContext`，绝不传浏览器本地路径。
+- Goal：使用稳定的 `thread/goal/set|get|clear`，属于 Thread 持久状态，跨 Turn 保留。
+- Plan mode：使用实验性 `collaborationMode` 适配，只影响下一 Turn，固定协议版本并做合约测试。
+- Record a skill：属于桌面宿主 Computer Use/录制能力；独立 Worker 未接入前显示禁用原因。
+- Plugins/Skills：目录来自 `skills/list` 与管理员批准策略的交集；选择后发送结构化 `skill`
+  UserInput，不只是在 Prompt 中拼接名称。
+- Apps：目录来自 `app/list` 与 Connector Policy 的交集；OAuth、Scope 和 Token 按飞书用户隔离。
+- Files and chats：只搜索当前用户的 CodexPlatform Thread、已上传文件和可访问企业资源。App Server
+  不提供个人 ChatGPT 历史搜索，平台不得通过共享账号展示个人 ChatGPT conversations。
+
+Documents、PDF、Spreadsheets 和 Presentations 是由 Skill、命令与文件库实现的工作流，不是 App
+Server 原生 Office 对象。Plugin 安装与市场接口处于 under development，普通用户只可使用管理员
+批准的目录。
 
 ### 3.3 三个独立 Workspace Surface
 
@@ -320,6 +353,11 @@ Tenant
 - `ModelCatalog`：账号或 Runtime 作用域的模型列表、读取时间、缓存状态和目录版本。
 - `TranscriptEntry`：由一个或多个 Item 事件投影出的用户消息、Agent 正文或紧凑活动行。
 - `WorkspaceLayoutState`：三个独立 Surface 的开关、尺寸、活动 Tab 与 Tab 列表。
+- `ComposerCapability`：能力类型、分区、来源、可用状态、禁用原因与组织策略。
+- `ContextAttachment`：FILE/FOLDER/IMAGE/THREAD/FEISHU_DOC/APP/SKILL 引用及
+  UPLOADING/SCANNING/READY/BLOCKED 等状态。
+- `ExecutionPermission`：用户模式及其展开后的 Sandbox、Approval policy、Reviewer、Profile 和来源。
+- `EffectiveTurnInputSnapshot`：提交时解析后的文本、附件、Goal/Plan、权限和供应商输入。
 - `ActorContext`：Tenant、飞书用户、角色、Tool Scope 和审批策略。
 - `ReasoningPresentation`：Provider、Kind、Summary、可展示状态、`auditEligible=false`。
 
@@ -328,6 +366,7 @@ Tenant
 ```text
 GET  /api/bootstrap
 GET  /api/models
+GET  /api/composer/capabilities
 GET  /api/auth/feishu/start|callback|session
 GET  /api/projects
 POST /api/projects
@@ -335,6 +374,10 @@ GET  /api/threads
 POST /api/threads
 GET  /api/threads/:id
 POST /api/threads/:id/turns
+POST /api/threads/:id/attachments
+DELETE /api/threads/:id/attachments/:attachmentId
+POST /api/threads/:id/goal
+DELETE /api/threads/:id/goal
 POST /api/threads/:id/steer
 POST /api/threads/:id/interrupt
 GET  /api/threads/:id/events
@@ -428,6 +471,10 @@ operator”门禁约束。只有 1.1B 通过 OpenAI 许可、独立 Worker / `CO
 - 未知事件、未知敏感字段和身份绑定缺失均 Fail Closed。
 - Dynamic Tools 仅为 1.1A 过渡适配层；1.1B 替换为正式 MCP Gateway。
 - 原生 Plugin 安装接口和 App 列表中的实验能力不作为 1.1 生产依赖。
+- `thread/goal/*` 可直接作为稳定 Goal 适配；`collaborationMode`、Plugin 市场和安装接口按各自协议
+  稳定性分开处理，不能因为同属 App Server 就统一宣称稳定。
+- Composer 上传和引用由平台 Artifact/Staging 层处理；App Server 的 `UserInput` 只接受 text、
+  image、localImage、skill 和 mention，不存在通用二进制附件对象。
 
 ## 10. Memory、插件与个性化边界
 
@@ -478,6 +525,12 @@ flowchart LR
 - 飞书登录后直接进入 Codex 工作区，不出现不可用 Chat/Work 入口。
 - 用户端与管理后台路由、导航和权限清晰分离。
 - Composer 展示当前账号真实模型目录；模型与 Effort 联动，最终 `thread/start` / `turn/start` 参数和 Turn 快照一致。
+- 权限 Popover 的 Ask for approval、Approve for me、Full access 与 Custom 映射到正确 Runtime
+  参数；组织策略和 Worker 门禁无法通过直接 API 绕过。
+- Add 菜单由 Capability Registry 驱动；文件、Goal、Plan、Skill、App 和 Thread 引用均显示真实
+  状态，未接入能力显示准确禁用原因。
+- 文件上传完成扫描和 owner ACL 后才能提交；图片使用 `localImage`，Skill 使用结构化 `skill`
+  UserInput，浏览器本地路径不会进入 Runtime、SSE 或日志。
 - 主对话流以用户消息、Agent Markdown 和紧凑活动行呈现；同一 Item 的流式 Delta 不生成重复卡片。
 - Pinned Summary、Bottom Panel、Side Panel 可以独立开关和组合存在；关闭 Side Panel 后主对话恢复完整宽度。
 - 点击 Output、Source 或 Subagent 摘要时在 Side Panel 打开对应 Tab；Terminal 只在 Bottom Panel

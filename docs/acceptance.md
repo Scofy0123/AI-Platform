@@ -49,6 +49,24 @@ pnpm verify
   浏览器 DOM 显示真实模型、完成状态和最终回复。
 - 该回归证明当前单操作者真实链路的 transport 修复，不替代完整 `REAL_CODEX_E2E=1`、
   凭证隔离探针或真实多人门禁。
+
+### 2026-07-28 Composer 权限与能力注册表纵切
+
+- `pnpm verify`：PASS；510 项 Vitest 通过、2 项条件跳过，12 项 Playwright 通过，协议校验与
+  Production Build 通过。
+- `ASK_FOR_APPROVAL`、`APPROVE_FOR_ME`、`FULL_ACCESS` 和 `CUSTOM` 已有统一契约；App Server
+  参数映射由 Runtime 单测逐字段核验。当前组织策略只开放前两档，`FULL_ACCESS` 与 `CUSTOM`
+  在 Composer 中可见但不可选，并显示门禁原因。
+- `GET /api/composer/capabilities` 按当前飞书用户和 Thread 返回服务端能力真值；浏览器不能自行把
+  `Files and folders`、Goal、Plan mode 或 Record a skill 标记成可用。
+- 当前四个 Add 能力尚未完成端到端实现，全部显示为禁用；这证明产品不会用可点击空壳伪装能力，
+  不代表附件、Goal、Plan 或 Skill 已交付。
+- Playwright 已验证权限菜单选择 `Approve for me` 后，保存的 Turn 配置快照为
+  `permissionMode=APPROVE_FOR_ME`；同时验证 Full access 与四个 Add 能力的禁用状态。
+- 视觉 UAT 产物名为 `composer-add-menu.png` 和 `composer-permissions.png`，由
+  `CODEXPLATFORM_CAPTURE_UAT=1` 生成在 Playwright 输出目录；截图只证明 Fake Runtime 页面结构，
+  不替代真实飞书登录和 Real Runtime Smoke。
+
 关键生命周期回归可单独运行：
 
 ```bash
@@ -91,7 +109,9 @@ pnpm test:e2e
 2. 已认证 Session 进入 Codex 用户工作区后，存在 New chat、Projects、历史、Settings、连续 Transcript 与 Composer；Pinned Summary、Side Panel、Bottom Panel 可独立打开。
 3. 第 2 个 Prompt 在同一 Thread 中形成新的 Turn，旧 Turn 和执行证据仍可见。
 4. 组件测试验证 legacy `/tasks/:id` 跳转到 `/threads/:id`。
-5. Playwright 选择 Runtime 返回的模型和该模型支持的 Effort，并从保存后的 Turn 配置快照核对 `model` / `effort`，不以按钮文案代替生效证据。
+5. Playwright 选择 Runtime 返回的模型和该模型支持的 Effort，并从保存后的 Turn 配置快照核对
+   `model` / `effort`；权限菜单选择 `Approve for me` 后同样从快照核对
+   `permissionMode=APPROVE_FOR_ME`，不以按钮文案代替生效证据。
 6. Playwright 验证 Plan、命令、Tool、Diff 和结果 Item；Transcript 不出现命令原始输出，命令活动行打开 Bottom Panel Terminal，且多条命令按 Item 分块而不是拼接；Tool 与 Diff/文件活动行打开带标题和返回入口的 Side Panel 详情。
 7. 组件/API 测试验证审批 Item；事件测试验证 SSE 增量只在相同 `threadId + turnId + itemId + type` 内合并。
 8. Subagents 在 Side Panel 展示 Active / Done，能打开独立只读 Transcript；其完整命令输出仍只进入 Bottom Terminal，其他用户不能读取。
@@ -109,16 +129,21 @@ pnpm test:e2e
 使用 `RUNTIME_MODE=fake` 启动后：
 
 1. 用飞书登录，确认直接进入 `/threads/new`。
-2. 打开 Composer 的 Model / Effort 选择器：选择 `Fake Deep` 后默认 Effort 应切换到 `high`，再选择 `xhigh` 并提交。
-3. Turn 完成后读取 `/api/threads/:id`，确认该 Turn 的 `model=fake-codex-deep`、`effort=xhigh`；只看选择器文案不能判定通过。
-4. 确认 Transcript 连续展示用户消息、Plan 更新、命令/Tool/Diff 活动摘要和最终回复；Markdown 粗体与代码应正确渲染，正文中不得出现独立的 `fake-codexplatform` 原始输出。
-5. 点击命令活动行打开 Bottom Panel 的 Terminal，确认其中能看到 `fake-codexplatform`；Bottom Panel 不出现 Changes、Files 或 Tool details 标签。
-6. 依次打开 Pinned Summary、Side Panel 和 Bottom Panel，确认三者同时可见；单独关闭 Pinned Summary 后，Side 与 Bottom 仍保持打开。
-7. Side Panel 切换 Plan、Outputs、Subagents、Sources；再分别点击 Transcript 的 Tool 与 Diff/文件活动行，确认 Side Panel 进入对应详情并能返回父 Tab。Pinned Summary 打开时不改变正文宽度，Side Panel 打开时才压缩正文。
-8. 在同一 Composer 提交第 2 个 Prompt，确认 URL 和 Thread 不变、两轮内容连续。
-9. 进入 Settings，修改 Theme 或默认 Model / Effort，保存并刷新，确认值仍属于当前飞书用户。
-10. 管理员进入独立 `/admin/accounts`，检查 Accounts、Policies、Connectors、Usage、Audit 和 Runtime health；再返回用户工作区。
-11. 在浏览器 Network 中检查 `/api/threads/:id` 和 SSE：用户侧不得出现账号别名、raw reasoning、`.data/real-runtime/codex-accounts/` 或真实 `CODEX_HOME` 路径；管理员审计可出现账号别名但不能出现凭证路径。
+2. 打开 “Add files and more”，确认 Files、Goal、Plan、Record skill 均显示真实禁用原因；当前阶段
+   不应允许点击。
+3. 打开权限菜单，确认 Ask for approval 与 Approve for me 可选，Full access 与 Custom 禁用；选择
+   `Approve for me`。
+4. 打开 Composer 的 Model / Effort 选择器：选择 `Fake Deep` 后默认 Effort 应切换到 `high`，再选择 `xhigh` 并提交。
+5. Turn 完成后读取 `/api/threads/:id`，确认该 Turn 的 `model=fake-codex-deep`、`effort=xhigh`、
+   `configSnapshot.permissionMode=APPROVE_FOR_ME`；只看选择器文案不能判定通过。
+6. 确认 Transcript 连续展示用户消息、Plan 更新、命令/Tool/Diff 活动摘要和最终回复；Markdown 粗体与代码应正确渲染，正文中不得出现独立的 `fake-codexplatform` 原始输出。
+7. 点击命令活动行打开 Bottom Panel 的 Terminal，确认其中能看到 `fake-codexplatform`；Bottom Panel 不出现 Changes、Files 或 Tool details 标签。
+8. 依次打开 Pinned Summary、Side Panel 和 Bottom Panel，确认三者同时可见；单独关闭 Pinned Summary 后，Side 与 Bottom 仍保持打开。
+9. Side Panel 切换 Plan、Outputs、Subagents、Sources；再分别点击 Transcript 的 Tool 与 Diff/文件活动行，确认 Side Panel 进入对应详情并能返回父 Tab。Pinned Summary 打开时不改变正文宽度，Side Panel 打开时才压缩正文。
+10. 在同一 Composer 提交第 2 个 Prompt，确认 URL 和 Thread 不变、两轮内容连续。
+11. 进入 Settings，修改 Theme 或默认 Model / Effort，保存并刷新，确认值仍属于当前飞书用户。
+12. 管理员进入独立 `/admin/accounts`，检查 Accounts、Policies、Connectors、Usage、Audit 和 Runtime health；再返回用户工作区。
+13. 在浏览器 Network 中检查 `/api/threads/:id` 和 SSE：用户侧不得出现账号别名、raw reasoning、`.data/real-runtime/codex-accounts/` 或真实 `CODEX_HOME` 路径；管理员审计可出现账号别名但不能出现凭证路径。
 
 fake UAT 证明的是交互和投影，不证明真实 Codex、多用户凭证隔离或真实飞书 Tool 已通过。
 
@@ -126,7 +151,7 @@ fake UAT 证明的是交互和投影，不证明真实 Codex、多用户凭证�
 
 ```bash
 pnpm exec playwright test tests/e2e/workspace.spec.ts \
-  --grep "selected Runtime model|Pinned, Side, and Bottom|reasoning canaries"
+  --grep "governed Composer capabilities|Pinned, Side, and Bottom|reasoning canaries"
 ```
 
 该 Playwright 快速命令覆盖以下 P0 门禁：

@@ -1,9 +1,15 @@
-import type { EffectiveThreadConfigSnapshot } from "@codexplatform/contracts";
+import type {
+  EffectiveThreadConfigSnapshot,
+  ExecutionPermissionSelection,
+} from "@codexplatform/contracts";
 import type { Personality } from "./generated/Personality.js";
 import type { JsonValue } from "./generated/serde_json/JsonValue.js";
+import type { ApprovalsReviewer } from "./generated/v2/ApprovalsReviewer.js";
+import type { AskForApproval } from "./generated/v2/AskForApproval.js";
 import type { Model } from "./generated/v2/Model.js";
 import type { ModelListParams } from "./generated/v2/ModelListParams.js";
 import type { ModelListResponse } from "./generated/v2/ModelListResponse.js";
+import type { SandboxMode } from "./generated/v2/SandboxMode.js";
 import type { SandboxPolicy } from "./generated/v2/SandboxPolicy.js";
 import type { ThreadBackgroundTerminalsListResponse } from "./generated/v2/ThreadBackgroundTerminalsListResponse.js";
 import type { ThreadBackgroundTerminalsTerminateResponse } from "./generated/v2/ThreadBackgroundTerminalsTerminateResponse.js";
@@ -282,6 +288,85 @@ function textInput(text: string) {
   return { type: "text" as const, text, text_elements: [] };
 }
 
+export function codexPermissionParams(
+  selection: ExecutionPermissionSelection,
+  cwd: string,
+):
+  | {
+      thread: {
+        approvalPolicy: AskForApproval;
+        approvalsReviewer: ApprovalsReviewer;
+        sandbox: SandboxMode;
+      };
+      turn: {
+        approvalPolicy: AskForApproval;
+        approvalsReviewer: ApprovalsReviewer;
+        sandboxPolicy: SandboxPolicy;
+      };
+    }
+  | {
+      thread: {
+        approvalPolicy: AskForApproval;
+        approvalsReviewer: ApprovalsReviewer;
+        permissions: string;
+      };
+      turn: {
+        approvalPolicy: AskForApproval;
+        approvalsReviewer: ApprovalsReviewer;
+        permissions: string;
+      };
+    } {
+  if (selection.mode === "CUSTOM") {
+    return {
+      thread: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        permissions: selection.profileId,
+      },
+      turn: {
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        permissions: selection.profileId,
+      },
+    };
+  }
+
+  if (selection.mode === "FULL_ACCESS") {
+    return {
+      thread: {
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandbox: "danger-full-access",
+      },
+      turn: {
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandboxPolicy: { type: "dangerFullAccess" },
+      },
+    };
+  }
+
+  const approvalsReviewer = selection.mode === "APPROVE_FOR_ME" ? "auto_review" : "user";
+  return {
+    thread: {
+      approvalPolicy: "on-request",
+      approvalsReviewer,
+      sandbox: "workspace-write",
+    },
+    turn: {
+      approvalPolicy: "on-request",
+      approvalsReviewer,
+      sandboxPolicy: {
+        type: "workspaceWrite",
+        writableRoots: [cwd],
+        networkAccess: false,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true,
+      },
+    },
+  };
+}
+
 function extractResponseThreadId(value: unknown): string | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const thread = (value as Record<string, unknown>).thread;
@@ -300,53 +385,61 @@ function isEmptyJsonObject(value: unknown): value is Record<string, never> {
 }
 
 function threadConfigParams(config: EffectiveThreadConfigSnapshot) {
+  if (config.permissionMode === "READ_ONLY") {
+    return {
+      model: config.model,
+      approvalPolicy: "on-request" as const,
+      approvalsReviewer: "user" as const,
+      sandbox: "read-only" as const,
+      developerInstructions: config.instructions,
+      personality: personality(config),
+    } satisfies Partial<ThreadStartParams & ThreadResumeParams>;
+  }
+  const permission = codexPermissionParams(selectionFromConfig(config), "");
   return {
     model: config.model,
-    approvalPolicy: approvalPolicy(config),
-    approvalsReviewer: "user" as const,
-    sandbox: sandboxMode(config),
+    ...permission.thread,
     developerInstructions: config.instructions,
     personality: personality(config),
   } satisfies Partial<ThreadStartParams & ThreadResumeParams>;
 }
 
 function turnConfigParams(cwd: string, config: EffectiveThreadConfigSnapshot) {
+  if (config.permissionMode === "READ_ONLY") {
+    return {
+      model: config.model,
+      effort: config.reasoningEffort.toLowerCase(),
+      summary: "auto" as const,
+      approvalPolicy: "on-request" as const,
+      approvalsReviewer: "user" as const,
+      sandboxPolicy: { type: "readOnly" as const, networkAccess: false },
+      personality: personality(config),
+    } satisfies Partial<TurnStartParams>;
+  }
+  const permission = codexPermissionParams(selectionFromConfig(config), cwd);
   return {
     model: config.model,
     effort: config.reasoningEffort.toLowerCase(),
     summary: "auto" as const,
-    approvalPolicy: approvalPolicy(config),
-    approvalsReviewer: "user" as const,
-    sandboxPolicy: sandboxPolicy(cwd, config),
+    ...permission.turn,
     personality: personality(config),
   } satisfies Partial<TurnStartParams>;
 }
 
-function approvalPolicy(config: EffectiveThreadConfigSnapshot): "on-request" {
+function selectionFromConfig(config: EffectiveThreadConfigSnapshot): ExecutionPermissionSelection {
   if (config.approvalMode !== "ASK") throw new Error("Unsupported approval mode");
-  return "on-request";
-}
-
-function sandboxMode(config: EffectiveThreadConfigSnapshot): "read-only" | "workspace-write" {
-  if (config.permissionMode === "READ_ONLY") return "read-only";
-  if (config.permissionMode === "DEFAULT" || config.permissionMode === "WORKSPACE_WRITE") {
-    return "workspace-write";
+  if (config.permissionMode === "APPROVE_FOR_ME") {
+    return { mode: "APPROVE_FOR_ME", profileId: null };
   }
-  throw new Error("Unsupported permission mode");
-}
-
-function sandboxPolicy(cwd: string, config: EffectiveThreadConfigSnapshot): SandboxPolicy {
-  if (config.permissionMode === "READ_ONLY") {
-    return { type: "readOnly", networkAccess: false };
+  if (config.permissionMode === "FULL_ACCESS") {
+    return { mode: "FULL_ACCESS", profileId: null };
   }
-  if (config.permissionMode === "DEFAULT" || config.permissionMode === "WORKSPACE_WRITE") {
-    return {
-      type: "workspaceWrite",
-      writableRoots: [cwd],
-      networkAccess: false,
-      excludeTmpdirEnvVar: true,
-      excludeSlashTmp: true,
-    };
+  if (
+    config.permissionMode === "DEFAULT" ||
+    config.permissionMode === "WORKSPACE_WRITE" ||
+    config.permissionMode === "ASK_FOR_APPROVAL"
+  ) {
+    return { mode: "ASK_FOR_APPROVAL", profileId: null };
   }
   throw new Error("Unsupported permission mode");
 }

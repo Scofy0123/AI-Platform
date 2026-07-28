@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   type ActorContext,
   type Bootstrap,
+  type ComposerCapability,
   type EffectiveConfigOverride,
   EffectiveConfigOverrideSchema,
   type EffectiveThreadConfigSnapshot,
@@ -33,6 +34,7 @@ import {
 import type { WeeklyQuota } from "../infra/codex/codex-runtime.js";
 import type { PlatformApi } from "../web-api.js";
 import type { AccountAdminStore, InternalAccount } from "./account-admin-store.js";
+import { listComposerCapabilities as buildComposerCapabilities } from "./composer-capabilities.js";
 import type { LeasedTurn, SQLiteLeaseStore } from "./lease-store.js";
 import type {
   ApprovalTransportIdentity,
@@ -380,6 +382,25 @@ export class LocalPlatformService implements PlatformApi {
       projectId: input.projectId,
       title: input.title,
       now: this.now(),
+    });
+  }
+
+  async listComposerCapabilities(userId: string, threadId?: string): Promise<ComposerCapability[]> {
+    if (threadId && !this.options.store.getTaskForUser(threadId, userId)) {
+      throw new Error("Thread not found");
+    }
+    return buildComposerCapabilities({
+      stagingAvailable: false,
+      stagingUnavailableReason: "File staging is not enabled in this build",
+      goalAvailable: false,
+      goalUnavailableReason: "Goal persistence is not enabled in this build",
+      planModeAvailable: false,
+      planModeUnavailableReason: "Plan mode is awaiting locked-version protocol validation",
+      skillRecorderAvailable: false,
+      skillRecorderUnavailableReason: "Requires an isolated Computer Use Worker",
+      approvedSkills: [],
+      approvedApps: [],
+      recentThreads: [],
     });
   }
 
@@ -1137,13 +1158,18 @@ export class LocalPlatformService implements PlatformApi {
 
   private validateConfigOverride(config: EffectiveConfigOverride): EffectiveConfigOverride {
     const parsed = EffectiveConfigOverrideSchema.parse(config);
+    if (
+      parsed.permissionMode !== undefined &&
+      !(SETTINGS_POLICY.allowedPermissionModes as readonly string[]).includes(parsed.permissionMode)
+    ) {
+      throw new Error("Permission mode is not allowed in 1.1A");
+    }
     this.validateSettingsPatch({
       execution: {
         ...(parsed.model !== undefined ? { model: parsed.model } : {}),
         ...(parsed.reasoningEffort !== undefined
           ? { reasoningEffort: parsed.reasoningEffort }
           : {}),
-        ...(parsed.permissionMode !== undefined ? { permissionMode: parsed.permissionMode } : {}),
         ...(parsed.approvalMode !== undefined ? { approvalPreference: parsed.approvalMode } : {}),
       },
       ...(parsed.personality !== undefined || parsed.instructions !== undefined
@@ -1832,6 +1858,8 @@ const SETTINGS_POLICY = {
     "DEFAULT",
     "READ_ONLY",
     "WORKSPACE_WRITE",
+    "ASK_FOR_APPROVAL",
+    "APPROVE_FOR_ME",
   ] as readonly UserSettings["execution"]["permissionMode"][],
   allowedApprovalPreferences: ["ASK"] as readonly UserSettings["execution"]["approvalPreference"][],
   lockedFields: [] as const,
