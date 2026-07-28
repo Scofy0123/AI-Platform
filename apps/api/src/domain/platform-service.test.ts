@@ -915,6 +915,27 @@ describe("LocalPlatformService", () => {
     );
   });
 
+  test("rejects archive and unarchive for hidden and expired Drafts without audit", async () => {
+    const project = await service.createProject("user-1", { name: "Hidden archive guard" });
+    const expired = await service.createDraft("user-1", { projectId: project.id });
+    await service.cleanupExpiredDrafts(new Date(NOW.getTime() + 2 * 60 * 60_000));
+    const draft = await service.createDraft("user-1", { projectId: project.id });
+
+    for (const threadId of [draft.id, expired.id]) {
+      await expect(service.archiveThread(threadId, "user-1")).rejects.toThrow("Thread not found");
+      await expect(service.unarchiveThread(threadId, "user-1")).rejects.toThrow("Thread not found");
+    }
+
+    expect(
+      database.sqlite
+        .prepare(
+          `SELECT COUNT(*) AS count FROM audit_events
+           WHERE task_id IN (?, ?)`,
+        )
+        .get(draft.id, expired.id),
+    ).toEqual({ count: 0 });
+  });
+
   test("refuses to archive a Thread while its Turn is running", async () => {
     const project = await service.createProject("user-1", { name: "Archive guard" });
     const thread = await service.createThread("user-1", {

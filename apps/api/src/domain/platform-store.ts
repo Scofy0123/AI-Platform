@@ -541,7 +541,7 @@ export class SQLitePlatformStore {
       const row = this.sqlite
         .prepare("SELECT * FROM tasks WHERE id = ? AND owner_id = ?")
         .get(input.threadId, input.ownerId) as TaskRow | undefined;
-      if (!row) throw new Error("Thread not found");
+      if (row?.lifecycle_state !== "ACTIVE") throw new Error("Thread not found");
       if (row.archived_at !== null) return mapTask(row);
 
       const activeTurn = this.sqlite
@@ -577,7 +577,7 @@ export class SQLitePlatformStore {
       const row = this.sqlite
         .prepare("SELECT * FROM tasks WHERE id = ? AND owner_id = ?")
         .get(input.threadId, input.ownerId) as TaskRow | undefined;
-      if (!row) throw new Error("Thread not found");
+      if (row?.lifecycle_state !== "ACTIVE") throw new Error("Thread not found");
       if (row.archived_at === null) return mapTask(row);
 
       this.sqlite

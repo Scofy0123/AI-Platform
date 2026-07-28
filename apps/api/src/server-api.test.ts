@@ -1084,6 +1084,35 @@ describe("CodexPlatform HTTP API", () => {
     expect(platform.unarchiveThread).toHaveBeenCalledWith("thread-1", "user-1");
   });
 
+  test("returns not found when archive routes target a Draft or expired Draft", async () => {
+    const { auth, platform } = services();
+    platform.archiveThread.mockRejectedValue(new Error("Thread not found"));
+    platform.unarchiveThread.mockRejectedValue(new Error("Thread not found"));
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const responses = await Promise.all(
+      ["draft-1", "expired-1"].flatMap((threadId) =>
+        ["archive", "unarchive"].map((action) =>
+          app.inject({
+            method: "POST",
+            url: `/api/threads/${threadId}/${action}`,
+            cookies: { codexplatform_session: "valid-session" },
+            headers: { "x-csrf-token": "valid-csrf" },
+          }),
+        ),
+      ),
+    );
+
+    expect(responses.map((response) => response.statusCode)).toEqual([404, 404, 404, 404]);
+    expect(responses.map((response) => response.json())).toEqual([
+      { error: "Thread not found" },
+      { error: "Thread not found" },
+      { error: "Thread not found" },
+      { error: "Thread not found" },
+    ]);
+  });
+
   test("creates and deletes hidden Drafts through owner-scoped CSRF routes", async () => {
     const { auth, platform } = services();
     const app = buildApp({ auth, platform });

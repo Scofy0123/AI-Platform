@@ -425,6 +425,41 @@ describe("SQLitePlatformStore", () => {
     });
   });
 
+  test("rejects archive and unarchive for DRAFT or EXPIRED rows without audit history", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Hidden", now: NOW });
+    const draft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+    const expired = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() - 1),
+    });
+    store.expireDrafts(NOW);
+
+    for (const threadId of [draft.id, expired.id]) {
+      expect(() => store.archiveThread({ threadId, ownerId: "user-1", now: NOW })).toThrow(
+        "Thread not found",
+      );
+      expect(() => store.unarchiveThread({ threadId, ownerId: "user-1", now: NOW })).toThrow(
+        "Thread not found",
+      );
+    }
+
+    expect(
+      database.sqlite
+        .prepare(
+          `SELECT COUNT(*) AS count FROM audit_events
+           WHERE task_id IN (?, ?)`,
+        )
+        .get(draft.id, expired.id),
+    ).toEqual({ count: 0 });
+  });
+
   test("appends monotonically sequenced events and replays from Last-Event-ID", () => {
     const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
     const task = store.createTask({
