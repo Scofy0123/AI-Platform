@@ -718,6 +718,122 @@ export class SQLitePlatformStore {
       : null;
   }
 
+  claimSteerInput(input: {
+    id: string;
+    taskId: string;
+    turnId: string;
+    ownerId: string;
+    prompt: string;
+    attachmentIds: string[];
+    now: Date;
+  }): EffectiveTurnInputSnapshot {
+    return this.immediateTransaction(() => {
+      const task = this.sqlite
+        .prepare(
+          `SELECT owner_id, lifecycle_state, status FROM tasks
+           WHERE id = ? AND owner_id = ?`,
+        )
+        .get(input.taskId, input.ownerId) as
+        | {
+            owner_id: string;
+            lifecycle_state: "DRAFT" | "ACTIVE" | "EXPIRED";
+            status: string;
+          }
+        | undefined;
+      if (task?.lifecycle_state !== "ACTIVE") throw new Error("Task not found");
+      if (!["RUNNING", "WAITING_APPROVAL"].includes(task.status)) {
+        throw new Error(`Task status ${task.status} does not accept Steer`);
+      }
+      const activeTurn = this.sqlite
+        .prepare(
+          `SELECT 1 FROM turns
+           WHERE id = ? AND task_id = ? AND status IN ('RUNNING', 'WAITING_APPROVAL')`,
+        )
+        .get(input.turnId, input.taskId);
+      if (!activeTurn) throw new Error("Active Turn projection is unavailable");
+
+      const attachmentIds = [...new Set(input.attachmentIds)];
+      if (input.prompt.trim().length === 0 && attachmentIds.length === 0) {
+        throw new Error("Invalid Steer input");
+      }
+      if (attachmentIds.length > MAX_ATTACHMENT_ROOTS) {
+        throw new Error("Attachment root limit exceeded");
+      }
+      const attachments = this.getReadyAttachments(input.taskId, input.ownerId, attachmentIds);
+      const totalBytes = attachments.reduce((sum, attachment) => sum + attachment.sizeBytes, 0);
+      if (totalBytes > MAX_TURN_ATTACHMENT_BYTES) {
+        throw new Error("Attachments exceed the 200 MiB Turn limit");
+      }
+      const claimableCount =
+        attachmentIds.length === 0
+          ? 0
+          : (
+              this.sqlite
+                .prepare(
+                  `SELECT COUNT(*) AS count FROM draft_attachments
+                   WHERE task_id = ? AND owner_id = ? AND scan_status = 'READY'
+                     AND claimed_turn_id IS NULL
+                     AND id IN (${attachmentIds.map(() => "?").join(",")})`,
+                )
+                .get(input.taskId, input.ownerId, ...attachmentIds) as { count: number }
+            ).count;
+      if (attachments.length !== attachmentIds.length || claimableCount !== attachmentIds.length) {
+        throw new Error("Attachments must exist, be owned, unclaimed, and READY");
+      }
+
+      this.sqlite
+        .prepare(
+          `INSERT INTO steer_input_snapshots (
+            id, turn_id, prompt, attachments_json, captured_at
+           ) VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.turnId,
+          input.prompt,
+          JSON.stringify(attachments),
+          input.now.getTime(),
+        );
+      if (attachmentIds.length > 0) {
+        const claimed = this.sqlite
+          .prepare(
+            `UPDATE draft_attachments SET claimed_turn_id = ?, updated_at = ?
+             WHERE claimed_turn_id IS NULL
+               AND id IN (${attachmentIds.map(() => "?").join(",")})`,
+          )
+          .run(input.turnId, input.now.getTime(), ...attachmentIds);
+        if (claimed.changes !== attachmentIds.length) {
+          throw new Error("Attachments must exist, be owned, unclaimed, and READY");
+        }
+      }
+      return EffectiveTurnInputSnapshotSchema.parse({
+        prompt: input.prompt,
+        attachments,
+        capturedAt: input.now.toISOString(),
+      });
+    });
+  }
+
+  listSteerInputSnapshots(turnId: string): EffectiveTurnInputSnapshot[] {
+    const rows = this.sqlite
+      .prepare(
+        `SELECT prompt, attachments_json, captured_at
+         FROM steer_input_snapshots WHERE turn_id = ? ORDER BY captured_at, id`,
+      )
+      .all(turnId) as Array<{
+      prompt: string;
+      attachments_json: string;
+      captured_at: number;
+    }>;
+    return rows.map((row) =>
+      EffectiveTurnInputSnapshotSchema.parse({
+        prompt: row.prompt,
+        attachments: JSON.parse(row.attachments_json),
+        capturedAt: new Date(row.captured_at).toISOString(),
+      }),
+    );
+  }
+
   getLatestTurnPrompt(taskId: string, ownerId: string): string | null {
     const row = this.sqlite
       .prepare(
@@ -1162,7 +1278,8 @@ export class SQLitePlatformStore {
   }
 
   listTaskEvents(taskId: string, ownerId: string, afterSequence = 0): TaskEvent[] | null {
-    if (!this.getTaskForUser(taskId, ownerId)) return null;
+    const task = this.getTaskForUser(taskId, ownerId);
+    if (task?.lifecycleState !== "ACTIVE") return null;
     const pathContext = this.runtimePathContextForTask(taskId);
     const rows = this.sqlite
       .prepare("SELECT * FROM task_events WHERE task_id = ? AND sequence > ? ORDER BY sequence")

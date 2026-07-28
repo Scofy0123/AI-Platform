@@ -4,6 +4,8 @@ import type {
   ComposerCapability,
   ModelCatalog,
   ModelOption,
+  TaskDetail,
+  TaskEvent,
   Thread,
   UserSettingsView,
 } from "@codexplatform/contracts";
@@ -13,7 +15,7 @@ import {
   InvalidThreadResumeResponseError,
   ModelCatalogUnavailableError,
 } from "./domain/platform-service.js";
-import { buildApp, streamTaskEvents, subscribeWithReplay } from "./server.js";
+import { buildApp, readMultipartStream, streamTaskEvents, subscribeWithReplay } from "./server.js";
 import type { AuthApi, PlatformApi } from "./web-api.js";
 
 const STANDARD_MODEL: ModelOption = {
@@ -1115,6 +1117,78 @@ describe("CodexPlatform HTTP API", () => {
     expect(platform.deleteDraft).toHaveBeenCalledWith("draft-1", "user-1");
   });
 
+  test("does not expose a Draft through legacy task detail or event routes", async () => {
+    const { auth, platform } = services();
+    platform.getTask.mockResolvedValue(null);
+    platform.listTaskEvents.mockResolvedValue(null);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const detail = await app.inject({
+      method: "GET",
+      url: "/api/tasks/draft-1",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const replay = await app.inject({
+      method: "GET",
+      url: "/api/tasks/draft-1/events",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { accept: "application/json" },
+    });
+    const stream = await app.inject({
+      method: "GET",
+      url: "/api/tasks/draft-1/events",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { accept: "text/event-stream" },
+    });
+
+    expect(detail.statusCode).toBe(404);
+    expect(replay.statusCode).toBe(404);
+    expect(stream.statusCode).toBe(404);
+    expect(`${detail.body}${replay.body}${stream.body}`).not.toContain("DRAFT");
+  });
+
+  test("accepts an attachment-only Steer on Thread and legacy task routes", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const thread = await app.inject({
+      method: "POST",
+      url: "/api/threads/thread-1/steer",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "", attachmentIds: ["attachment-1"] },
+    });
+    const task = await app.inject({
+      method: "POST",
+      url: "/api/tasks/task-1/steer",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "", attachmentIds: ["attachment-2"] },
+    });
+
+    expect(thread.statusCode).toBe(202);
+    expect(task.statusCode).toBe(202);
+    expect(platform.steerThread).toHaveBeenCalledWith("thread-1", "user-1", "", ["attachment-1"]);
+    expect(platform.steerTask).toHaveBeenCalledWith("task-1", "user-1", "", ["attachment-2"]);
+  });
+
+  test("stops reading multipart content as soon as the aggregate limit is exceeded", async () => {
+    let yielded = 0;
+    async function* chunks() {
+      for (const value of ["1234", "5678", "must-not-read"]) {
+        yielded += 1;
+        yield Buffer.from(value);
+      }
+    }
+
+    await expect(readMultipartStream(chunks(), 5)).rejects.toThrow(
+      "Attachments exceed the aggregate upload limit",
+    );
+    expect(yielded).toBe(2);
+  });
+
   test("accepts multipart attachment uploads without exposing an absolute path", async () => {
     const { auth, platform } = services();
     const app = buildApp({ auth, platform });
@@ -1552,16 +1626,18 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
     listProjects: vi.fn(async () => []),
     createTask: vi.fn(async () => ({ id: "task-1" })),
     listTasks: vi.fn(async () => []),
-    getTask: vi.fn(async () => ({
-      id: "task-1",
-      projectId: "project-1",
-      title: "Build it",
-      status: "RUNNING" as const,
-      updatedAt: "2026-07-21T12:00:00.000Z",
-      prompt: "Build it",
-      accountAlias: "Codex A",
-      queue: null,
-    })),
+    getTask: vi.fn(
+      async (): Promise<TaskDetail | null> => ({
+        id: "task-1",
+        projectId: "project-1",
+        title: "Build it",
+        status: "RUNNING" as const,
+        updatedAt: "2026-07-21T12:00:00.000Z",
+        prompt: "Build it",
+        accountAlias: "Codex A",
+        queue: null,
+      }),
+    ),
     createThread: vi.fn(async () => ({
       id: "thread-new",
       projectId: "project-1",
@@ -1708,7 +1784,7 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
     startTurn: vi.fn(async () => ({ status: "RUNNING" })),
     steerTask: vi.fn(async () => ({ status: "RUNNING" })),
     interruptTask: vi.fn(async () => ({ status: "INTERRUPTING" })),
-    listTaskEvents: vi.fn(async () => [event]),
+    listTaskEvents: vi.fn(async (): Promise<TaskEvent[] | null> => [event]),
     subscribeTaskEvents: vi.fn(() => () => undefined),
     listApprovals: vi.fn(async () => []),
     decideApproval: vi.fn(async () => ({ id: "approval-1", status: "DECIDED" })),

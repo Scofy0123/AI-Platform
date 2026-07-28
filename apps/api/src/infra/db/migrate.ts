@@ -207,6 +207,17 @@ CREATE TABLE IF NOT EXISTS turn_input_snapshots (
   captured_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS steer_input_snapshots (
+  id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+  prompt TEXT NOT NULL,
+  attachments_json TEXT NOT NULL,
+  captured_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS steer_input_snapshots_turn_idx
+  ON steer_input_snapshots(turn_id, captured_at, id);
+
 CREATE TABLE IF NOT EXISTS task_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -384,6 +395,15 @@ export function migrateDatabase(sqlite: Database.Database): void {
       attachments_json TEXT NOT NULL,
       captured_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS steer_input_snapshots (
+      id TEXT PRIMARY KEY,
+      turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+      prompt TEXT NOT NULL,
+      attachments_json TEXT NOT NULL,
+      captured_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS steer_input_snapshots_turn_idx
+      ON steer_input_snapshots(turn_id, captured_at, id);
   `);
   ensureColumn(sqlite, "queue_entries", "required_account_id", "TEXT");
   ensureColumn(sqlite, "sessions", "persistent_at", "INTEGER");

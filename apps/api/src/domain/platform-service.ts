@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { lstat, mkdir, open, realpath, rm } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
   type ActorContext,
   type Bootstrap,
@@ -168,7 +169,12 @@ export interface TaskExecutionAdapter {
     actorContext: ActorContext;
     attachments?: Array<{ name: string; path: string; mimeType: string }>;
   }): Promise<{ threadId: string; turnId: string }>;
-  steerTask(threadId: string, turnId: string, prompt: string): Promise<void>;
+  steerTask(
+    threadId: string,
+    turnId: string,
+    prompt: string,
+    attachments?: Array<{ name: string; path: string; mimeType: string }>,
+  ): Promise<void>;
   interruptTask(threadId: string, turnId: string): Promise<void>;
   respondApproval(
     requestId: string,
@@ -426,8 +432,8 @@ export class LocalPlatformService implements PlatformApi {
     await this.removeAttachmentRefs(threadId, deleted.attachmentRefs);
   }
 
-  async cleanupExpiredDrafts(): Promise<number> {
-    const expired = this.options.store.expireDrafts(this.now());
+  async cleanupExpiredDrafts(now = this.now()): Promise<number> {
+    const expired = this.options.store.expireDrafts(now);
     await Promise.all(
       expired.map(({ threadId, attachmentRefs }) =>
         this.removeAttachmentRefs(threadId, attachmentRefs),
@@ -478,6 +484,7 @@ export class LocalPlatformService implements PlatformApi {
       "attachments",
       attachmentId,
     );
+    let stagingPrepared = false;
     const isFolder = scannedFiles.length > 1 || scannedFiles[0]?.relativePath.includes("/");
     const commonRoot = commonAttachmentRoot(scannedFiles.map((file) => file.relativePath));
     const relativePath = isFolder
@@ -489,12 +496,10 @@ export class LocalPlatformService implements PlatformApi {
           scannedFiles[0]?.relativePath as string,
         );
     try {
+      await prepareSafeAttachmentRoot(this.options.dataDir, threadId, attachmentId);
+      stagingPrepared = true;
       for (const file of scannedFiles) {
-        const absolutePath = join(attachmentRoot, file.relativePath);
-        await mkdir(dirname(absolutePath), { recursive: true, mode: 0o700 });
-        await chmod(attachmentRoot, 0o700);
-        await writeFile(absolutePath, file.content, { mode: 0o600, flag: "wx" });
-        await chmod(absolutePath, 0o600);
+        await writeSafeAttachmentFile(attachmentRoot, file.relativePath, file.content);
       }
       return this.options.store.createAttachment({
         id: attachmentId,
@@ -512,7 +517,9 @@ export class LocalPlatformService implements PlatformApi {
         now: this.now(),
       });
     } catch (error) {
-      await rm(attachmentRoot, { recursive: true, force: true });
+      if (stagingPrepared) {
+        await removeSafeAttachmentRoot(this.options.dataDir, threadId, attachmentId);
+      }
       throw error;
     }
   }
@@ -528,7 +535,7 @@ export class LocalPlatformService implements PlatformApi {
 
   async getTask(taskId: string, userId: string): Promise<TaskDetail | null> {
     const task = this.options.store.getTaskForUser(taskId, userId);
-    if (!task) return null;
+    if (task?.lifecycleState !== "ACTIVE") return null;
     const queued = this.options.leases.getQueueEntry(taskId, userId);
     return {
       ...toTaskSummary(task),
@@ -619,8 +626,13 @@ export class LocalPlatformService implements PlatformApi {
     return this.startTurn(threadId, userId, prompt, config, attachmentIds);
   }
 
-  async steerThread(threadId: string, userId: string, prompt: string) {
-    return this.steerTask(threadId, userId, prompt);
+  async steerThread(
+    threadId: string,
+    userId: string,
+    prompt: string,
+    attachmentIds: string[] = [],
+  ) {
+    return this.steerTask(threadId, userId, prompt, attachmentIds);
   }
 
   async interruptThread(threadId: string, userId: string) {
@@ -759,7 +771,7 @@ export class LocalPlatformService implements PlatformApi {
     return this.startAllocatedTurn(allocation);
   }
 
-  async steerTask(taskId: string, userId: string, prompt: string) {
+  async steerTask(taskId: string, userId: string, prompt: string, attachmentIds: string[] = []) {
     const task = this.requireTask(taskId, userId);
     if (task.status !== "RUNNING" && task.status !== "WAITING_APPROVAL") {
       throw new Error(`Task status ${task.status} does not accept Steer`);
@@ -770,7 +782,30 @@ export class LocalPlatformService implements PlatformApi {
       task.currentTurnId,
     );
     if (!platformTurnId) throw new Error("Active Turn projection is unavailable");
-    await this.options.execution.steerTask(task.threadId, task.currentTurnId, prompt);
+    const inputSnapshot = this.options.store.claimSteerInput({
+      id: randomUUID(),
+      taskId,
+      turnId: platformTurnId,
+      ownerId: userId,
+      prompt,
+      attachmentIds,
+      now: this.now(),
+    });
+    const attachments = inputSnapshot.attachments.map((attachment) => ({
+      name: attachment.name,
+      path: join(this.options.dataDir, "workspaces", taskId, attachment.relativePath),
+      mimeType: attachment.mimeType,
+    }));
+    if (attachments.length > 0) {
+      await this.options.execution.steerTask(
+        task.threadId,
+        task.currentTurnId,
+        prompt,
+        attachments,
+      );
+    } else {
+      await this.options.execution.steerTask(task.threadId, task.currentTurnId, prompt);
+    }
     const event = this.options.store.appendTaskEvent({
       taskId,
       threadId: task.threadId,
@@ -1062,6 +1097,7 @@ export class LocalPlatformService implements PlatformApi {
   }
 
   async runMaintenance(now = this.now()): Promise<void> {
+    await this.cleanupExpiredDrafts(now);
     this.recoverExpiredModelCatalogCooldowns(now);
     for (const schedulerTurnId of this.schedulerTurnByRuntimeTurn.values()) {
       this.options.leases.heartbeatTurn(schedulerTurnId, now);
@@ -1346,18 +1382,21 @@ export class LocalPlatformService implements PlatformApi {
   }
 
   private async removeAttachmentRefs(threadId: string, refs: string[]): Promise<void> {
-    const workspace = join(this.options.dataDir, "workspaces", threadId);
-    const roots = new Set(
+    const attachmentIds = new Set(
       refs.map((reference) => {
         const segments = reference.split("/");
         const attachmentId = segments[2];
         if (segments[0] !== ".codexplatform" || segments[1] !== "attachments" || !attachmentId) {
           throw new Error("Invalid attachment staging reference");
         }
-        return join(workspace, ".codexplatform", "attachments", attachmentId);
+        return attachmentId;
       }),
     );
-    await Promise.all([...roots].map((root) => rm(root, { recursive: true, force: true })));
+    await Promise.all(
+      [...attachmentIds].map((attachmentId) =>
+        removeSafeAttachmentRoot(this.options.dataDir, threadId, attachmentId),
+      ),
+    );
   }
 
   private requireTask(taskId: string, userId: string) {
@@ -2082,6 +2121,124 @@ function runtimeTurnKey(taskId: string, turnId: string | null): string | null {
 function commonAttachmentRoot(paths: string[]): string | null {
   const roots = paths.map((path) => path.split("/")[0]).filter(Boolean);
   return roots.length > 0 && roots.every((root) => root === roots[0]) ? (roots[0] ?? null) : null;
+}
+
+async function prepareSafeAttachmentRoot(
+  dataDir: string,
+  threadId: string,
+  attachmentId: string,
+): Promise<void> {
+  const dataRoot = resolve(dataDir);
+  await mkdir(dataRoot, { recursive: true, mode: 0o700 });
+  const dataRootReal = await realpath(dataRoot);
+  const ancestry = attachmentAncestry(dataRoot, threadId, attachmentId);
+  for (const directory of ancestry) {
+    await createDirectoryWithoutSymlink(directory);
+    assertContainedPath(dataRootReal, await realpath(directory));
+  }
+}
+
+async function writeSafeAttachmentFile(
+  attachmentRoot: string,
+  relativePath: string,
+  content: Buffer,
+): Promise<void> {
+  const rootReal = await realpath(attachmentRoot);
+  const segments = relativePath.split("/");
+  const fileName = segments.pop();
+  if (!fileName) throw new Error("Unsafe attachment staging path");
+
+  let parent = attachmentRoot;
+  let parentReal = rootReal;
+  for (const segment of segments) {
+    parent = join(parent, segment);
+    await createDirectoryWithoutSymlink(parent);
+    parentReal = await realpath(parent);
+    assertContainedPath(rootReal, parentReal);
+  }
+
+  const target = join(parentReal, fileName);
+  assertContainedPath(rootReal, target);
+  try {
+    await lstat(target);
+    throw new Error("Unsafe attachment staging path");
+  } catch (error) {
+    if (!isFileSystemError(error, "ENOENT")) throw error;
+  }
+
+  const noFollow = "O_NOFOLLOW" in fsConstants ? fsConstants.O_NOFOLLOW : 0;
+  const handle = await open(
+    target,
+    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow,
+    0o600,
+  );
+  try {
+    await handle.writeFile(content);
+    await handle.chmod(0o600);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function createDirectoryWithoutSymlink(path: string): Promise<void> {
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (error) {
+    if (!isFileSystemError(error, "EEXIST")) throw error;
+  }
+  const stat = await lstat(path);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error("Unsafe attachment staging path");
+  }
+}
+
+async function removeSafeAttachmentRoot(
+  dataDir: string,
+  threadId: string,
+  attachmentId: string,
+): Promise<void> {
+  const dataRoot = resolve(dataDir);
+  let dataRootReal: string;
+  try {
+    dataRootReal = await realpath(dataRoot);
+  } catch (error) {
+    if (isFileSystemError(error, "ENOENT")) return;
+    throw error;
+  }
+
+  const ancestry = attachmentAncestry(dataRoot, threadId, attachmentId);
+  for (const path of ancestry) {
+    let stat: Awaited<ReturnType<typeof lstat>>;
+    try {
+      stat = await lstat(path);
+    } catch (error) {
+      if (isFileSystemError(error, "ENOENT")) return;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error("Unsafe attachment staging path");
+    }
+    assertContainedPath(dataRootReal, await realpath(path));
+  }
+  await rm(ancestry.at(-1) as string, { recursive: true, force: true });
+}
+
+function attachmentAncestry(dataRoot: string, threadId: string, attachmentId: string): string[] {
+  const workspaces = join(dataRoot, "workspaces");
+  const workspace = join(workspaces, threadId);
+  const privateRoot = join(workspace, ".codexplatform");
+  const attachments = join(privateRoot, "attachments");
+  return [workspaces, workspace, privateRoot, attachments, join(attachments, attachmentId)];
+}
+
+function assertContainedPath(base: string, candidate: string): void {
+  const child = relative(base, candidate);
+  if (child === "" || (!child.startsWith("..") && !isAbsolute(child))) return;
+  throw new Error("Unsafe attachment staging path");
+}
+
+function isFileSystemError(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error && error.code === code;
 }
 
 function projectTurn(threadId: string, turn: TurnRecord): Thread["turns"][number] {

@@ -134,6 +134,112 @@ describe("SQLitePlatformStore", () => {
     expect(JSON.stringify(store.getTurnInputSnapshot(turn.id))).not.toContain("/private/");
   });
 
+  test("claims only owned, READY, unclaimed attachments into immutable Steer snapshots", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Steer", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Steer",
+      now: NOW,
+    });
+    const turn = store.createTurn({
+      id: "active-turn",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Initial",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    store.setTurnStatus(turn.id, "RUNNING");
+    store.setCurrentTurn(task.id, "runtime-active-turn", "RUNNING", NOW);
+    const ready = store.createAttachment({
+      id: "steer-ready",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "ready.txt",
+      relativePath: ".codexplatform/attachments/steer-ready/ready.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    const blocked = store.createAttachment({
+      id: "steer-blocked",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "blocked.txt",
+      relativePath: ".codexplatform/attachments/steer-blocked/blocked.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      fileCount: 1,
+      scanStatus: "BLOCKED",
+      now: NOW,
+    });
+
+    expect(
+      store.claimSteerInput({
+        id: "steer-input-1",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-1",
+        prompt: "",
+        attachmentIds: [ready.id],
+        now: NOW,
+      }),
+    ).toEqual({
+      prompt: "",
+      attachments: [ready],
+      capturedAt: NOW.toISOString(),
+    });
+    expect(() =>
+      store.claimSteerInput({
+        id: "steer-input-repeat",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-1",
+        prompt: "",
+        attachmentIds: [ready.id],
+        now: NOW,
+      }),
+    ).toThrow("Attachments must exist, be owned, unclaimed, and READY");
+    expect(() =>
+      store.claimSteerInput({
+        id: "steer-input-blocked",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-1",
+        prompt: "",
+        attachmentIds: [blocked.id],
+        now: NOW,
+      }),
+    ).toThrow("Attachments must exist, be owned, unclaimed, and READY");
+    expect(() =>
+      store.claimSteerInput({
+        id: "steer-input-owner",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-2",
+        prompt: "steal",
+        attachmentIds: [],
+        now: NOW,
+      }),
+    ).toThrow("Task not found");
+    expect(() =>
+      store.claimSteerInput({
+        id: "steer-input-empty",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-1",
+        prompt: "",
+        attachmentIds: [],
+        now: NOW,
+      }),
+    ).toThrow("Invalid Steer input");
+  });
+
   test("enforces attachment root, aggregate-size, and folder-file limits", () => {
     const project = store.createProject({ ownerId: "user-1", name: "Limits", now: NOW });
     const thread = store.createTask({

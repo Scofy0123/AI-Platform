@@ -191,18 +191,9 @@ export class CodexAppServerRuntime {
     if (!this.memoryDisabledThreadIds.has(threadId)) {
       throw new Error("Thread native memory must be disabled before turn/start");
     }
-    const userInput: UserInput[] = [];
-    if (prompt.length > 0) userInput.push(textInput(prompt));
-    for (const attachment of options?.attachments ?? []) {
-      userInput.push(
-        attachment.mimeType.startsWith("image/")
-          ? { type: "localImage", path: attachment.path }
-          : { type: "mention", name: attachment.name, path: attachment.path },
-      );
-    }
     const params = {
       threadId,
-      input: userInput,
+      input: buildUserInput(prompt, options?.attachments ?? []),
       ...(options ? turnConfigParams(options.cwd, options.effectiveConfig) : {}),
     } satisfies TurnStartParams;
     return this.rpc.request("turn/start", params);
@@ -224,11 +215,16 @@ export class CodexAppServerRuntime {
     return response;
   }
 
-  steerTurn(threadId: string, turnId: string, prompt: string): Promise<unknown> {
+  steerTurn(
+    threadId: string,
+    turnId: string,
+    prompt: string,
+    attachments: Array<{ name: string; path: string; mimeType: string }> = [],
+  ): Promise<unknown> {
     return this.rpc.request("turn/steer", {
       threadId,
       expectedTurnId: turnId,
-      input: [textInput(prompt)],
+      input: buildUserInput(prompt, attachments),
     });
   }
 
@@ -300,6 +296,22 @@ function codexBucketPriority(key: string, snapshot: RateLimitSnapshot): number {
 
 function textInput(text: string) {
   return { type: "text" as const, text, text_elements: [] };
+}
+
+function buildUserInput(
+  prompt: string,
+  attachments: Array<{ name: string; path: string; mimeType: string }>,
+): UserInput[] {
+  const input: UserInput[] = [];
+  if (prompt.length > 0) input.push(textInput(prompt));
+  for (const attachment of attachments) {
+    input.push(
+      attachment.mimeType.startsWith("image/")
+        ? { type: "localImage", path: attachment.path }
+        : { type: "mention", name: attachment.name, path: attachment.path },
+    );
+  }
+  return input;
 }
 
 export function codexPermissionParams(

@@ -226,6 +226,16 @@ export const turnInputSnapshots = sqliteTable("turn_input_snapshots", {
   capturedAt: integer("captured_at", { mode: "timestamp_ms" }).notNull(),
 });
 
+export const steerInputSnapshots = sqliteTable("steer_input_snapshots", {
+  id: text("id").primaryKey(),
+  turnId: text("turn_id")
+    .notNull()
+    .references(() => turns.id, { onDelete: "cascade" }),
+  prompt: text("prompt").notNull(),
+  attachmentsJson: text("attachments_json").notNull(),
+  capturedAt: integer("captured_at", { mode: "timestamp_ms" }).notNull(),
+});
+
 export const taskEvents = sqliteTable(
   "task_events",
   {

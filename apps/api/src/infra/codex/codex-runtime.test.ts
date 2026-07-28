@@ -601,6 +601,45 @@ describe("CodexAppServerRuntime", () => {
     });
   });
 
+  test("maps an attachment-only Steer into Codex UserInput", async () => {
+    const rpc = new FakeRpc({ "turn/steer": { turnId: "turn-1" } });
+    const runtime = new CodexAppServerRuntime(rpc);
+
+    await runtime.steerTurn("thread-1", "turn-1", "", [
+      {
+        name: "diagram.png",
+        path: "/runtime/workspaces/thread-1/.codexplatform/attachments/a1/diagram.png",
+        mimeType: "image/png",
+      },
+      {
+        name: "notes.txt",
+        path: "/runtime/workspaces/thread-1/.codexplatform/attachments/a2/notes.txt",
+        mimeType: "text/plain",
+      },
+    ]);
+
+    expect(rpc.requests).toEqual([
+      {
+        method: "turn/steer",
+        params: {
+          threadId: "thread-1",
+          expectedTurnId: "turn-1",
+          input: [
+            {
+              type: "localImage",
+              path: "/runtime/workspaces/thread-1/.codexplatform/attachments/a1/diagram.png",
+            },
+            {
+              type: "mention",
+              name: "notes.txt",
+              path: "/runtime/workspaces/thread-1/.codexplatform/attachments/a2/notes.txt",
+            },
+          ],
+        },
+      },
+    ]);
+  });
+
   test("reapplies the immutable snapshot when resuming and preserves explicit empty instructions", async () => {
     const rpc = new FakeRpc({
       "thread/resume": { thread: { id: "thread-1" } },

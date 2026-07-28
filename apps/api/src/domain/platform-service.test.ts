@@ -1,4 +1,6 @@
 import { EventEmitter } from "node:events";
+import { access, mkdir, readdir, rm, symlink } from "node:fs/promises";
+import { join } from "node:path";
 import {
   BootstrapSchema,
   ModelCatalogSchema,
@@ -201,6 +203,55 @@ describe("LocalPlatformService", () => {
     expect(JSON.stringify(await service.getThread(task.id, "user-1"))).not.toContain("不得落库");
   });
 
+  test("claims READY attachments into an immutable snapshot before an attachment-only Steer", async () => {
+    const project = await service.createProject("user-1", { name: "Steer attachment" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Initial");
+    const platformTurnId = (
+      database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+        id: string;
+      }
+    ).id;
+    const attachment = store.createAttachment({
+      id: "steer-attachment-1",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "diagram.png",
+      relativePath: ".codexplatform/attachments/steer-attachment-1/diagram.png",
+      mimeType: "image/png",
+      sizeBytes: 4,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+
+    await service.steerThread(task.id, "user-1", "", [attachment.id]);
+
+    expect(execution.steerTask).toHaveBeenLastCalledWith(
+      `thread-${task.id}`,
+      `codex-turn-${task.id}`,
+      "",
+      [
+        {
+          name: "diagram.png",
+          path: expect.stringContaining("/attachments/steer-attachment-1/diagram.png"),
+          mimeType: "image/png",
+        },
+      ],
+    );
+    expect(store.listSteerInputSnapshots(platformTurnId)).toEqual([
+      {
+        prompt: "",
+        attachments: [attachment],
+        capturedAt: NOW.toISOString(),
+      },
+    ]);
+    expect(() => store.deleteAttachment(attachment.id, task.id, "user-1")).toThrow(
+      "Attachment is already claimed by a Turn",
+    );
+  });
+
   test("allows Steer only for RUNNING or WAITING_APPROVAL tasks", async () => {
     const project = await service.createProject("user-1", { name: "Steer state" });
     const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
@@ -208,6 +259,75 @@ describe("LocalPlatformService", () => {
       "does not accept Steer",
     );
     expect(execution.steerTask).not.toHaveBeenCalled();
+  });
+
+  test("does not expose an owned Draft through legacy task detail or event reads", async () => {
+    const project = await service.createProject("user-1", { name: "Hidden draft" });
+    const draft = await service.createDraft("user-1", { projectId: project.id });
+
+    await expect(service.getTask(draft.id, "user-1")).resolves.toBeNull();
+    await expect(service.listTaskEvents(draft.id, "user-1", 0)).resolves.toBeNull();
+    await expect(service.listThreadEvents(draft.id, "user-1", 0)).resolves.toBeNull();
+  });
+
+  test("maintenance expires Drafts with their files idempotently using its supplied clock", async () => {
+    const project = await service.createProject("user-1", { name: "Draft maintenance" });
+    const draft = await service.createDraft("user-1", { projectId: project.id });
+    const attachment = await service.uploadAttachment(draft.id, "user-1", {
+      files: [
+        {
+          name: "notes.txt",
+          relativePath: "notes.txt",
+          mimeType: "text/plain",
+          content: Buffer.from("hello"),
+        },
+      ],
+    });
+    const attachmentRoot = join(
+      "/tmp/codexplatform-test",
+      "workspaces",
+      draft.id,
+      ".codexplatform",
+      "attachments",
+      attachment.id,
+    );
+    const maintenanceAt = new Date(NOW.getTime() + 2 * 60 * 60_000);
+
+    await access(attachmentRoot);
+    await service.runMaintenance(maintenanceAt);
+    await expect(access(attachmentRoot)).rejects.toThrow();
+    expect(store.getTaskForUser(draft.id, "user-1")).toBeNull();
+
+    await expect(service.runMaintenance(maintenanceAt)).resolves.toBeUndefined();
+  });
+
+  test("rejects a symlink in the staging ancestry without writing outside the workspace", async () => {
+    const project = await service.createProject("user-1", { name: "Symlink safety" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    const workspace = join("/tmp/codexplatform-test", "workspaces", task.id);
+    const escapeRoot = join("/tmp", `codexplatform-escape-${task.id}`);
+    await mkdir(workspace, { recursive: true });
+    await mkdir(escapeRoot, { recursive: true });
+    await symlink(escapeRoot, join(workspace, ".codexplatform"));
+
+    try {
+      await expect(
+        service.uploadAttachment(task.id, "user-1", {
+          files: [
+            {
+              name: "notes.txt",
+              relativePath: "notes.txt",
+              mimeType: "text/plain",
+              content: Buffer.from("must stay contained"),
+            },
+          ],
+        }),
+      ).rejects.toThrow("Unsafe attachment staging path");
+      expect(await readdir(escapeRoot)).toEqual([]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+      await rm(escapeRoot, { recursive: true, force: true });
+    }
   });
 
   test("returns strict public task DTOs with the latest prompt and live queue state", async () => {

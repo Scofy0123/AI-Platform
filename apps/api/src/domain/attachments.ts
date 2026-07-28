@@ -20,10 +20,9 @@ export interface AttachmentScanner {
   }): Promise<AttachmentScanResult>;
 }
 
-const EXECUTABLE_EXTENSIONS = new Set([
+const INSTALLER_EXTENSIONS = new Set([
   ".app",
   ".bat",
-  ".bin",
   ".cmd",
   ".com",
   ".cpl",
@@ -32,26 +31,23 @@ const EXECUTABLE_EXTENSIONS = new Set([
   ".exe",
   ".hta",
   ".jar",
-  ".js",
   ".jse",
   ".msi",
   ".msp",
   ".pkg",
   ".ps1",
   ".scr",
-  ".sh",
   ".vbe",
   ".vbs",
   ".wsf",
 ]);
 
-const EXECUTABLE_MIME_TYPES = new Set([
+const INSTALLER_MIME_TYPES = new Set([
   "application/java-archive",
   "application/vnd.microsoft.portable-executable",
   "application/x-dosexec",
   "application/x-executable",
   "application/x-msdownload",
-  "application/x-sh",
 ]);
 
 const ZERO_BYTE_ALLOWED_MIME_TYPES = new Set([
@@ -84,13 +80,27 @@ export class BasicAttachmentScanner implements AttachmentScanner {
     }
     const extension = posix.extname(normalized).toLowerCase();
     if (
-      EXECUTABLE_EXTENSIONS.has(extension) ||
-      EXECUTABLE_MIME_TYPES.has(input.mimeType.toLowerCase())
+      INSTALLER_EXTENSIONS.has(extension) ||
+      INSTALLER_MIME_TYPES.has(input.mimeType.toLowerCase())
     ) {
-      return { status: "BLOCKED", reason: "Unsupported executable attachment" };
+      return { status: "BLOCKED", reason: "Unsupported installer attachment" };
+    }
+    if (hasExecutableSignature(input.content)) {
+      return { status: "BLOCKED", reason: "Executable attachment content is not allowed" };
     }
     return { status: "READY", normalizedRelativePath: normalized };
   }
+}
+
+function hasExecutableSignature(content: Buffer): boolean {
+  if (content.subarray(0, 2).equals(Buffer.from([0x4d, 0x5a]))) return true;
+  if (content.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) return true;
+  if (content.subarray(0, 2).toString("ascii") === "#!") return true;
+  if (content.subarray(0, 4).toString("ascii") === "xar!") return true;
+  const magic = content.subarray(0, 4).toString("hex");
+  return new Set(["cafebabe", "cafebabf", "cefaedfe", "cffaedfe", "feedface", "feedfacf"]).has(
+    magic,
+  );
 }
 
 export function normalizeAttachmentPath(value: string): string | null {

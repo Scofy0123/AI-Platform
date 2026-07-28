@@ -65,7 +65,12 @@ export interface PlatformApi {
     config?: EffectiveConfigOverride,
     attachmentIds?: string[],
   ): Promise<unknown>;
-  steerThread(threadId: string, userId: string, prompt: string): Promise<unknown>;
+  steerThread(
+    threadId: string,
+    userId: string,
+    prompt: string,
+    attachmentIds?: string[],
+  ): Promise<unknown>;
   interruptThread(threadId: string, userId: string): Promise<unknown>;
   listThreadEvents(
     threadId: string,
@@ -81,7 +86,12 @@ export interface PlatformApi {
   getMyConnections(userId: string): Promise<unknown>;
   getMyPlugins(userId: string): Promise<unknown>;
   startTurn(taskId: string, userId: string, prompt: string): Promise<unknown>;
-  steerTask(taskId: string, userId: string, prompt: string): Promise<unknown>;
+  steerTask(
+    taskId: string,
+    userId: string,
+    prompt: string,
+    attachmentIds?: string[],
+  ): Promise<unknown>;
   interruptTask(taskId: string, userId: string): Promise<unknown>;
   listTaskEvents(
     taskId: string,

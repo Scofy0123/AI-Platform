@@ -11,6 +11,7 @@ import sensible from "@fastify/sensible";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { FeishuConnectionStatus, PlatformUser } from "./auth/auth-store.js";
+import { MAX_TURN_ATTACHMENT_BYTES } from "./domain/attachments.js";
 import {
   AllocatedModelSelectionChangedError,
   ModelCatalogUnavailableError,
@@ -313,8 +314,13 @@ function registerRoutes(
       mimeType: string;
       content: Buffer;
     }> = [];
+    let aggregateBytes = 0;
     for await (const file of request.files()) {
-      const content = await file.toBuffer();
+      const content = await readMultipartStream(
+        file.file,
+        MAX_TURN_ATTACHMENT_BYTES - aggregateBytes,
+      );
+      aggregateBytes += content.byteLength;
       if (file.file.truncated) {
         return reply.code(400).send({ error: "Attachment exceeds the 50 MiB file limit" });
       }
@@ -394,12 +400,25 @@ function registerRoutes(
     if (!actor) return;
     const { id } = request.params as { id: string };
     const body = parseBody(
-      z.object({ prompt: z.string().trim().min(1).max(100_000) }),
+      z
+        .object({
+          prompt: z.string().trim().max(100_000),
+          attachmentIds: z.array(z.string().min(1)).max(32).default([]),
+        })
+        .refine((input) => input.prompt.length > 0 || input.attachmentIds.length > 0, {
+          message: "A Steer requires a prompt or at least one attachment",
+        }),
       request.body,
       reply,
     );
     if (!body) return;
-    return reply.code(202).send(await platform.steerThread(id, actor.user.id, body.prompt));
+    return reply
+      .code(202)
+      .send(
+        body.attachmentIds.length > 0
+          ? await platform.steerThread(id, actor.user.id, body.prompt, body.attachmentIds)
+          : await platform.steerThread(id, actor.user.id, body.prompt),
+      );
   });
 
   app.post("/api/threads/:id/interrupt", async (request, reply) => {
@@ -536,12 +555,25 @@ function registerRoutes(
     if (!actor) return;
     const { id } = request.params as { id: string };
     const body = parseBody(
-      z.object({ prompt: z.string().trim().min(1).max(100_000) }),
+      z
+        .object({
+          prompt: z.string().trim().max(100_000),
+          attachmentIds: z.array(z.string().min(1)).max(32).default([]),
+        })
+        .refine((input) => input.prompt.length > 0 || input.attachmentIds.length > 0, {
+          message: "A Steer requires a prompt or at least one attachment",
+        }),
       request.body,
       reply,
     );
     if (!body) return;
-    return reply.code(202).send(await platform.steerTask(id, actor.user.id, body.prompt));
+    return reply
+      .code(202)
+      .send(
+        body.attachmentIds.length > 0
+          ? await platform.steerTask(id, actor.user.id, body.prompt, body.attachmentIds)
+          : await platform.steerTask(id, actor.user.id, body.prompt),
+      );
   });
 
   app.post("/api/tasks/:id/interrupt", async (request, reply) => {
@@ -887,6 +919,26 @@ export async function subscribeWithReplay<T extends { sequence: number }>(input:
   }
 }
 
+export async function readMultipartStream(
+  stream: AsyncIterable<Buffer | Uint8Array | string> & { destroy?: (error?: Error) => void },
+  maxBytes: number,
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const rawChunk of stream) {
+    const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+    bytes += chunk.byteLength;
+    if (bytes > maxBytes) {
+      const error = new Error("Attachments exceed the aggregate upload limit");
+      stream.destroy?.(error);
+      chunks.length = 0;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, bytes);
+}
+
 export function encodeSse(
   event: TaskEvent,
   hideAccountAlias = true,
@@ -1048,6 +1100,7 @@ function classifyKnownError(
   }
   if (/cannot be archived$/i.test(message)) return { statusCode: 409, message };
   if (/^Thread is archived$/i.test(message)) return { statusCode: 409, message };
+  if (/^Attachments exceed\b/i.test(message)) return { statusCode: 400, message };
   if (/credential isolation|real codex multi-user execution is disabled/i.test(message)) {
     return { statusCode: 403, message };
   }

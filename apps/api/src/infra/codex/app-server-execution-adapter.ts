@@ -58,7 +58,12 @@ interface RuntimePort {
     },
   ): Promise<unknown>;
   disableThreadMemory(threadId: string): Promise<unknown>;
-  steerTurn(threadId: string, turnId: string, prompt: string): Promise<unknown>;
+  steerTurn(
+    threadId: string,
+    turnId: string,
+    prompt: string,
+    attachments?: Array<{ name: string; path: string; mimeType: string }>,
+  ): Promise<unknown>;
   interruptTurn(threadId: string, turnId: string): Promise<unknown>;
   startChatGptLogin(): Promise<{ loginId: string; authUrl: string }>;
   readWeeklyQuota(): Promise<WeeklyQuota>;
@@ -295,8 +300,18 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     }
   }
 
-  async steerTask(threadId: string, turnId: string, prompt: string): Promise<void> {
-    await this.requireRuntime(threadId).steerTurn(threadId, turnId, prompt);
+  async steerTask(
+    threadId: string,
+    turnId: string,
+    prompt: string,
+    attachments?: Array<{ name: string; path: string; mimeType: string }>,
+  ): Promise<void> {
+    const runtime = this.requireRuntime(threadId);
+    if (attachments?.length) {
+      await runtime.steerTurn(threadId, turnId, prompt, attachments);
+    } else {
+      await runtime.steerTurn(threadId, turnId, prompt);
+    }
   }
 
   async interruptTask(threadId: string, turnId: string): Promise<void> {
