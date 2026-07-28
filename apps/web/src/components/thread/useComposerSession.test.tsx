@@ -41,6 +41,16 @@ function createApi() {
   } as unknown as PlatformApi;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (cause: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 afterEach(() => {
   sessionStorage.clear();
 });
@@ -237,6 +247,121 @@ describe("useComposerSession", () => {
     expect(sessionStorage.getItem("codexplatform.composer-draft.v1")).toBe(
       '{"draftId":"draft-restored","projectId":"project-1"}',
     );
+  });
+
+  test("awaits one pending Draft restore when Files, Goal, and Plan are used immediately", async () => {
+    sessionStorage.setItem(
+      "codexplatform.composer-draft.v1",
+      JSON.stringify({ draftId: "draft-restored", projectId: "project-1" }),
+    );
+    const restore = deferred<{
+      id: string;
+      projectId: string;
+      lifecycleState: "DRAFT";
+    }>();
+    const api = createApi();
+    if (!api.getDraft || !api.getThreadComposer) throw new Error("Draft restore mocks missing");
+    vi.mocked(api.getDraft).mockReturnValue(restore.promise);
+    vi.mocked(api.getThreadComposer).mockResolvedValue({ planMode: false, revision: 7 });
+    const { result } = renderHook(() =>
+      useComposerSession({ api, resolveProjectId: async () => "project-1" }),
+    );
+    await waitFor(() => expect(api.getDraft).toHaveBeenCalledTimes(1));
+
+    let actions!: Promise<unknown[]>;
+    act(() => {
+      actions = Promise.all([
+        result.current.chooseFiles([new File(["one"], "one.txt", { type: "text/plain" })]),
+        result.current.saveGoal({
+          objective: "恢复后继续",
+          tokenBudget: 200_000,
+          timeBudgetSeconds: 3_600,
+        }),
+        result.current.togglePlanMode(),
+      ]);
+    });
+    expect(api.createDraft).not.toHaveBeenCalled();
+
+    restore.resolve({
+      id: "draft-restored",
+      projectId: "project-1",
+      lifecycleState: "DRAFT",
+    });
+    await act(() => actions);
+
+    expect(api.getDraft).toHaveBeenCalledTimes(1);
+    expect(api.createDraft).not.toHaveBeenCalled();
+    expect(api.uploadAttachments).toHaveBeenCalledWith("draft-restored", [expect.any(File)]);
+    expect(api.putThreadGoal).toHaveBeenCalledWith(
+      "draft-restored",
+      expect.objectContaining({ objective: "恢复后继续" }),
+    );
+    expect(api.patchThreadComposer).toHaveBeenCalledWith("draft-restored", {
+      planMode: true,
+      revision: 7,
+    });
+    expect(result.current.resourceThreadId).toBe("draft-restored");
+    expect(result.current.goal?.objective).toBe("恢复后继续");
+    expect(result.current.planMode).toBe(true);
+  });
+
+  test("ignores a stale Draft restore after the hook moves to another Thread generation", async () => {
+    sessionStorage.setItem(
+      "codexplatform.composer-draft.v1",
+      JSON.stringify({ draftId: "draft-stale", projectId: "project-1" }),
+    );
+    const restore = deferred<{
+      id: string;
+      projectId: string;
+      lifecycleState: "DRAFT";
+    }>();
+    const api = createApi();
+    if (!api.getDraft || !api.listThreadAttachments) throw new Error("Draft restore mocks missing");
+    vi.mocked(api.getDraft).mockReturnValue(restore.promise);
+    vi.mocked(api.listThreadAttachments).mockImplementation(async (threadId) =>
+      threadId === "draft-stale"
+        ? [
+            {
+              id: "stale-file",
+              threadId,
+              kind: "FILE",
+              name: "stale.txt",
+              relativePath: ".codexplatform/attachments/stale-file/stale.txt",
+              mimeType: "text/plain",
+              sizeBytes: 5,
+              fileCount: 1,
+              scanStatus: "READY",
+              createdAt: "2026-07-28T10:00:00.000Z",
+            },
+          ]
+        : [],
+    );
+    const initialProps: { threadId: string | undefined } = { threadId: undefined };
+    const { result, rerender } = renderHook(
+      ({ threadId }: { threadId: string | undefined }) =>
+        useComposerSession({
+          api,
+          threadId,
+          resolveProjectId: async () => "project-1",
+        }),
+      { initialProps },
+    );
+    await waitFor(() => expect(api.getDraft).toHaveBeenCalledTimes(1));
+
+    rerender({ threadId: "thread-active" });
+    restore.resolve({
+      id: "draft-stale",
+      projectId: "project-1",
+      lifecycleState: "DRAFT",
+    });
+
+    await waitFor(() => expect(result.current.resourceThreadId).toBe("thread-active"));
+    await act(async () => {
+      await restore.promise;
+      await Promise.resolve();
+    });
+    expect(result.current.resourceThreadId).toBe("thread-active");
+    expect(result.current.readyAttachmentIds).not.toContain("stale-file");
   });
 
   test("clears an expired Draft key, creates a replacement, and clears it after activation", async () => {

@@ -40,12 +40,14 @@ export function useComposerSession({
   const draftPromiseRef = useRef<Promise<string> | null>(null);
   const restorePromiseRef = useRef<Promise<string | null> | null>(null);
   const restoreAttemptedRef = useRef(false);
+  const sessionGenerationRef = useRef(0);
   const revisionRef = useRef(initialComposerState?.revision ?? 0);
   const pendingSequenceRef = useRef(0);
   const initialPlanMode = initialComposerState?.planMode ?? false;
   const initialComposerRevision = initialComposerState?.revision ?? 0;
 
   useEffect(() => {
+    sessionGenerationRef.current += 1;
     resourceThreadIdRef.current = threadId ?? null;
     setResourceThreadId(threadId ?? null);
     setAttachments([]);
@@ -60,14 +62,20 @@ export function useComposerSession({
   }, [initialComposerRevision, initialPlanMode, threadId]);
 
   const restoreStoredDraft = useCallback(async (): Promise<string | null> => {
-    if (threadId || restoreAttemptedRef.current) return resourceThreadIdRef.current;
     if (restorePromiseRef.current) return restorePromiseRef.current;
+    if (threadId || restoreAttemptedRef.current) return resourceThreadIdRef.current;
     restoreAttemptedRef.current = true;
     const stored = readStoredDraft();
     if (!stored || !api.getDraft) return null;
+    const generation = sessionGenerationRef.current;
+    const isCurrentRestore = () =>
+      sessionGenerationRef.current === generation &&
+      resourceThreadIdRef.current === null &&
+      storedDraftMatches(stored);
     const pending = (async () => {
       try {
         const restored = await api.getDraft?.(stored.draftId);
+        if (!isCurrentRestore()) return resourceThreadIdRef.current;
         if (!restored || restored.projectId !== stored.projectId) {
           clearStoredDraft();
           return null;
@@ -82,6 +90,7 @@ export function useComposerSession({
             : Promise.resolve(null),
           api.getThreadComposer?.(restored.id) ?? Promise.resolve({ planMode: false, revision: 0 }),
         ]);
+        if (!isCurrentRestore()) return resourceThreadIdRef.current;
         resourceThreadIdRef.current = restored.id;
         setResourceThreadId(restored.id);
         setAttachments(loadedAttachments);
@@ -91,10 +100,11 @@ export function useComposerSession({
         setPlanMode(loadedComposer.planMode);
         return restored.id;
       } catch (cause) {
-        if (hasStatus(cause, 404)) {
+        if (hasStatus(cause, 404) && isCurrentRestore()) {
           clearStoredDraft();
           return null;
         }
+        if (!isCurrentRestore()) return resourceThreadIdRef.current;
         setError(errorMessage(cause));
         return null;
       }
@@ -103,7 +113,7 @@ export function useComposerSession({
     try {
       return await pending;
     } finally {
-      restorePromiseRef.current = null;
+      if (restorePromiseRef.current === pending) restorePromiseRef.current = null;
     }
   }, [api, threadId]);
 
@@ -166,6 +176,7 @@ export function useComposerSession({
     if (resourceThreadIdRef.current) return resourceThreadIdRef.current;
     const restored = await restoreStoredDraft();
     if (restored) return restored;
+    if (resourceThreadIdRef.current) return resourceThreadIdRef.current;
     if (draftPromiseRef.current) return draftPromiseRef.current;
     if (!api.createDraft) throw new Error("Draft endpoint unavailable");
     const pending = (async () => {
@@ -326,7 +337,12 @@ export function useComposerSession({
     clearGoal,
     togglePlanMode,
     clearSubmittedAttachments,
-    markActivated: clearStoredDraft,
+    markActivated: () => {
+      sessionGenerationRef.current += 1;
+      restoreAttemptedRef.current = true;
+      restorePromiseRef.current = null;
+      clearStoredDraft();
+    },
     reportError: (message: string) => setError(message),
   };
 }
@@ -351,6 +367,11 @@ function readStoredDraft(): { draftId: string; projectId: string } | null {
 function storeDraft(value: { draftId: string; projectId: string }) {
   if (typeof sessionStorage === "undefined") return;
   sessionStorage.setItem(DRAFT_SESSION_KEY, JSON.stringify(value));
+}
+
+function storedDraftMatches(value: { draftId: string; projectId: string }) {
+  const current = readStoredDraft();
+  return current?.draftId === value.draftId && current.projectId === value.projectId;
 }
 
 function clearStoredDraft() {
