@@ -1730,7 +1730,7 @@ export class LocalPlatformService implements PlatformApi {
     requiredAccountId: string | null,
   ): Promise<PlanModeCatalogCapability> {
     this.options.store.getUserIdentity(userId);
-    const accountIds = this.options.leases.listModelRoutingAccountIdsForUser(
+    const accountIds = this.options.leases.listAssignableAccountIdsForUser(
       userId,
       this.now(),
       requiredAccountId,
@@ -2255,7 +2255,11 @@ export class LocalPlatformService implements PlatformApi {
         requestedConfig,
         collaborationPreset: cloneCollaborationPreset(preset),
       });
+      await mkdir(cwd, { recursive: true, mode: 0o700 });
       this.options.store.updateTurnConfigSnapshot(allocation.turnId, effectiveConfig);
+      if (!this.isAccountModelRoutingEligible(queuedTurn.ownerId, account.id)) {
+        throw new AllocatedAccountIneligibleError();
+      }
     } catch (error) {
       const accountBecameIneligible =
         error instanceof AllocatedAccountIneligibleError ||
@@ -2282,7 +2286,6 @@ export class LocalPlatformService implements PlatformApi {
     }
 
     try {
-      await mkdir(cwd, { recursive: true, mode: 0o700 });
       const started = await this.options.execution.startTask({
         accountId: account.id,
         codexHome: account.codexHome,

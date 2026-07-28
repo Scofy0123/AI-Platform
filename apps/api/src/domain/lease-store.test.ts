@@ -114,6 +114,21 @@ describe("SQLiteLeaseStore", () => {
     ]);
   });
 
+  test("lists FULL accounts as assignable only for the user that already owns a slot", () => {
+    store.addAccount(account("available", { weeklyRemaining: 80 }));
+    store.addAccount(
+      account("full", { weeklyRemaining: 90, maxActiveUsers: 1, status: "AVAILABLE" }),
+    );
+
+    expect(store.acquireTurn(request("user-with-slot", "task-1", "turn-1"))).toMatchObject({
+      kind: "LEASED",
+      accountId: "full",
+    });
+
+    expect(store.listAssignableAccountIdsForUser("new-user", NOW)).toEqual(["available"]);
+    expect(store.listAssignableAccountIdsForUser("user-with-slot", NOW)).toEqual(["full"]);
+  });
+
   test("selects the account required by an existing Thread instead of a higher-quota account", () => {
     store.addAccount(account("thread-account", { weeklyRemaining: 10 }));
     store.addAccount(account("higher-quota-account", { weeklyRemaining: 90 }));

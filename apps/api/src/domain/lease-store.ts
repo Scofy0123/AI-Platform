@@ -511,7 +511,7 @@ export class SQLiteLeaseStore {
     return { activeUsers: row.active_users, activeTurns: row.active_turns };
   }
 
-  listEligibleAccountIdsForUser(
+  listAssignableAccountIdsForUser(
     userId: string,
     now: Date,
     requiredAccountId: string | null = null,
@@ -539,15 +539,15 @@ export class SQLiteLeaseStore {
       if (hasBlockingTurn) return [];
     }
 
-    const accountIds: string[] = [];
-    const excluded = new Set<string>();
-    while (true) {
-      const account = this.selectEligibleAccount(now, requiredAccountId, excluded);
-      if (!account) break;
-      accountIds.push(account.id);
-      excluded.add(account.id);
-    }
-    return accountIds;
+    return this.listNewAssignableAccounts(now, requiredAccountId).map((account) => account.id);
+  }
+
+  listEligibleAccountIdsForUser(
+    userId: string,
+    now: Date,
+    requiredAccountId: string | null = null,
+  ): string[] {
+    return this.listAssignableAccountIdsForUser(userId, now, requiredAccountId);
   }
 
   listModelRoutingAccountIdsForUser(
@@ -749,7 +749,18 @@ export class SQLiteLeaseStore {
     requiredAccountId: string | null,
     excludedAccountIds: ReadonlySet<string>,
   ): EligibleAccountRow | null {
-    const accounts = this.sqlite
+    return (
+      this.listNewAssignableAccounts(now, requiredAccountId).find(
+        (account) => !excludedAccountIds.has(account.id),
+      ) ?? null
+    );
+  }
+
+  private listNewAssignableAccounts(
+    now: Date,
+    requiredAccountId: string | null,
+  ): EligibleAccountRow[] {
+    return this.sqlite
       .prepare(
         `SELECT a.id, a.max_active_users,
                   COUNT(s.user_id) AS active_users
@@ -782,7 +793,6 @@ export class SQLiteLeaseStore {
         requiredAccountId,
         now.getTime() - QUOTA_FRESHNESS_MS,
       ) as EligibleAccountRow[];
-    return accounts.find((account) => !excludedAccountIds.has(account.id)) ?? null;
   }
 
   private findExistingUserAccount(userId: string, requiredAccountId: string | null): string | null {

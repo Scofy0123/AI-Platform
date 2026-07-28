@@ -24,6 +24,7 @@ import {
   type AttachedGoalRuntimeResult,
   LocalPlatformService,
   ModelCatalogUnavailableError,
+  type PlanModeCatalogCapability,
   type RuntimeGoalProjection,
   type RuntimeSafetyPort,
   type TaskEventDraft,
@@ -309,6 +310,87 @@ describe("LocalPlatformService", () => {
       unavailableReasonCode: "RUNTIME_VERSION_UNSUPPORTED",
     });
   });
+
+  test("does not let a FULL account without this user's slot poison the Plan intersection", async () => {
+    leases.addAccount({
+      id: "account-full",
+      alias: "Codex Full",
+      codexHome: "/tmp/codexplatform-test/account-full",
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+      maxActiveUsers: 1,
+      weeklyRemaining: 90,
+      quotaUpdatedAt: NOW,
+      allowUnknownQuota: false,
+      healthScore: 100,
+    });
+    expect(
+      leases.acquireTurn({
+        userId: "user-2",
+        taskId: "occupy-full-account",
+        turnId: "occupy-full-account-turn",
+        now: NOW,
+      }),
+    ).toMatchObject({ kind: "LEASED", accountId: "account-full" });
+    execution.readPlanModeCatalog.mockImplementation(async (account) => {
+      if (account.id === "account-full") {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+          reason: "FULL account has an old Runtime",
+          presets: [],
+        };
+      }
+      return planCatalog();
+    });
+
+    expect(
+      (await service.listComposerCapabilities("user-1")).find(
+        (capability) => capability.id === "plan-mode",
+      ),
+    ).toMatchObject({ availability: "AVAILABLE" });
+    expect(execution.readPlanModeCatalog).toHaveBeenCalledTimes(1);
+    expect(execution.readPlanModeCatalog).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "account-1" }),
+    );
+  });
+
+  test.each(["DRAINING", "EXHAUSTED", "STALE_QUOTA"] as const)(
+    "does not start Runtime when the allocated account becomes %s during the Plan catalog probe",
+    async (transition) => {
+      const catalog = deferred<PlanModeCatalogCapability>();
+      execution.readPlanModeCatalog.mockReturnValueOnce(catalog.promise);
+      const project = await service.createProject("user-1", { name: `Plan race ${transition}` });
+      const thread = await service.createThread("user-1", {
+        projectId: project.id,
+        title: "Must not start",
+      });
+
+      const starting = service.startThreadTurn(thread.id, "user-1", "Do not run");
+      await vi.waitFor(() => expect(execution.readPlanModeCatalog).toHaveBeenCalledTimes(1));
+      if (transition === "STALE_QUOTA") {
+        leases.updateQuota("account-1", {
+          weeklyRemaining: 80,
+          quotaUpdatedAt: new Date(NOW.getTime() - 6 * 60_000),
+        });
+      } else {
+        leases.updateAccount("account-1", { status: transition });
+      }
+      catalog.resolve(planCatalog());
+
+      await expect(starting).rejects.toThrow();
+      expect(execution.startTask).not.toHaveBeenCalled();
+      expect(leases.getAccountOccupancy("account-1")).toEqual({
+        activeUsers: 0,
+        activeTurns: 0,
+      });
+      expect(await service.getThread(thread.id, "user-1")).toMatchObject({
+        status: "FAILED",
+        currentTurn: null,
+        turns: [expect.objectContaining({ status: "FAILED" })],
+      });
+    },
+  );
 
   test("persists a Steer only after the runtime accepts it and replays it as a platform Turn item", async () => {
     const project = await service.createProject("user-1", { name: "Steer persistence" });
@@ -3710,6 +3792,34 @@ function seedUser(database: PlatformDatabase, id: string, role: "ADMIN" | "MEMBE
        ) VALUES (?, 'tenant-1', ?, ?, ?, ?, ?)`,
     )
     .run(id, `ou_${id}`, id, role, NOW.getTime(), NOW.getTime());
+}
+
+function planCatalog(): PlanModeCatalogCapability {
+  return {
+    availability: "AVAILABLE",
+    reasonCode: null,
+    reason: null,
+    presets: [
+      {
+        name: "Default",
+        mode: "default",
+        settings: {
+          model: "fake-codex-standard",
+          reasoningEffort: "medium",
+          developerInstructions: null,
+        },
+      },
+      {
+        name: "Plan",
+        mode: "plan",
+        settings: {
+          model: "fake-codex-standard",
+          reasoningEffort: "high",
+          developerInstructions: null,
+        },
+      },
+    ],
+  };
 }
 
 function deferred<T>(): {
