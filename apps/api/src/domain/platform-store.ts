@@ -92,6 +92,17 @@ export interface ThreadGoalTokenUpdate {
   goal: StoredThreadGoalView;
 }
 
+export interface ThreadGoalBudgetTransition {
+  ownerId: string;
+  goal: StoredThreadGoalView;
+}
+
+export interface RecoveredPersistedGoal {
+  taskId: string;
+  ownerId: string;
+  runtimeThreadId: string;
+}
+
 export interface TaskRecord {
   id: string;
   projectId: string;
@@ -1167,30 +1178,81 @@ export class SQLitePlatformStore {
       .run(now.getTime(), threadId, ownerId);
   }
 
-  applyGoalWatchdog(now: Date): string[] {
-    const rows = this.sqlite
-      .prepare(
-        `SELECT task_id, owner_id FROM thread_goals
-         WHERE deleted_at IS NULL AND status = 'ACTIVE' AND (
-           tokens_used >= token_budget OR
-           (activated_at IS NOT NULL AND time_used_seconds + CAST((? - activated_at) / 1000 AS INTEGER) >= time_budget_seconds)
-         )`,
-      )
-      .all(now.getTime()) as Array<{ task_id: string; owner_id: string }>;
-    for (const row of rows) {
-      this.sqlite
+  applyGoalWatchdog(now: Date): ThreadGoalBudgetTransition[] {
+    return this.immediateTransaction(() => {
+      const rows = this.sqlite
         .prepare(
-          `UPDATE thread_goals SET status = 'BUDGET_LIMITED',
-           runtime_sync_state = 'PENDING',
-           time_used_seconds = MIN(time_budget_seconds,
-             time_used_seconds + CASE WHEN activated_at IS NULL THEN 0
-             ELSE CAST((? - activated_at) / 1000 AS INTEGER) END),
-           activated_at = NULL, updated_at = ?
-           WHERE task_id = ? AND owner_id = ?`,
+          `SELECT task_id, owner_id FROM thread_goals
+           WHERE deleted_at IS NULL AND status = 'ACTIVE' AND (
+             tokens_used >= token_budget OR
+             (activated_at IS NOT NULL AND time_used_seconds + CAST((? - activated_at) / 1000 AS INTEGER) >= time_budget_seconds)
+           )`,
         )
-        .run(now.getTime(), now.getTime(), row.task_id, row.owner_id);
-    }
-    return rows.map((row) => row.task_id);
+        .all(now.getTime()) as Array<{ task_id: string; owner_id: string }>;
+      const transitioned: ThreadGoalBudgetTransition[] = [];
+      for (const row of rows) {
+        const result = this.sqlite
+          .prepare(
+            `UPDATE thread_goals SET status = 'BUDGET_LIMITED',
+             runtime_sync_state = 'PENDING',
+             time_used_seconds = MIN(time_budget_seconds,
+               time_used_seconds + CASE WHEN activated_at IS NULL THEN 0
+               ELSE CAST((? - activated_at) / 1000 AS INTEGER) END),
+             activated_at = NULL, updated_at = ?
+             WHERE task_id = ? AND owner_id = ? AND deleted_at IS NULL AND status = 'ACTIVE'`,
+          )
+          .run(now.getTime(), now.getTime(), row.task_id, row.owner_id);
+        if (result.changes !== 1) continue;
+        const goal = this.getThreadGoal(row.task_id, row.owner_id);
+        if (goal) transitioned.push({ ownerId: row.owner_id, goal });
+      }
+      return transitioned;
+    });
+  }
+
+  recoverPersistedRuntimeGoals(now: Date): RecoveredPersistedGoal[] {
+    return this.immediateTransaction(() => {
+      const rows = this.sqlite
+        .prepare(
+          `SELECT tg.task_id, tg.owner_id, tg.runtime_thread_id
+           FROM thread_goals tg
+           JOIN tasks t ON t.id = tg.task_id AND t.owner_id = tg.owner_id
+           WHERE tg.deleted_at IS NULL
+             AND tg.runtime_thread_id IS NOT NULL
+             AND tg.status IN ('ACTIVE', 'PAUSED', 'BUDGET_LIMITED')
+             AND t.lifecycle_state = 'ACTIVE'
+           ORDER BY tg.updated_at, tg.task_id`,
+        )
+        .all() as Array<{
+        task_id: string;
+        owner_id: string;
+        runtime_thread_id: string;
+      }>;
+      const recovered: RecoveredPersistedGoal[] = [];
+      const recoverGoal = this.sqlite.prepare(
+        `UPDATE thread_goals
+         SET status = 'NEEDS_RECOVERY', runtime_sync_state = 'NEEDS_RECOVERY',
+             activated_at = NULL, updated_at = ?
+         WHERE task_id = ? AND owner_id = ? AND deleted_at IS NULL
+           AND status IN ('ACTIVE', 'PAUSED', 'BUDGET_LIMITED')`,
+      );
+      const recoverTask = this.sqlite.prepare(
+        `UPDATE tasks
+         SET status = 'NEEDS_RECOVERY', current_turn_id = NULL,
+             queue_ticket = NULL, updated_at = ?
+         WHERE id = ? AND owner_id = ? AND lifecycle_state = 'ACTIVE'`,
+      );
+      for (const row of rows) {
+        if (recoverGoal.run(now.getTime(), row.task_id, row.owner_id).changes !== 1) continue;
+        recoverTask.run(now.getTime(), row.task_id, row.owner_id);
+        recovered.push({
+          taskId: row.task_id,
+          ownerId: row.owner_id,
+          runtimeThreadId: row.runtime_thread_id,
+        });
+      }
+      return recovered;
+    });
   }
 
   private requireOwnedGoalThread(threadId: string, ownerId: string): void {

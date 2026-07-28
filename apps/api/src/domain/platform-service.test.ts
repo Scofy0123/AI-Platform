@@ -596,15 +596,46 @@ describe("LocalPlatformService", () => {
       timeBudgetSeconds: 1,
     });
     await service.startTurn(task.id, "user-1", "执行");
+    execution.interruptTask.mockClear();
+    execution.syncThreadGoal.mockClear();
 
     await service.runMaintenance(new Date(NOW.getTime() + 2_000));
+    await service.runMaintenance(new Date(NOW.getTime() + 3_000));
 
+    expect(execution.interruptTask).toHaveBeenCalledTimes(1);
     expect(execution.interruptTask).toHaveBeenCalledWith(
       `thread-${task.id}`,
       `codex-turn-${task.id}`,
     );
+    expect(execution.syncThreadGoal).toHaveBeenCalledTimes(1);
+    expect(execution.syncThreadGoal).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      expect.objectContaining({ status: "BUDGET_LIMITED" }),
+    );
     expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
       status: "BUDGET_LIMITED",
+      runtimeSyncState: "SYNCED",
+    });
+  });
+
+  test("requires Goal recovery when time-budget Runtime synchronization fails", async () => {
+    const project = await service.createProject("user-1", { name: "Goal watchdog failure" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "短时执行",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 1,
+    });
+    await service.startTurn(task.id, "user-1", "执行");
+    execution.syncThreadGoal.mockRejectedValueOnce(new Error("Runtime Goal sync failed"));
+
+    await expect(service.runMaintenance(new Date(NOW.getTime() + 2_000))).resolves.toBeUndefined();
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
     });
   });
 
@@ -2880,6 +2911,58 @@ describe("LocalPlatformService", () => {
     );
     expect(accounts.list()[0]).toMatchObject({ activeTurns: 0 });
   });
+
+  test.each(["ACTIVE", "PAUSED", "BUDGET_LIMITED"] as const)(
+    "recovers a persisted %s Runtime Goal at startup without a running Turn",
+    async (goalStatus) => {
+      const project = await service.createProject("user-1", { name: `Startup ${goalStatus}` });
+      const task = await service.createTask("user-1", {
+        projectId: project.id,
+        title: `Startup ${goalStatus}`,
+      });
+      await service.putThreadGoal(task.id, "user-1", {
+        objective: "跨重启未完成目标",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      });
+      await service.startTurn(task.id, "user-1", "建立 Runtime 绑定");
+      execution.emitTaskEvent({
+        taskId: task.id,
+        threadId: `thread-${task.id}`,
+        turnId: `codex-turn-${task.id}`,
+        type: "TURN_COMPLETED",
+        payload: { status: "completed" },
+      });
+      if (goalStatus === "PAUSED") {
+        await service.patchThreadGoal(task.id, "user-1", { action: "PAUSE" });
+      } else if (goalStatus === "BUDGET_LIMITED") {
+        store.updateThreadGoalTokens(task.id, "user-1", 200_000, NOW);
+      }
+
+      expect(service.recoverInterruptedTurns()).toBe(0);
+      expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+        status: "NEEDS_RECOVERY",
+        runtimeSyncState: "NEEDS_RECOVERY",
+      });
+      expect(await service.getTask(task.id, "user-1")).toMatchObject({
+        status: "NEEDS_RECOVERY",
+      });
+      expect(
+        (await service.listTaskEvents(task.id, "user-1", 0))?.filter(
+          (event) => event.type === "RECOVERY_REQUIRED",
+        ),
+      ).toHaveLength(1);
+      await expect(service.startTurn(task.id, "user-1", "不得继续")).rejects.toThrow(
+        "does not accept new Turns",
+      );
+      expect(service.recoverInterruptedTurns()).toBe(0);
+      expect(
+        (await service.listTaskEvents(task.id, "user-1", 0))?.filter(
+          (event) => event.type === "RECOVERY_REQUIRED",
+        ),
+      ).toHaveLength(1);
+    },
+  );
 
   test("recovers an orphaned ALLOCATING Turn left before lease acquisition", async () => {
     const project = await service.createProject("user-1", { name: "Allocating recovery" });

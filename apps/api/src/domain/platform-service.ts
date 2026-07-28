@@ -1307,19 +1307,11 @@ export class LocalPlatformService implements PlatformApi {
 
   async runMaintenance(now = this.now()): Promise<void> {
     await this.cleanupExpiredDrafts(now);
-    const limitedGoalTaskIds = this.options.store.applyGoalWatchdog(now);
+    const limitedGoals = this.options.store.applyGoalWatchdog(now);
     await Promise.all(
-      limitedGoalTaskIds.map(async (taskId) => {
-        const ownerId = this.options.store.getTaskOwnerId(taskId);
-        if (!ownerId) return;
-        const task = this.options.store.getTaskForUser(taskId, ownerId);
-        if (!task?.threadId || !task.currentTurnId) return;
-        try {
-          await this.options.execution.interruptTask(task.threadId, task.currentTurnId);
-        } catch {
-          this.options.store.markThreadGoalRecovery(taskId, ownerId, now);
-        }
-      }),
+      limitedGoals.map(({ ownerId, goal }) =>
+        this.enforceGoalBudgetLimit(goal.threadId, ownerId, goal).catch(() => undefined),
+      ),
     );
     this.recoverExpiredModelCatalogCooldowns(now);
     for (const schedulerTurnId of this.schedulerTurnByRuntimeTurn.values()) {
@@ -1350,6 +1342,20 @@ export class LocalPlatformService implements PlatformApi {
       "The API process restarted; resume must occur at a Turn boundary.",
       now,
     );
+    for (const goal of this.options.store.recoverPersistedRuntimeGoals(now)) {
+      const event = this.options.store.appendTaskEvent({
+        taskId: goal.taskId,
+        threadId: goal.runtimeThreadId,
+        turnId: null,
+        type: "RECOVERY_REQUIRED",
+        payload: {
+          reason:
+            "The API process restarted while a Runtime Goal remained unfinished; explicit recovery is required.",
+        },
+        now,
+      });
+      this.publish(event);
+    }
     return interrupted.size;
   }
 
