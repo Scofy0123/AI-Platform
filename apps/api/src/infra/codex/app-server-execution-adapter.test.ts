@@ -235,6 +235,40 @@ describe("AppServerExecutionAdapter", () => {
     );
   });
 
+  test("starts a new Turn after resuming a system-error Thread with no in-progress Turn", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.resumeThread).mockResolvedValue(
+      resumeResponse("thread-1", { type: "systemError" }, [
+        { id: "turn-failed", status: "failed" },
+      ]),
+    );
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await expect(
+      adapter.startTask({
+        accountId: "account-1",
+        codexHome: "/tmp/account-1",
+        taskId: "task-1",
+        userId: "user-1",
+        cwd: "/workspace",
+        prompt: "Retry with an available model",
+        existingThreadId: "thread-1",
+        ...TEST_EXECUTION_CONTEXT,
+      }),
+    ).resolves.toEqual({ threadId: "thread-1", turnId: "turn-1" });
+    expect(runtime.resumeThread).toHaveBeenCalledOnce();
+    expect(runtime.disableThreadMemory).toHaveBeenCalledWith("thread-1");
+    expect(runtime.startTurn).toHaveBeenCalledOnce();
+  });
+
   test("clears a stale native Goal before starting a resumed Turn without a platform Goal", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();

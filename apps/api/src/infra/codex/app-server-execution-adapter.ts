@@ -1328,7 +1328,10 @@ function inspectResumedThread(
   if (statusType === "idle" && "activeFlags" in status) {
     throw new Error("Idle thread.status must not contain activeFlags");
   }
-  if (statusType !== "idle") {
+  // App Server reports systemError after a failed Turn even though the Thread is no longer
+  // running; starting the next Turn clears that terminal error state. The in-progress check
+  // above remains the safety boundary that prevents attaching a new prompt to active work.
+  if (!["idle", "systemError"].includes(statusType)) {
     throw new Error(`Thread resume did not return an idle Thread: ${statusType}`);
   }
   return { kind: "IDLE", threadId };

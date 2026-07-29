@@ -33,6 +33,8 @@ export interface NormalizedApprovalRequest {
 export class CodexEventNormalizer {
   private sequence = 0;
   private readonly now: () => Date;
+  private readonly streamedAgentMessageText = new Map<string, string>();
+  private readonly completedAgentMessageItems = new Set<string>();
 
   constructor(private readonly context: NormalizerContext) {
     this.now = context.now ?? (() => new Date());
@@ -70,6 +72,10 @@ export class CodexEventNormalizer {
       }
       case "item/agentMessage/delta":
         if (!stableItemId(params.itemId)) return [];
+        this.streamedAgentMessageText.set(
+          stringOrEmpty(params.itemId),
+          `${this.streamedAgentMessageText.get(stringOrEmpty(params.itemId)) ?? ""}${stringOrEmpty(params.delta)}`,
+        );
         return [
           this.event("AGENT_MESSAGE_DELTA", threadId, turnId, {
             itemId: stringOrEmpty(params.itemId),
@@ -150,6 +156,8 @@ export class CodexEventNormalizer {
         return this.normalizeItemStarted(item, threadId, turnId);
       case "item/completed":
         return this.normalizeItemCompleted(item, threadId, turnId);
+      case "rawResponseItem/completed":
+        return this.normalizeRawResponseItemCompleted(item, threadId, turnId);
       default:
         return [];
     }
@@ -234,12 +242,14 @@ export class CodexEventNormalizer {
   ): TaskEvent[] {
     if (!stableItemId(item.id)) return [];
     if (item.type === "agentMessage") {
-      return [
-        this.event("AGENT_MESSAGE_PHASE", threadId, turnId, {
-          itemId: stringOrEmpty(item.id),
-          phase: normalizeAgentMessagePhase(item.phase),
-        }),
-      ];
+      const itemId = stringOrEmpty(item.id);
+      return this.normalizeCompletedAgentMessage(
+        itemId,
+        normalizeAgentMessagePhase(item.phase),
+        typeof item.text === "string" ? item.text : "",
+        threadId,
+        turnId,
+      );
     }
     if (item.type === "commandExecution") {
       return [
@@ -280,6 +290,61 @@ export class CodexEventNormalizer {
       return this.normalizeSubagentItem(item, threadId, turnId);
     }
     return [];
+  }
+
+  private normalizeRawResponseItemCompleted(
+    item: Record<string, unknown>,
+    threadId: string | null,
+    turnId: string | null,
+  ): TaskEvent[] {
+    const itemId = stableItemId(item.id);
+    if (
+      item.type !== "message" ||
+      item.role !== "assistant" ||
+      normalizeAgentMessagePhase(item.phase) !== "final_answer" ||
+      !itemId ||
+      !Array.isArray(item.content)
+    ) {
+      return [];
+    }
+    const text = item.content
+      .map((contentItem) => asRecord(contentItem))
+      .filter((contentItem) => contentItem.type === "output_text")
+      .map((contentItem) => stringOrEmpty(contentItem.text))
+      .join("");
+    return this.normalizeCompletedAgentMessage(itemId, "final_answer", text, threadId, turnId);
+  }
+
+  private normalizeCompletedAgentMessage(
+    itemId: string,
+    phase: "commentary" | "final_answer" | null,
+    completedText: string,
+    threadId: string | null,
+    turnId: string | null,
+  ): TaskEvent[] {
+    if (this.completedAgentMessageItems.has(itemId)) return [];
+    this.completedAgentMessageItems.add(itemId);
+    const streamedText = this.streamedAgentMessageText.get(itemId) ?? "";
+    this.streamedAgentMessageText.delete(itemId);
+    const missingText =
+      phase === "final_answer" && completedText.length > 0 && completedText.startsWith(streamedText)
+        ? completedText.slice(streamedText.length)
+        : "";
+    const events: TaskEvent[] = [
+      this.event("AGENT_MESSAGE_PHASE", threadId, turnId, {
+        itemId,
+        phase,
+      }),
+    ];
+    if (missingText) {
+      events.push(
+        this.event("AGENT_MESSAGE_DELTA", threadId, turnId, {
+          itemId,
+          delta: missingText,
+        }),
+      );
+    }
+    return events;
   }
 
   private normalizeSubagentItem(
