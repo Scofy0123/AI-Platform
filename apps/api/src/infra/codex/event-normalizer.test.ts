@@ -177,6 +177,166 @@ describe("CodexEventNormalizer", () => {
     );
   });
 
+  test("emits a final answer delivered only by item completion", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    const events = normalizer.normalizeNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "agentMessage",
+          id: "message-final",
+          text: "<proposed_plan>Final plan</proposed_plan>",
+          phase: "final_answer",
+          content: "private content",
+          encrypted_content: "ciphertext",
+        },
+      },
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "AGENT_MESSAGE_PHASE",
+        payload: { itemId: "message-final", phase: "final_answer" },
+      }),
+      expect.objectContaining({
+        type: "AGENT_MESSAGE_DELTA",
+        payload: {
+          itemId: "message-final",
+          delta: "<proposed_plan>Final plan</proposed_plan>",
+        },
+      }),
+      expect.objectContaining({
+        type: "PROPOSED_PLAN_PUBLISHED",
+        payload: {
+          itemId: "message-final",
+          markdown: "Final plan",
+          title: "Final plan",
+        },
+      }),
+    ]);
+    expect(JSON.stringify(events)).not.toMatch(/private content|ciphertext/);
+  });
+
+  test("does not duplicate agent message text already delivered as deltas", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+    normalizer.normalizeNotification({
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "message-final",
+        delta: "Final plan",
+      },
+    });
+
+    const events = normalizer.normalizeNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "agentMessage",
+          id: "message-final",
+          text: "Final plan",
+          phase: "final_answer",
+        },
+      },
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "AGENT_MESSAGE_PHASE",
+        payload: { itemId: "message-final", phase: "final_answer" },
+      }),
+    ]);
+  });
+
+  test("normalizes a final answer delivered by raw response item completion", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    const events = normalizer.normalizeNotification({
+      method: "rawResponseItem/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "message",
+          id: "message-final",
+          role: "assistant",
+          phase: "final_answer",
+          content: [
+            { type: "output_text", text: "<proposed_plan>Final plan</proposed_plan>" },
+            { type: "input_text", text: "private input" },
+          ],
+          encrypted_content: "ciphertext",
+        },
+      },
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: "AGENT_MESSAGE_PHASE",
+        payload: { itemId: "message-final", phase: "final_answer" },
+      }),
+      expect.objectContaining({
+        type: "AGENT_MESSAGE_DELTA",
+        payload: {
+          itemId: "message-final",
+          delta: "<proposed_plan>Final plan</proposed_plan>",
+        },
+      }),
+      expect.objectContaining({
+        type: "PROPOSED_PLAN_PUBLISHED",
+        payload: {
+          itemId: "message-final",
+          markdown: "Final plan",
+          title: "Final plan",
+        },
+      }),
+    ]);
+    expect(JSON.stringify(events)).not.toMatch(/private input|ciphertext/);
+  });
+
+  test("publishes a complete Markdown Plan without leaking content outside the envelope", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    const events = normalizer.normalizeNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "agentMessage",
+          id: "message-final",
+          text: [
+            "<proposed_plan>",
+            "# 华东出差计划",
+            "",
+            "## 行程",
+            "- 上海",
+            "- 杭州",
+            "</proposed_plan>",
+          ].join("\n"),
+          phase: "final_answer",
+        },
+      },
+    });
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "PROPOSED_PLAN_PUBLISHED",
+        payload: {
+          itemId: "message-final",
+          markdown: "# 华东出差计划\n\n## 行程\n- 上海\n- 杭州",
+          title: "华东出差计划",
+        },
+      }),
+    );
+  });
+
   test("normalizes command completion, dynamic tools, approvals, and turn failure", () => {
     const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
     const command = normalizer.normalizeNotification({

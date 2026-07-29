@@ -84,6 +84,7 @@ describe("shared contracts scaffold", () => {
     expect(AgentMessagePhaseSchema.parse("final_answer")).toBe("final_answer");
     expect(() => AgentMessagePhaseSchema.parse("raw_reasoning")).toThrow();
     expect(TASK_EVENT_TYPES).toContain("AGENT_MESSAGE_PHASE");
+    expect(TASK_EVENT_TYPES).toContain("PROPOSED_PLAN_PUBLISHED");
   });
 
   test("accepts a strict runtime model catalog with ordered provider effort strings", () => {

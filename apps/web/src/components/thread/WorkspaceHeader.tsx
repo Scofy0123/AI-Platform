@@ -1,5 +1,6 @@
-import { type Ref, useState } from "react";
+import type { Ref } from "react";
 import { Icon } from "../../icons.js";
+import { useDismissiblePopover } from "./useDismissiblePopover.js";
 
 interface WorkspaceHeaderProps {
   title: string;
@@ -34,7 +35,13 @@ export function WorkspaceHeader({
   onToggleSide,
   onArchive,
 }: WorkspaceHeaderProps) {
-  const [menuOpen, setMenuOpen] = useState(false);
+  const {
+    close: closeMenu,
+    open: menuOpen,
+    rootRef: menuRef,
+    toggle: toggleMenu,
+    triggerRef: menuTriggerRef,
+  } = useDismissiblePopover<HTMLDivElement>();
 
   return (
     <header className="v11-thread-header">
@@ -43,14 +50,16 @@ export function WorkspaceHeader({
           <Icon name="project" />
         </span>
         <h1>{title}</h1>
-        <div className="v11-thread-menu">
+        <div ref={menuRef} className="v11-thread-menu">
           <button
+            ref={menuTriggerRef}
             type="button"
             className="v11-thread-menu-trigger"
             aria-label="Thread actions"
             aria-haspopup="menu"
-            aria-expanded={menuOpen}
-            onClick={() => setMenuOpen((open) => !open)}
+            aria-expanded={menuOpen && canArchive}
+            disabled={!canArchive}
+            onClick={toggleMenu}
           >
             <span aria-hidden="true">•••</span>
           </button>
@@ -62,7 +71,7 @@ export function WorkspaceHeader({
                 aria-label="Archive Thread"
                 disabled={archivePending}
                 onClick={() => {
-                  setMenuOpen(false);
+                  closeMenu({ restoreFocus: true });
                   onArchive();
                 }}
               >

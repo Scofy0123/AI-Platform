@@ -1,16 +1,26 @@
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import {
+  type ComposerState,
+  type DraftAttachment,
+  DraftAttachmentSchema,
   type EffectiveConfigOverride,
   EffectiveConfigOverrideSchema,
   type EffectiveThreadConfigSnapshot,
   EffectiveThreadConfigSnapshotSchema,
+  type EffectiveTurnInputSnapshot,
+  EffectiveTurnInputSnapshotSchema,
   type SubagentStatus,
   type SubagentThread,
   type SubagentThreadDetail,
   type TaskEvent,
   type TaskEventPayloadMap,
   type TaskEventType,
+  type ThreadGoalPatch,
+  ThreadGoalPatchSchema,
+  type ThreadGoalSnapshot,
+  type ThreadGoalView,
+  ThreadGoalViewSchema,
   type ThreadItem,
   type TokenUsageBreakdown,
   TokenUsageBreakdownSchema,
@@ -23,6 +33,17 @@ import {
   type RuntimePathRedactionContext,
   sanitizeEventTransport,
 } from "../event-payload-safety.js";
+import {
+  MAX_ATTACHMENT_ROOTS,
+  MAX_FOLDER_FILES,
+  MAX_TURN_ATTACHMENT_BYTES,
+} from "./attachments.js";
+import {
+  ComposerRevisionConflictError,
+  GoalMutationBlockedByPendingTurnError,
+  GoalMutationSupersededError,
+  PlanModeMutationBlockedError,
+} from "./errors.js";
 
 export interface ProjectRecord {
   id: string;
@@ -31,6 +52,61 @@ export interface ProjectRecord {
   taskCount: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface SteerInputSnapshotRecord extends EffectiveTurnInputSnapshot {
+  deliveryStatus: "PENDING" | "DELIVERED" | "FAILED" | "UNKNOWN";
+  deliveryError: string | null;
+  deliveredAt: string | null;
+  failedAt: string | null;
+  unknownAt: string | null;
+}
+
+export interface AttachmentCleanupJob {
+  id: string;
+  threadId: string;
+  attachmentId: string;
+  relativePath: string;
+  status: "PENDING" | "FAILED";
+  attempts: number;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface ThreadGoalRow {
+  task_id: string;
+  objective: string;
+  status: ThreadGoalView["status"];
+  token_budget: number;
+  tokens_used: number;
+  time_budget_seconds: number;
+  time_used_seconds: number;
+  runtime_sync_state: ThreadGoalView["runtimeSyncState"];
+  runtime_thread_id: string | null;
+  runtime_updated_at: number | null;
+  revision: number;
+  deleted_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export type StoredThreadGoalView = ThreadGoalView & { revision: number };
+
+export interface ThreadGoalTokenUpdate {
+  triggered: boolean;
+  goal: StoredThreadGoalView;
+}
+
+export interface ThreadGoalBudgetTransition {
+  ownerId: string;
+  goal: StoredThreadGoalView;
+}
+
+export interface RecoveredPersistedGoal {
+  taskId: string;
+  ownerId: string;
+  runtimeThreadId: string;
 }
 
 export interface TaskRecord {
@@ -47,6 +123,10 @@ export interface TaskRecord {
   currentTurnId: string | null;
   threadConfig: EffectiveConfigOverride | null;
   archivedAt: string | null;
+  lifecycleState: "DRAFT" | "ACTIVE" | "EXPIRED";
+  draftExpiresAt: string | null;
+  planMode: boolean;
+  composerRevision: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -155,8 +235,25 @@ interface TaskRow {
   current_turn_id: string | null;
   thread_config_json: string | null;
   archived_at: number | null;
+  lifecycle_state: "DRAFT" | "ACTIVE" | "EXPIRED";
+  draft_expires_at: number | null;
+  plan_mode: number;
+  composer_revision: number;
   created_at: number;
   updated_at: number;
+}
+
+interface AttachmentRow {
+  id: string;
+  task_id: string;
+  kind: "FILE" | "FOLDER";
+  name: string;
+  relative_path: string;
+  mime_type: string;
+  size_bytes: number;
+  file_count: number;
+  scan_status: DraftAttachment["scanStatus"];
+  created_at: number;
 }
 
 interface EventRow {
@@ -257,7 +354,8 @@ export class SQLitePlatformStore {
     const rows = this.sqlite
       .prepare(
         `SELECT p.*,
-          (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS task_count
+          (SELECT COUNT(*) FROM tasks t
+            WHERE t.project_id = p.id AND t.lifecycle_state = 'ACTIVE') AS task_count
          FROM projects p WHERE p.owner_id = ? ORDER BY p.updated_at DESC, p.id`,
       )
       .all(ownerId) as ProjectRow[];
@@ -294,19 +392,46 @@ export class SQLitePlatformStore {
     return this.getTaskForUser(id, input.ownerId) as TaskRecord;
   }
 
+  createDraft(input: {
+    ownerId: string;
+    projectId: string;
+    now: Date;
+    expiresAt: Date;
+  }): TaskRecord {
+    if (!this.getProject(input.projectId, input.ownerId)) throw new Error("Project not found");
+    const id = randomUUID();
+    this.sqlite
+      .prepare(
+        `INSERT INTO tasks (
+          id, project_id, owner_id, title, status, lifecycle_state, draft_expires_at,
+          created_at, updated_at
+         ) VALUES (?, ?, ?, 'Untitled', 'DRAFT', 'DRAFT', ?, ?, ?)`,
+      )
+      .run(
+        id,
+        input.projectId,
+        input.ownerId,
+        input.expiresAt.getTime(),
+        input.now.getTime(),
+        input.now.getTime(),
+      );
+    return this.getTaskForUser(id, input.ownerId) as TaskRecord;
+  }
+
   listTasks(ownerId: string, projectId?: string): TaskRecord[] {
     const rows = projectId
       ? (this.sqlite
           .prepare(
             `SELECT * FROM tasks
              WHERE owner_id = ? AND project_id = ? AND archived_at IS NULL
+               AND lifecycle_state = 'ACTIVE'
              ORDER BY updated_at DESC`,
           )
           .all(ownerId, projectId) as TaskRow[])
       : (this.sqlite
           .prepare(
             `SELECT * FROM tasks
-             WHERE owner_id = ? AND archived_at IS NULL
+             WHERE owner_id = ? AND archived_at IS NULL AND lifecycle_state = 'ACTIVE'
              ORDER BY updated_at DESC`,
           )
           .all(ownerId) as TaskRow[]);
@@ -317,7 +442,7 @@ export class SQLitePlatformStore {
     const rows = this.sqlite
       .prepare(
         `SELECT * FROM tasks
-         WHERE owner_id = ? AND archived_at IS NOT NULL
+         WHERE owner_id = ? AND archived_at IS NOT NULL AND lifecycle_state = 'ACTIVE'
          ORDER BY archived_at DESC, id`,
       )
       .all(ownerId) as TaskRow[];
@@ -331,12 +456,260 @@ export class SQLitePlatformStore {
     return row ? mapTask(row) : null;
   }
 
+  getComposerState(threadId: string, ownerId: string): ComposerState | null {
+    const row = this.sqlite
+      .prepare(
+        `SELECT plan_mode, composer_revision
+         FROM tasks
+         WHERE id = ? AND owner_id = ? AND lifecycle_state IN ('DRAFT', 'ACTIVE')
+           AND archived_at IS NULL`,
+      )
+      .get(threadId, ownerId) as { plan_mode: number; composer_revision: number } | undefined;
+    return row ? { planMode: row.plan_mode === 1, revision: row.composer_revision } : null;
+  }
+
+  patchComposerState(input: {
+    threadId: string;
+    ownerId: string;
+    planMode: boolean;
+    expectedRevision: number;
+    now: Date;
+  }): ComposerState {
+    return this.immediateTransaction(() => {
+      const task = this.sqlite
+        .prepare(
+          `SELECT plan_mode, composer_revision
+           FROM tasks
+           WHERE id = ? AND owner_id = ? AND lifecycle_state IN ('DRAFT', 'ACTIVE')
+             AND archived_at IS NULL`,
+        )
+        .get(input.threadId, input.ownerId) as
+        | { plan_mode: number; composer_revision: number }
+        | undefined;
+      if (!task) throw new Error("Thread not found");
+      if (task.composer_revision !== input.expectedRevision) {
+        throw new ComposerRevisionConflictError();
+      }
+      const pending = this.sqlite
+        .prepare(
+          `SELECT status FROM turns
+           WHERE task_id = ?
+             AND status IN ('ALLOCATING', 'QUEUED', 'RUNNING', 'WAITING_APPROVAL')
+           ORDER BY started_at DESC, rowid DESC LIMIT 1`,
+        )
+        .get(input.threadId) as
+        | {
+            status: "ALLOCATING" | "QUEUED" | "RUNNING" | "WAITING_APPROVAL";
+          }
+        | undefined;
+      if (pending) throw new PlanModeMutationBlockedError(pending.status);
+      const nextRevision = task.composer_revision + 1;
+      const updated = this.sqlite
+        .prepare(
+          `UPDATE tasks
+           SET plan_mode = ?, composer_revision = ?, updated_at = ?
+           WHERE id = ? AND owner_id = ? AND composer_revision = ?`,
+        )
+        .run(
+          input.planMode ? 1 : 0,
+          nextRevision,
+          input.now.getTime(),
+          input.threadId,
+          input.ownerId,
+          input.expectedRevision,
+        );
+      if (updated.changes !== 1) throw new ComposerRevisionConflictError();
+      return { planMode: input.planMode, revision: nextRevision };
+    });
+  }
+
+  activateDraft(threadId: string, ownerId: string, now: Date): TaskRecord {
+    const result = this.sqlite
+      .prepare(
+        `UPDATE tasks
+         SET lifecycle_state = 'ACTIVE', status = 'READY', draft_expires_at = NULL, updated_at = ?
+         WHERE id = ? AND owner_id = ? AND lifecycle_state = 'DRAFT'`,
+      )
+      .run(now.getTime(), threadId, ownerId);
+    if (result.changes !== 1) throw new Error("Thread not found");
+    return this.getTaskForUser(threadId, ownerId) as TaskRecord;
+  }
+
+  deleteDraft(threadId: string, ownerId: string, now = new Date()): { attachmentRefs: string[] } {
+    return this.immediateTransaction(() => {
+      const draft = this.sqlite
+        .prepare("SELECT id FROM tasks WHERE id = ? AND owner_id = ? AND lifecycle_state = 'DRAFT'")
+        .get(threadId, ownerId);
+      if (!draft) throw new Error("Thread not found");
+      const attachments = this.attachmentRefs(threadId);
+      this.enqueueAttachmentCleanupJobs(threadId, attachments, now);
+      this.sqlite.prepare("DELETE FROM tasks WHERE id = ?").run(threadId);
+      return { attachmentRefs: attachments.map((attachment) => attachment.relativePath) };
+    });
+  }
+
+  expireDrafts(now: Date): Array<{ threadId: string; attachmentRefs: string[] }> {
+    return this.immediateTransaction(() => {
+      const rows = this.sqlite
+        .prepare(
+          `SELECT id FROM tasks
+           WHERE lifecycle_state = 'DRAFT' AND draft_expires_at IS NOT NULL AND draft_expires_at <= ?`,
+        )
+        .all(now.getTime()) as Array<{ id: string }>;
+      const expired = rows.map(({ id }) => {
+        const attachments = this.attachmentRefs(id);
+        this.enqueueAttachmentCleanupJobs(id, attachments, now);
+        return {
+          threadId: id,
+          attachmentRefs: attachments.map((attachment) => attachment.relativePath),
+        };
+      });
+      for (const { id } of rows) {
+        this.sqlite.prepare("UPDATE tasks SET lifecycle_state = 'EXPIRED' WHERE id = ?").run(id);
+        this.sqlite.prepare("DELETE FROM tasks WHERE id = ?").run(id);
+      }
+      return expired;
+    });
+  }
+
+  createAttachment(input: {
+    id: string;
+    threadId: string;
+    ownerId: string;
+    kind: "FILE" | "FOLDER";
+    name: string;
+    relativePath: string;
+    mimeType: string;
+    sizeBytes: number;
+    fileCount: number;
+    scanStatus: DraftAttachment["scanStatus"];
+    blockedReason?: string | null;
+    now: Date;
+  }): DraftAttachment {
+    return this.immediateTransaction(() => {
+      const task = this.sqlite
+        .prepare(
+          "SELECT 1 FROM tasks WHERE id = ? AND owner_id = ? AND lifecycle_state != 'EXPIRED'",
+        )
+        .get(input.threadId, input.ownerId);
+      if (!task) throw new Error("Thread not found");
+      if (input.fileCount > MAX_FOLDER_FILES) throw new Error("Folder exceeds the 500 file limit");
+      const aggregate = this.sqlite
+        .prepare(
+          `SELECT COUNT(*) AS roots, COALESCE(SUM(size_bytes), 0) AS bytes
+           FROM draft_attachments WHERE task_id = ? AND claimed_turn_id IS NULL`,
+        )
+        .get(input.threadId) as { roots: number; bytes: number };
+      if (aggregate.roots >= MAX_ATTACHMENT_ROOTS)
+        throw new Error("Attachment root limit exceeded");
+      if (aggregate.bytes + input.sizeBytes > MAX_TURN_ATTACHMENT_BYTES) {
+        throw new Error("Attachments exceed the 200 MiB Turn limit");
+      }
+      this.sqlite
+        .prepare(
+          `INSERT INTO draft_attachments (
+            id, task_id, owner_id, kind, name, relative_path, mime_type, size_bytes, file_count,
+            scan_status, blocked_reason, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.threadId,
+          input.ownerId,
+          input.kind,
+          input.name,
+          input.relativePath,
+          input.mimeType,
+          input.sizeBytes,
+          input.fileCount,
+          input.scanStatus,
+          input.blockedReason ?? null,
+          input.now.getTime(),
+          input.now.getTime(),
+        );
+      return this.getAttachment(input.id, input.threadId, input.ownerId) as DraftAttachment;
+    });
+  }
+
+  getAttachment(attachmentId: string, threadId: string, ownerId: string): DraftAttachment | null {
+    const row = this.sqlite
+      .prepare(
+        `SELECT * FROM draft_attachments
+         WHERE id = ? AND task_id = ? AND owner_id = ?`,
+      )
+      .get(attachmentId, threadId, ownerId) as AttachmentRow | undefined;
+    return row ? mapAttachment(row) : null;
+  }
+
+  listUnclaimedAttachments(threadId: string, ownerId: string): DraftAttachment[] {
+    const task = this.sqlite
+      .prepare("SELECT 1 FROM tasks WHERE id = ? AND owner_id = ? AND lifecycle_state != 'EXPIRED'")
+      .get(threadId, ownerId);
+    if (!task) throw new Error("Thread not found");
+    const rows = this.sqlite
+      .prepare(
+        `SELECT * FROM draft_attachments
+         WHERE task_id = ? AND owner_id = ? AND claimed_turn_id IS NULL
+         ORDER BY created_at, id`,
+      )
+      .all(threadId, ownerId) as AttachmentRow[];
+    return rows.map(mapAttachment);
+  }
+
+  getReadyAttachments(
+    threadId: string,
+    ownerId: string,
+    attachmentIds: string[],
+  ): DraftAttachment[] {
+    if (attachmentIds.length === 0) return [];
+    const placeholders = attachmentIds.map(() => "?").join(",");
+    const rows = this.sqlite
+      .prepare(
+        `SELECT * FROM draft_attachments
+         WHERE task_id = ? AND owner_id = ? AND scan_status = 'READY'
+           AND id IN (${placeholders})`,
+      )
+      .all(threadId, ownerId, ...attachmentIds) as AttachmentRow[];
+    const byId = new Map(rows.map((row) => [row.id, mapAttachment(row)]));
+    return attachmentIds.flatMap((id) => {
+      const attachment = byId.get(id);
+      return attachment ? [attachment] : [];
+    });
+  }
+
+  deleteAttachment(
+    attachmentId: string,
+    threadId: string,
+    ownerId: string,
+    now = new Date(),
+  ): string {
+    return this.immediateTransaction(() => {
+      const row = this.sqlite
+        .prepare(
+          `SELECT relative_path, claimed_turn_id FROM draft_attachments
+           WHERE id = ? AND task_id = ? AND owner_id = ?`,
+        )
+        .get(attachmentId, threadId, ownerId) as
+        | { relative_path: string; claimed_turn_id: string | null }
+        | undefined;
+      if (!row) throw new Error("Attachment not found");
+      if (row.claimed_turn_id) throw new Error("Attachment is already claimed by a Turn");
+      this.enqueueAttachmentCleanupJobs(
+        threadId,
+        [{ id: attachmentId, relativePath: row.relative_path }],
+        now,
+      );
+      this.sqlite.prepare("DELETE FROM draft_attachments WHERE id = ?").run(attachmentId);
+      return row.relative_path;
+    });
+  }
+
   archiveThread(input: { threadId: string; ownerId: string; now: Date }): TaskRecord {
     return this.immediateTransaction(() => {
       const row = this.sqlite
         .prepare("SELECT * FROM tasks WHERE id = ? AND owner_id = ?")
         .get(input.threadId, input.ownerId) as TaskRow | undefined;
-      if (!row) throw new Error("Thread not found");
+      if (row?.lifecycle_state !== "ACTIVE") throw new Error("Thread not found");
       if (row.archived_at !== null) return mapTask(row);
 
       const activeTurn = this.sqlite
@@ -372,7 +745,7 @@ export class SQLitePlatformStore {
       const row = this.sqlite
         .prepare("SELECT * FROM tasks WHERE id = ? AND owner_id = ?")
         .get(input.threadId, input.ownerId) as TaskRow | undefined;
-      if (!row) throw new Error("Thread not found");
+      if (row?.lifecycle_state !== "ACTIVE") throw new Error("Thread not found");
       if (row.archived_at === null) return mapTask(row);
 
       this.sqlite
@@ -413,21 +786,58 @@ export class SQLitePlatformStore {
     prompt: string;
     status: "ALLOCATING" | "QUEUED";
     configSnapshot?: EffectiveThreadConfigSnapshot;
+    attachmentIds?: string[];
     now: Date;
   }): TurnRecord {
     this.immediateTransaction(() => {
       const task = this.sqlite
-        .prepare("SELECT owner_id FROM tasks WHERE id = ?")
-        .get(input.taskId) as { owner_id: string } | undefined;
+        .prepare("SELECT owner_id, lifecycle_state, plan_mode, title FROM tasks WHERE id = ?")
+        .get(input.taskId) as
+        | {
+            owner_id: string;
+            lifecycle_state: "DRAFT" | "ACTIVE" | "EXPIRED";
+            plan_mode: number;
+            title: string;
+          }
+        | undefined;
       if (!task || task.owner_id !== input.ownerId) throw new Error("Task not found");
+      const attachmentIds = [...new Set(input.attachmentIds ?? [])];
+      if (input.prompt.trim().length === 0 && attachmentIds.length === 0) {
+        throw new Error("Invalid Turn input");
+      }
+      if (attachmentIds.length > MAX_ATTACHMENT_ROOTS)
+        throw new Error("Attachment root limit exceeded");
+      const attachments = this.getReadyAttachments(input.taskId, input.ownerId, attachmentIds);
+      if (attachments.length !== attachmentIds.length) {
+        throw new Error("Attachments must exist, be owned, unclaimed, and READY");
+      }
+      const claimedCount =
+        attachmentIds.length === 0
+          ? 0
+          : (
+              this.sqlite
+                .prepare(
+                  `SELECT COUNT(*) AS count FROM draft_attachments
+                 WHERE task_id = ? AND owner_id = ? AND claimed_turn_id IS NULL
+                   AND id IN (${attachmentIds.map(() => "?").join(",")})`,
+                )
+                .get(input.taskId, input.ownerId, ...attachmentIds) as { count: number }
+            ).count;
+      if (claimedCount !== attachmentIds.length) {
+        throw new Error("Attachments must exist, be owned, unclaimed, and READY");
+      }
       const active = this.sqlite
         .prepare(
           `SELECT 1 FROM turns
-           WHERE task_id = ? AND status IN ('ALLOCATING', 'QUEUED', 'RUNNING')
+           WHERE task_id = ? AND status IN ('ALLOCATING', 'QUEUED', 'RUNNING', 'WAITING_APPROVAL')
            LIMIT 1`,
         )
         .get(input.taskId);
       if (active) throw new Error("Task already has an active Turn");
+      const goal = this.readThreadGoalSnapshot(input.taskId, input.ownerId);
+      if (goal && goal.status !== "ACTIVE") {
+        throw new Error(`Goal status ${goal.status} does not accept new Turns`);
+      }
       this.sqlite
         .prepare(
           `INSERT INTO turns (
@@ -446,8 +856,684 @@ export class SQLitePlatformStore {
           ),
           input.now.getTime(),
         );
+      this.sqlite
+        .prepare(
+          `INSERT INTO turn_input_snapshots (
+            turn_id, prompt, attachments_json, goal_json, plan_mode, captured_at
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.prompt,
+          JSON.stringify(attachments),
+          goal ? JSON.stringify(goal) : null,
+          task.plan_mode,
+          input.now.getTime(),
+        );
+      if (attachmentIds.length > 0) {
+        this.sqlite
+          .prepare(
+            `UPDATE draft_attachments SET claimed_turn_id = ?, updated_at = ?
+             WHERE id IN (${attachmentIds.map(() => "?").join(",")})`,
+          )
+          .run(input.id, input.now.getTime(), ...attachmentIds);
+      }
+      if (task.lifecycle_state === "DRAFT") {
+        const draftTitle =
+          task.title === "Untitled"
+            ? input.prompt.trim().slice(0, 80) || attachments[0]?.name || "New task"
+            : task.title;
+        this.sqlite
+          .prepare(
+            `UPDATE tasks SET lifecycle_state = 'ACTIVE', status = 'READY',
+             draft_expires_at = NULL, title = ?, updated_at = ? WHERE id = ?`,
+          )
+          .run(draftTitle, input.now.getTime(), input.taskId);
+      }
     });
     return this.getTurn(input.id) as TurnRecord;
+  }
+
+  getTurnInputSnapshot(turnId: string): EffectiveTurnInputSnapshot | null {
+    const row = this.sqlite
+      .prepare("SELECT * FROM turn_input_snapshots WHERE turn_id = ?")
+      .get(turnId) as
+      | {
+          prompt: string;
+          attachments_json: string;
+          goal_json: string | null;
+          plan_mode: number;
+          captured_at: number;
+        }
+      | undefined;
+    return row
+      ? EffectiveTurnInputSnapshotSchema.parse({
+          prompt: row.prompt,
+          attachments: JSON.parse(row.attachments_json),
+          goal: row.goal_json ? JSON.parse(row.goal_json) : null,
+          planMode: row.plan_mode === 1,
+          capturedAt: new Date(row.captured_at).toISOString(),
+        })
+      : null;
+  }
+
+  claimSteerInput(input: {
+    id: string;
+    taskId: string;
+    turnId: string;
+    ownerId: string;
+    prompt: string;
+    attachmentIds: string[];
+    now: Date;
+  }): EffectiveTurnInputSnapshot {
+    return this.immediateTransaction(() => {
+      const task = this.sqlite
+        .prepare(
+          `SELECT owner_id, lifecycle_state, status FROM tasks
+           WHERE id = ? AND owner_id = ?`,
+        )
+        .get(input.taskId, input.ownerId) as
+        | {
+            owner_id: string;
+            lifecycle_state: "DRAFT" | "ACTIVE" | "EXPIRED";
+            status: string;
+          }
+        | undefined;
+      if (task?.lifecycle_state !== "ACTIVE") throw new Error("Task not found");
+      if (!["RUNNING", "WAITING_APPROVAL"].includes(task.status)) {
+        throw new Error(`Task status ${task.status} does not accept Steer`);
+      }
+      const activeTurn = this.sqlite
+        .prepare(
+          `SELECT 1 FROM turns
+           WHERE id = ? AND task_id = ? AND status IN ('RUNNING', 'WAITING_APPROVAL')`,
+        )
+        .get(input.turnId, input.taskId);
+      if (!activeTurn) throw new Error("Active Turn projection is unavailable");
+
+      const attachmentIds = [...new Set(input.attachmentIds)];
+      if (input.prompt.trim().length === 0 && attachmentIds.length === 0) {
+        throw new Error("Invalid Steer input");
+      }
+      if (attachmentIds.length > MAX_ATTACHMENT_ROOTS) {
+        throw new Error("Attachment root limit exceeded");
+      }
+      const attachments = this.getReadyAttachments(input.taskId, input.ownerId, attachmentIds);
+      const totalBytes = attachments.reduce((sum, attachment) => sum + attachment.sizeBytes, 0);
+      if (totalBytes > MAX_TURN_ATTACHMENT_BYTES) {
+        throw new Error("Attachments exceed the 200 MiB Turn limit");
+      }
+      const claimableCount =
+        attachmentIds.length === 0
+          ? 0
+          : (
+              this.sqlite
+                .prepare(
+                  `SELECT COUNT(*) AS count FROM draft_attachments
+                   WHERE task_id = ? AND owner_id = ? AND scan_status = 'READY'
+                     AND claimed_turn_id IS NULL
+                     AND id IN (${attachmentIds.map(() => "?").join(",")})`,
+                )
+                .get(input.taskId, input.ownerId, ...attachmentIds) as { count: number }
+            ).count;
+      if (attachments.length !== attachmentIds.length || claimableCount !== attachmentIds.length) {
+        throw new Error("Attachments must exist, be owned, unclaimed, and READY");
+      }
+
+      this.sqlite
+        .prepare(
+          `INSERT INTO steer_input_snapshots (
+            id, turn_id, prompt, attachments_json, delivery_status, captured_at
+           ) VALUES (?, ?, ?, ?, 'PENDING', ?)`,
+        )
+        .run(
+          input.id,
+          input.turnId,
+          input.prompt,
+          JSON.stringify(attachments),
+          input.now.getTime(),
+        );
+      if (attachmentIds.length > 0) {
+        const claimed = this.sqlite
+          .prepare(
+            `UPDATE draft_attachments SET claimed_turn_id = ?, updated_at = ?
+             WHERE claimed_turn_id IS NULL
+               AND id IN (${attachmentIds.map(() => "?").join(",")})`,
+          )
+          .run(input.turnId, input.now.getTime(), ...attachmentIds);
+        if (claimed.changes !== attachmentIds.length) {
+          throw new Error("Attachments must exist, be owned, unclaimed, and READY");
+        }
+      }
+      return EffectiveTurnInputSnapshotSchema.parse({
+        prompt: input.prompt,
+        attachments,
+        goal: this.readThreadGoalSnapshot(input.taskId, input.ownerId),
+        planMode: this.getTurnInputSnapshot(input.turnId)?.planMode ?? false,
+        capturedAt: input.now.toISOString(),
+      });
+    });
+  }
+
+  getThreadGoal(threadId: string, ownerId: string): StoredThreadGoalView | null {
+    this.requireOwnedGoalThread(threadId, ownerId);
+    const row = this.sqlite
+      .prepare("SELECT * FROM thread_goals WHERE task_id = ? AND owner_id = ?")
+      .get(threadId, ownerId) as ThreadGoalRow | undefined;
+    return row && row.deleted_at === null ? mapThreadGoal(row) : null;
+  }
+
+  putThreadGoal(input: {
+    threadId: string;
+    ownerId: string;
+    objective: string;
+    tokenBudget: number;
+    timeBudgetSeconds: number;
+    now: Date;
+  }): StoredThreadGoalView {
+    return this.immediateTransaction(() => {
+      this.requireOwnedGoalThread(input.threadId, input.ownerId);
+      this.assertNoPendingGoalTurn(input.threadId, input.ownerId);
+      this.sqlite
+        .prepare(
+          `INSERT INTO thread_goals (
+            task_id, owner_id, objective, status, token_budget, tokens_used,
+            time_budget_seconds, time_used_seconds, runtime_sync_state,
+            activated_at, revision, deleted_at, created_at, updated_at
+           ) VALUES (?, ?, ?, 'ACTIVE', ?, 0, ?, 0, 'PENDING', ?, 1, NULL, ?, ?)
+           ON CONFLICT(task_id) DO UPDATE SET
+             objective = excluded.objective,
+             status = 'ACTIVE',
+             token_budget = excluded.token_budget,
+             tokens_used = 0,
+             time_budget_seconds = excluded.time_budget_seconds,
+             time_used_seconds = 0,
+             runtime_sync_state = 'PENDING',
+             runtime_thread_id = NULL,
+             runtime_updated_at = NULL,
+             activated_at = excluded.activated_at,
+             revision = thread_goals.revision + 1,
+             deleted_at = NULL,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          input.threadId,
+          input.ownerId,
+          input.objective,
+          input.tokenBudget,
+          input.timeBudgetSeconds,
+          input.now.getTime(),
+          input.now.getTime(),
+          input.now.getTime(),
+        );
+      return this.getThreadGoal(input.threadId, input.ownerId) as StoredThreadGoalView;
+    });
+  }
+
+  patchThreadGoal(input: {
+    threadId: string;
+    ownerId: string;
+    patch: ThreadGoalPatch;
+    now: Date;
+  }): StoredThreadGoalView {
+    const patch = ThreadGoalPatchSchema.parse(input.patch);
+    return this.immediateTransaction(() => {
+      const current = this.getThreadGoal(input.threadId, input.ownerId);
+      if (!current) throw new Error("Goal not found");
+      this.assertNoPendingGoalTurn(input.threadId, input.ownerId);
+      const status =
+        patch.action === "PAUSE"
+          ? "PAUSED"
+          : patch.action === "RESUME"
+            ? "ACTIVE"
+            : patch.action === "COMPLETE"
+              ? "COMPLETE"
+              : current.status;
+      this.sqlite
+        .prepare(
+          `UPDATE thread_goals SET
+             objective = ?, status = ?, token_budget = ?, time_budget_seconds = ?,
+             time_used_seconds = MIN(time_budget_seconds,
+               time_used_seconds + CASE
+                 WHEN status = 'ACTIVE' AND activated_at IS NOT NULL
+                   THEN MAX(0, CAST((? - activated_at) / 1000 AS INTEGER))
+                 ELSE 0
+               END),
+             runtime_sync_state = 'PENDING', activated_at = ?,
+             revision = revision + 1, updated_at = ?
+           WHERE task_id = ? AND owner_id = ?`,
+        )
+        .run(
+          patch.objective ?? current.objective,
+          status,
+          patch.tokenBudget ?? current.tokenBudget,
+          patch.timeBudgetSeconds ?? current.timeBudgetSeconds,
+          input.now.getTime(),
+          status === "ACTIVE" ? input.now.getTime() : null,
+          input.now.getTime(),
+          input.threadId,
+          input.ownerId,
+        );
+      return this.getThreadGoal(input.threadId, input.ownerId) as StoredThreadGoalView;
+    });
+  }
+
+  deleteThreadGoal(threadId: string, ownerId: string): boolean {
+    return this.deleteThreadGoalMutation(threadId, ownerId, new Date()).deleted;
+  }
+
+  deleteThreadGoalMutation(
+    threadId: string,
+    ownerId: string,
+    now: Date,
+  ): { deleted: boolean; revision: number } {
+    return this.immediateTransaction(() => {
+      this.requireOwnedGoalThread(threadId, ownerId);
+      this.assertNoPendingGoalTurn(threadId, ownerId);
+      const result = this.sqlite
+        .prepare(
+          `UPDATE thread_goals
+           SET deleted_at = ?, runtime_sync_state = 'PENDING',
+               revision = revision + 1, updated_at = ?
+           WHERE task_id = ? AND owner_id = ? AND deleted_at IS NULL
+           RETURNING revision`,
+        )
+        .get(now.getTime(), now.getTime(), threadId, ownerId) as { revision: number } | undefined;
+      return { deleted: Boolean(result), revision: result?.revision ?? 0 };
+    });
+  }
+
+  finalizeThreadGoalDelete(input: {
+    threadId: string;
+    ownerId: string;
+    expectedRevision: number;
+    runtimeSyncState: "PENDING" | "SYNCED";
+    now: Date;
+  }): void {
+    const result = this.sqlite
+      .prepare(
+        `UPDATE thread_goals SET runtime_sync_state = ?, updated_at = ?
+         WHERE task_id = ? AND owner_id = ? AND revision = ? AND deleted_at IS NOT NULL`,
+      )
+      .run(
+        input.runtimeSyncState,
+        input.now.getTime(),
+        input.threadId,
+        input.ownerId,
+        input.expectedRevision,
+      );
+    if (result.changes !== 1) throw new GoalMutationSupersededError();
+  }
+
+  syncThreadGoal(input: {
+    threadId: string;
+    ownerId: string;
+    runtimeThreadId: string;
+    status: ThreadGoalView["status"];
+    tokensUsed: number;
+    timeUsedSeconds: number;
+    runtimeUpdatedAt?: number;
+    expectedRevision?: number;
+    source?: "COMMAND" | "NOTIFICATION";
+    now: Date;
+  }): StoredThreadGoalView {
+    const current = this.getThreadGoal(input.threadId, input.ownerId);
+    if (!current) throw new Error("Goal not found");
+    const runtimeUpdatedAt = input.runtimeUpdatedAt ?? input.now.getTime();
+    const result = this.sqlite
+      .prepare(
+        `UPDATE thread_goals SET
+         status = CASE
+           WHEN status IN ('COMPLETE', 'BUDGET_LIMITED', 'NEEDS_RECOVERY') THEN status
+           ELSE ?
+         END,
+         tokens_used = MAX(tokens_used, ?),
+         time_used_seconds = MAX(time_used_seconds, ?),
+         runtime_sync_state = CASE
+           WHEN runtime_sync_state = 'NEEDS_RECOVERY' THEN 'NEEDS_RECOVERY'
+           ELSE 'SYNCED'
+         END,
+         runtime_thread_id = ?,
+         runtime_updated_at = ?,
+         activated_at = CASE
+           WHEN status IN ('COMPLETE', 'BUDGET_LIMITED', 'NEEDS_RECOVERY') THEN NULL
+           WHEN ? = 'ACTIVE' THEN ?
+           ELSE NULL
+         END,
+         updated_at = ?
+         WHERE task_id = ? AND owner_id = ? AND deleted_at IS NULL
+           AND (? IS NULL OR revision = ?)
+           AND (
+             runtime_updated_at IS NULL OR
+             ? > runtime_updated_at OR
+             (? = 'COMMAND' AND runtime_sync_state = 'PENDING' AND ? >= runtime_updated_at)
+           )`,
+      )
+      .run(
+        input.status,
+        input.tokensUsed,
+        input.timeUsedSeconds,
+        input.runtimeThreadId,
+        runtimeUpdatedAt,
+        input.status,
+        input.now.getTime(),
+        input.now.getTime(),
+        input.threadId,
+        input.ownerId,
+        input.expectedRevision ?? null,
+        input.expectedRevision ?? null,
+        runtimeUpdatedAt,
+        input.source ?? "NOTIFICATION",
+        runtimeUpdatedAt,
+      );
+    if (result.changes === 0) {
+      if (input.expectedRevision !== undefined) throw new GoalMutationSupersededError();
+      return current;
+    }
+    return this.getThreadGoal(input.threadId, input.ownerId) as StoredThreadGoalView;
+  }
+
+  updateThreadGoalTokens(
+    threadId: string,
+    ownerId: string,
+    tokensUsed: number,
+    now: Date,
+  ): ThreadGoalTokenUpdate | null {
+    return this.immediateTransaction(() => {
+      const before = this.getThreadGoal(threadId, ownerId);
+      if (!before) return null;
+      this.sqlite
+        .prepare(
+          `UPDATE thread_goals SET
+           tokens_used = MAX(tokens_used, ?),
+           status = CASE
+             WHEN status = 'ACTIVE' AND MAX(tokens_used, ?) >= token_budget
+               THEN 'BUDGET_LIMITED'
+             ELSE status
+           END,
+           activated_at = CASE
+             WHEN status = 'ACTIVE' AND MAX(tokens_used, ?) >= token_budget THEN NULL
+             ELSE activated_at
+           END,
+           runtime_sync_state = CASE
+             WHEN status = 'ACTIVE' AND MAX(tokens_used, ?) >= token_budget THEN 'PENDING'
+             ELSE runtime_sync_state
+           END,
+           updated_at = ?
+         WHERE task_id = ? AND owner_id = ? AND deleted_at IS NULL`,
+        )
+        .run(tokensUsed, tokensUsed, tokensUsed, tokensUsed, now.getTime(), threadId, ownerId);
+      const goal = this.getThreadGoal(threadId, ownerId);
+      if (!goal) return null;
+      return {
+        triggered: before.status === "ACTIVE" && goal.status === "BUDGET_LIMITED",
+        goal,
+      };
+    });
+  }
+
+  markThreadGoalRecovery(threadId: string, ownerId: string, now: Date): void {
+    this.sqlite
+      .prepare(
+        `UPDATE thread_goals SET status = 'NEEDS_RECOVERY',
+         runtime_sync_state = 'NEEDS_RECOVERY', activated_at = NULL,
+         deleted_at = NULL, updated_at = ?
+         WHERE task_id = ? AND owner_id = ?`,
+      )
+      .run(now.getTime(), threadId, ownerId);
+  }
+
+  applyGoalWatchdog(now: Date): ThreadGoalBudgetTransition[] {
+    return this.immediateTransaction(() => {
+      const rows = this.sqlite
+        .prepare(
+          `SELECT task_id, owner_id FROM thread_goals
+           WHERE deleted_at IS NULL AND status = 'ACTIVE' AND (
+             tokens_used >= token_budget OR
+             (activated_at IS NOT NULL AND time_used_seconds + CAST((? - activated_at) / 1000 AS INTEGER) >= time_budget_seconds)
+           )`,
+        )
+        .all(now.getTime()) as Array<{ task_id: string; owner_id: string }>;
+      const transitioned: ThreadGoalBudgetTransition[] = [];
+      for (const row of rows) {
+        const result = this.sqlite
+          .prepare(
+            `UPDATE thread_goals SET status = 'BUDGET_LIMITED',
+             runtime_sync_state = 'PENDING',
+             time_used_seconds = MIN(time_budget_seconds,
+               time_used_seconds + CASE WHEN activated_at IS NULL THEN 0
+               ELSE CAST((? - activated_at) / 1000 AS INTEGER) END),
+             activated_at = NULL, updated_at = ?
+             WHERE task_id = ? AND owner_id = ? AND deleted_at IS NULL AND status = 'ACTIVE'`,
+          )
+          .run(now.getTime(), now.getTime(), row.task_id, row.owner_id);
+        if (result.changes !== 1) continue;
+        const goal = this.getThreadGoal(row.task_id, row.owner_id);
+        if (goal) transitioned.push({ ownerId: row.owner_id, goal });
+      }
+      return transitioned;
+    });
+  }
+
+  recoverPersistedRuntimeGoals(now: Date): RecoveredPersistedGoal[] {
+    return this.immediateTransaction(() => {
+      const rows = this.sqlite
+        .prepare(
+          `SELECT tg.task_id, tg.owner_id, tg.runtime_thread_id
+           FROM thread_goals tg
+           JOIN tasks t ON t.id = tg.task_id AND t.owner_id = tg.owner_id
+           WHERE tg.deleted_at IS NULL
+             AND tg.runtime_thread_id IS NOT NULL
+             AND tg.status IN ('ACTIVE', 'PAUSED', 'BUDGET_LIMITED')
+             AND t.lifecycle_state = 'ACTIVE'
+           ORDER BY tg.updated_at, tg.task_id`,
+        )
+        .all() as Array<{
+        task_id: string;
+        owner_id: string;
+        runtime_thread_id: string;
+      }>;
+      const recovered: RecoveredPersistedGoal[] = [];
+      const recoverGoal = this.sqlite.prepare(
+        `UPDATE thread_goals
+         SET status = 'NEEDS_RECOVERY', runtime_sync_state = 'NEEDS_RECOVERY',
+             activated_at = NULL, updated_at = ?
+         WHERE task_id = ? AND owner_id = ? AND deleted_at IS NULL
+           AND status IN ('ACTIVE', 'PAUSED', 'BUDGET_LIMITED')`,
+      );
+      const recoverTask = this.sqlite.prepare(
+        `UPDATE tasks
+         SET status = 'NEEDS_RECOVERY', current_turn_id = NULL,
+             queue_ticket = NULL, updated_at = ?
+         WHERE id = ? AND owner_id = ? AND lifecycle_state = 'ACTIVE'`,
+      );
+      for (const row of rows) {
+        if (recoverGoal.run(now.getTime(), row.task_id, row.owner_id).changes !== 1) continue;
+        recoverTask.run(now.getTime(), row.task_id, row.owner_id);
+        recovered.push({
+          taskId: row.task_id,
+          ownerId: row.owner_id,
+          runtimeThreadId: row.runtime_thread_id,
+        });
+      }
+      return recovered;
+    });
+  }
+
+  private requireOwnedGoalThread(threadId: string, ownerId: string): void {
+    const row = this.sqlite
+      .prepare(
+        `SELECT 1 FROM tasks
+         WHERE id = ? AND owner_id = ? AND lifecycle_state != 'EXPIRED' AND archived_at IS NULL`,
+      )
+      .get(threadId, ownerId);
+    if (!row) throw new Error("Thread not found");
+  }
+
+  private assertNoPendingGoalTurn(threadId: string, ownerId: string): void {
+    const row = this.sqlite
+      .prepare(
+        `SELECT tr.status
+         FROM turns tr
+         JOIN tasks t ON t.id = tr.task_id
+         WHERE tr.task_id = ? AND t.owner_id = ?
+           AND tr.status IN ('ALLOCATING', 'QUEUED')
+         ORDER BY tr.started_at DESC, tr.rowid DESC
+         LIMIT 1`,
+      )
+      .get(threadId, ownerId) as { status: "ALLOCATING" | "QUEUED" } | undefined;
+    if (row) throw new GoalMutationBlockedByPendingTurnError(row.status);
+  }
+
+  private readThreadGoalSnapshot(threadId: string, ownerId: string): ThreadGoalSnapshot | null {
+    const row = this.sqlite
+      .prepare("SELECT * FROM thread_goals WHERE task_id = ? AND owner_id = ?")
+      .get(threadId, ownerId) as ThreadGoalRow | undefined;
+    if (!row || row.deleted_at !== null) return null;
+    const goal = mapThreadGoal(row);
+    return {
+      objective: goal.objective,
+      status: goal.status,
+      tokenBudget: goal.tokenBudget,
+      tokensUsed: goal.tokensUsed,
+      timeBudgetSeconds: goal.timeBudgetSeconds,
+      timeUsedSeconds: goal.timeUsedSeconds,
+    };
+  }
+
+  completeSteerInputDelivery(id: string, now: Date): void {
+    const result = this.sqlite
+      .prepare(
+        `UPDATE steer_input_snapshots
+         SET delivery_status = 'DELIVERED', delivery_error = NULL,
+             delivered_at = ?, failed_at = NULL, unknown_at = NULL
+         WHERE id = ? AND delivery_status = 'PENDING'`,
+      )
+      .run(now.getTime(), id);
+    if (result.changes !== 1) throw new Error("Steer input is not pending");
+  }
+
+  failSteerInputDelivery(id: string, error: string, now: Date): void {
+    this.immediateTransaction(() => {
+      const row = this.sqlite
+        .prepare(
+          `SELECT turn_id, attachments_json FROM steer_input_snapshots
+           WHERE id = ? AND delivery_status = 'PENDING'`,
+        )
+        .get(id) as { turn_id: string; attachments_json: string } | undefined;
+      if (!row) throw new Error("Steer input is not pending");
+      const attachments = EffectiveTurnInputSnapshotSchema.parse({
+        prompt: "",
+        attachments: JSON.parse(row.attachments_json),
+        capturedAt: now.toISOString(),
+      }).attachments;
+      this.sqlite
+        .prepare(
+          `UPDATE steer_input_snapshots
+           SET delivery_status = 'FAILED', delivery_error = ?,
+               delivered_at = NULL, failed_at = ?, unknown_at = NULL
+           WHERE id = ?`,
+        )
+        .run(error, now.getTime(), id);
+      if (attachments.length > 0) {
+        this.sqlite
+          .prepare(
+            `UPDATE draft_attachments SET claimed_turn_id = NULL, updated_at = ?
+             WHERE claimed_turn_id = ?
+               AND id IN (${attachments.map(() => "?").join(",")})`,
+          )
+          .run(now.getTime(), row.turn_id, ...attachments.map((attachment) => attachment.id));
+      }
+    });
+  }
+
+  markSteerInputDeliveryUnknown(id: string, error: string, now: Date): void {
+    const result = this.sqlite
+      .prepare(
+        `UPDATE steer_input_snapshots
+         SET delivery_status = 'UNKNOWN', delivery_error = ?,
+             delivered_at = NULL, failed_at = NULL, unknown_at = ?
+         WHERE id = ? AND delivery_status = 'PENDING'`,
+      )
+      .run(error, now.getTime(), id);
+    if (result.changes !== 1) throw new Error("Steer input is not pending");
+  }
+
+  listSteerInputSnapshots(turnId: string): SteerInputSnapshotRecord[] {
+    const rows = this.sqlite
+      .prepare(
+        `SELECT prompt, attachments_json, delivery_status, delivery_error,
+                delivered_at, failed_at, unknown_at, captured_at
+         FROM steer_input_snapshots WHERE turn_id = ? ORDER BY captured_at, rowid`,
+      )
+      .all(turnId) as Array<{
+      prompt: string;
+      attachments_json: string;
+      delivery_status: "PENDING" | "DELIVERED" | "FAILED" | "UNKNOWN";
+      delivery_error: string | null;
+      delivered_at: number | null;
+      failed_at: number | null;
+      unknown_at: number | null;
+      captured_at: number;
+    }>;
+    return rows.map((row) => ({
+      ...EffectiveTurnInputSnapshotSchema.parse({
+        prompt: row.prompt,
+        attachments: JSON.parse(row.attachments_json),
+        capturedAt: new Date(row.captured_at).toISOString(),
+      }),
+      deliveryStatus: row.delivery_status,
+      deliveryError: row.delivery_error,
+      deliveredAt: row.delivered_at === null ? null : new Date(row.delivered_at).toISOString(),
+      failedAt: row.failed_at === null ? null : new Date(row.failed_at).toISOString(),
+      unknownAt: row.unknown_at === null ? null : new Date(row.unknown_at).toISOString(),
+    }));
+  }
+
+  listAttachmentCleanupJobs(limit = 100): AttachmentCleanupJob[] {
+    const rows = this.sqlite
+      .prepare(
+        `SELECT * FROM attachment_cleanup_jobs
+         WHERE status IN ('PENDING', 'FAILED')
+         ORDER BY created_at, rowid
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{
+      id: string;
+      thread_id: string;
+      attachment_id: string;
+      relative_path: string;
+      status: "PENDING" | "FAILED";
+      attempts: number;
+      last_error: string | null;
+      created_at: number;
+      updated_at: number;
+    }>;
+    return rows.map((row) => ({
+      id: row.id,
+      threadId: row.thread_id,
+      attachmentId: row.attachment_id,
+      relativePath: row.relative_path,
+      status: row.status,
+      attempts: row.attempts,
+      lastError: row.last_error,
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+    }));
+  }
+
+  completeAttachmentCleanupJob(id: string): void {
+    this.sqlite.prepare("DELETE FROM attachment_cleanup_jobs WHERE id = ?").run(id);
+  }
+
+  failAttachmentCleanupJob(id: string, error: string, now: Date): void {
+    this.sqlite
+      .prepare(
+        `UPDATE attachment_cleanup_jobs
+         SET status = 'FAILED', attempts = attempts + 1, last_error = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(error, now.getTime(), id);
   }
 
   getLatestTurnPrompt(taskId: string, ownerId: string): string | null {
@@ -549,6 +1635,11 @@ export class SQLitePlatformStore {
                  SELECT 1 FROM user_turn_slots uts
                  WHERE uts.account_id = ? AND uts.task_id = t.id
                )
+               OR EXISTS (
+                 SELECT 1 FROM thread_goals tg
+                 WHERE tg.task_id = t.id AND tg.deleted_at IS NULL
+                   AND tg.status IN ('ACTIVE', 'PAUSED')
+               )
              )
            ORDER BY t.created_at, t.id`,
         )
@@ -588,6 +1679,15 @@ export class SQLitePlatformStore {
               )`,
         )
         .run(now.getTime(), now.getTime(), accountId, accountId);
+      const recoverGoal = this.sqlite.prepare(
+        `UPDATE thread_goals
+         SET status = 'NEEDS_RECOVERY', runtime_sync_state = 'NEEDS_RECOVERY',
+             activated_at = NULL, deleted_at = NULL, updated_at = ?
+         WHERE task_id = ? AND owner_id = ? AND status IN ('ACTIVE', 'PAUSED')`,
+      );
+      for (const row of rows) {
+        recoverGoal.run(now.getTime(), row.task_id, row.owner_id);
+      }
       this.sqlite
         .prepare(
           `UPDATE tasks
@@ -598,6 +1698,11 @@ export class SQLitePlatformStore {
                status IN ('RUNNING', 'WAITING_APPROVAL')
                OR id IN (
                  SELECT task_id FROM user_turn_slots WHERE account_id = ?
+               )
+               OR id IN (
+                 SELECT tg.task_id
+                 FROM thread_goals tg
+                 WHERE tg.deleted_at IS NULL AND tg.status = 'NEEDS_RECOVERY'
                )
              )`,
         )
@@ -880,6 +1985,25 @@ export class SQLitePlatformStore {
           JSON.stringify(payload),
           input.now.getTime(),
         );
+      if (input.type === "TURN_FAILED") {
+        const task = this.getTaskRow(input.taskId);
+        const failurePayload = payload as Record<string, unknown>;
+        const code = stringValue(failurePayload.code) ?? "TURN_FAILED";
+        const message = stringValue(failurePayload.error) ?? "Turn failed";
+        this.insertAudit({
+          actorUserId: task.owner_id,
+          accountId: task.account_id,
+          accountAlias: task.account_alias,
+          leaseId: task.lease_id,
+          taskId: input.taskId,
+          threadId: input.threadId,
+          turnId: input.turnId,
+          action: "TURN_FAILED",
+          outcome: "FAILED",
+          summary: `${code}: ${message}`,
+          now: input.now,
+        });
+      }
       return {
         taskId: input.taskId,
         threadId: input.threadId,
@@ -894,7 +2018,8 @@ export class SQLitePlatformStore {
   }
 
   listTaskEvents(taskId: string, ownerId: string, afterSequence = 0): TaskEvent[] | null {
-    if (!this.getTaskForUser(taskId, ownerId)) return null;
+    const task = this.getTaskForUser(taskId, ownerId);
+    if (task?.lifecycleState !== "ACTIVE") return null;
     const pathContext = this.runtimePathContextForTask(taskId);
     const rows = this.sqlite
       .prepare("SELECT * FROM task_events WHERE task_id = ? AND sequence > ? ORDER BY sequence")
@@ -921,9 +2046,9 @@ export class SQLitePlatformStore {
     const row = this.sqlite
       .prepare(
         `SELECT
-          (SELECT COUNT(*) FROM tasks WHERE owner_id = ?) AS threads,
+          (SELECT COUNT(*) FROM tasks WHERE owner_id = ? AND lifecycle_state = 'ACTIVE') AS threads,
           (SELECT COUNT(*) FROM turns tr JOIN tasks t ON t.id = tr.task_id
-            WHERE t.owner_id = ?) AS turns,
+            WHERE t.owner_id = ? AND t.lifecycle_state = 'ACTIVE') AS turns,
           (SELECT COUNT(*) FROM tool_calls WHERE user_id = ?) AS tool_calls,
           (SELECT COUNT(*) FROM subagent_threads WHERE owner_id = ?) AS subagents,
           (SELECT COUNT(*) FROM thread_token_usage WHERE owner_id = ?) AS token_rows,
@@ -1017,8 +2142,9 @@ export class SQLitePlatformStore {
       .prepare(
         `SELECT
           (SELECT COUNT(*) FROM users) AS users,
-          (SELECT COUNT(*) FROM tasks) AS threads,
-          (SELECT COUNT(*) FROM turns) AS turns,
+          (SELECT COUNT(*) FROM tasks WHERE lifecycle_state = 'ACTIVE') AS threads,
+          (SELECT COUNT(*) FROM turns tr JOIN tasks t ON t.id = tr.task_id
+            WHERE t.lifecycle_state = 'ACTIVE') AS turns,
           (SELECT COUNT(*) FROM tool_calls) AS tool_calls,
           (SELECT COUNT(*) FROM subagent_threads) AS subagents,
           (SELECT COUNT(*) FROM thread_token_usage) AS token_rows,
@@ -1746,6 +2872,113 @@ export class SQLitePlatformStore {
     });
   }
 
+  claimToolWriteInvocation(input: {
+    callId: string;
+    taskId: string;
+    turnId: string;
+    userId: string;
+    tool: string;
+    arguments: unknown;
+    startedAt: Date;
+  }):
+    | { kind: "CLAIMED" }
+    | { kind: "IN_PROGRESS" }
+    | { kind: "CONFLICT" }
+    | { kind: "REPLAY"; response: unknown } {
+    return this.immediateTransaction(() => {
+      const task = this.getTaskRow(input.taskId);
+      if (task.owner_id !== input.userId) throw new Error("Task not found");
+      const inputDigest = digestJson({ tool: input.tool, arguments: input.arguments });
+      const existing = this.sqlite
+        .prepare("SELECT * FROM tool_calls WHERE call_id = ?")
+        .get(input.callId) as Record<string, unknown> | undefined;
+      if (!existing) {
+        this.sqlite
+          .prepare(
+            `INSERT INTO tool_calls (
+              id, call_id, task_id, turn_id, user_id, tool, status, input_digest,
+              output_digest, response_json, started_at, completed_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'IN_PROGRESS', ?, NULL, NULL, ?, NULL)`,
+          )
+          .run(
+            randomUUID(),
+            input.callId,
+            input.taskId,
+            input.turnId,
+            input.userId,
+            input.tool,
+            inputDigest,
+            input.startedAt.getTime(),
+          );
+        return { kind: "CLAIMED" };
+      }
+      if (
+        existing.task_id !== input.taskId ||
+        existing.turn_id !== input.turnId ||
+        existing.user_id !== input.userId ||
+        existing.tool !== input.tool ||
+        existing.input_digest !== inputDigest
+      ) {
+        return { kind: "CONFLICT" };
+      }
+      if (existing.status === "IN_PROGRESS") return { kind: "IN_PROGRESS" };
+      if (typeof existing.response_json !== "string") return { kind: "CONFLICT" };
+      return { kind: "REPLAY", response: JSON.parse(existing.response_json) as unknown };
+    });
+  }
+
+  completeToolWriteInvocation(input: {
+    callId: string;
+    taskId: string;
+    turnId: string;
+    userId: string;
+    tool: string;
+    arguments: unknown;
+    response: unknown;
+    success: boolean;
+    startedAt: Date;
+    completedAt: Date;
+  }): void {
+    this.immediateTransaction(() => {
+      const task = this.getTaskRow(input.taskId);
+      if (task.owner_id !== input.userId) throw new Error("Task not found");
+      const toolCall = this.sqlite
+        .prepare("SELECT id, status FROM tool_calls WHERE call_id = ?")
+        .get(input.callId) as { id: string; status: string } | undefined;
+      if (toolCall?.status !== "IN_PROGRESS") {
+        throw new Error("Tool write claim is not active");
+      }
+      const update = this.sqlite
+        .prepare(
+          `UPDATE tool_calls
+             SET status = ?, output_digest = ?, response_json = ?, completed_at = ?
+           WHERE call_id = ? AND status = 'IN_PROGRESS'`,
+        )
+        .run(
+          input.success ? "SUCCEEDED" : "FAILED",
+          digestJson(input.response),
+          JSON.stringify(input.response),
+          input.completedAt.getTime(),
+          input.callId,
+        );
+      if (update.changes !== 1) throw new Error("Tool write claim completion lost");
+      this.insertAudit({
+        actorUserId: input.userId,
+        accountId: task.account_id,
+        accountAlias: task.account_alias,
+        leaseId: task.lease_id,
+        taskId: input.taskId,
+        threadId: task.thread_id,
+        turnId: input.turnId,
+        toolCallId: toolCall.id,
+        action: "TOOL_INVOKED",
+        outcome: input.success ? "SUCCESS" : "FAILED",
+        summary: `Enterprise tool invoked: ${input.tool}`,
+        now: input.completedAt,
+      });
+    });
+  }
+
   private requireUser(userId: string): void {
     const user = this.sqlite.prepare("SELECT 1 FROM users WHERE id = ?").get(userId);
     if (!user) throw new Error("User not found");
@@ -1755,11 +2988,44 @@ export class SQLitePlatformStore {
     const row = this.sqlite
       .prepare(
         `SELECT p.*,
-          (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id) AS task_count
+          (SELECT COUNT(*) FROM tasks t
+            WHERE t.project_id = p.id AND t.lifecycle_state = 'ACTIVE') AS task_count
          FROM projects p WHERE p.id = ? AND p.owner_id = ?`,
       )
       .get(id, ownerId) as ProjectRow | undefined;
     return row ? mapProject(row) : null;
+  }
+
+  private attachmentRefs(taskId: string): Array<{ id: string; relativePath: string }> {
+    return (
+      this.sqlite
+        .prepare("SELECT id, relative_path FROM draft_attachments WHERE task_id = ?")
+        .all(taskId) as Array<{ id: string; relative_path: string }>
+    ).map((row) => ({ id: row.id, relativePath: row.relative_path }));
+  }
+
+  private enqueueAttachmentCleanupJobs(
+    threadId: string,
+    attachments: Array<{ id: string; relativePath: string }>,
+    now: Date,
+  ): void {
+    const statement = this.sqlite.prepare(
+      `INSERT INTO attachment_cleanup_jobs (
+        id, thread_id, attachment_id, relative_path, status,
+        attempts, last_error, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, 'PENDING', 0, NULL, ?, ?)
+       ON CONFLICT(thread_id, attachment_id) DO NOTHING`,
+    );
+    for (const attachment of attachments) {
+      statement.run(
+        randomUUID(),
+        threadId,
+        attachment.id,
+        attachment.relativePath,
+        now.getTime(),
+        now.getTime(),
+      );
+    }
   }
 
   private getTaskRow(taskId: string): TaskRow {
@@ -1859,9 +3125,45 @@ function mapTask(row: TaskRow): TaskRecord {
       ? EffectiveConfigOverrideSchema.parse(JSON.parse(row.thread_config_json))
       : null,
     archivedAt: row.archived_at === null ? null : new Date(row.archived_at).toISOString(),
+    lifecycleState: row.lifecycle_state,
+    draftExpiresAt:
+      row.draft_expires_at === null ? null : new Date(row.draft_expires_at).toISOString(),
+    planMode: row.plan_mode === 1,
+    composerRevision: row.composer_revision,
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
   };
+}
+
+function mapThreadGoal(row: ThreadGoalRow): StoredThreadGoalView {
+  const view = ThreadGoalViewSchema.parse({
+    threadId: row.task_id,
+    objective: row.objective,
+    status: row.status,
+    tokenBudget: row.token_budget,
+    tokensUsed: row.tokens_used,
+    timeBudgetSeconds: row.time_budget_seconds,
+    timeUsedSeconds: row.time_used_seconds,
+    runtimeSyncState: row.runtime_sync_state,
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  });
+  return { ...view, revision: row.revision };
+}
+
+function mapAttachment(row: AttachmentRow): DraftAttachment {
+  return DraftAttachmentSchema.parse({
+    id: row.id,
+    threadId: row.task_id,
+    kind: row.kind,
+    name: row.name,
+    relativePath: row.relative_path,
+    mimeType: row.mime_type,
+    sizeBytes: row.size_bytes,
+    fileCount: row.file_count,
+    scanStatus: row.scan_status,
+    createdAt: new Date(row.created_at).toISOString(),
+  });
 }
 
 function mapTurn(row: TurnRow): TurnRecord {
@@ -2008,6 +3310,7 @@ function deriveEventItemId(
 ): string {
   if (typeof payload.itemId === "string" && payload.itemId.length > 0) return payload.itemId;
   if (type === "PLAN_UPDATED") return `plan:${turnId ?? taskId}`;
+  if (type === "PROPOSED_PLAN_PUBLISHED") return `proposed-plan:${turnId ?? taskId}`;
   if (type === "DIFF_UPDATED") return `diff:${turnId ?? taskId}`;
   if (type === "QUEUED") return `queue:${taskId}`;
   if (type === "APPROVAL_DECIDED" && typeof payload.approvalId === "string") {
@@ -2020,13 +3323,14 @@ function deriveEventItemId(
 const PUBLIC_EVENT_PAYLOAD_KEYS = {
   TURN_STARTED: ["status"],
   TURN_COMPLETED: ["status", "durationMs"],
-  TURN_FAILED: ["status", "error"],
+  TURN_FAILED: ["status", "code", "error"],
   TURN_INTERRUPTED: ["status"],
   USER_MESSAGE: ["itemId", "kind", "text"],
   AGENT_MESSAGE_DELTA: ["itemId", "delta"],
   AGENT_MESSAGE_PHASE: ["itemId", "phase"],
   REASONING_SUMMARY_DELTA: ["itemId", "delta"],
   PLAN_UPDATED: ["explanation", "plan"],
+  PROPOSED_PLAN_PUBLISHED: ["itemId", "title", "markdown"],
   COMMAND_STARTED: ["itemId", "command", "cwd"],
   COMMAND_OUTPUT: ["itemId", "delta"],
   COMMAND_COMPLETED: ["itemId", "command", "aggregatedOutput", "exitCode", "durationMs"],

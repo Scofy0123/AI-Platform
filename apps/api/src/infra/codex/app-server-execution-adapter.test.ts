@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { ActorContext, EffectiveThreadConfigSnapshot } from "@codexplatform/contracts";
 import { describe, expect, test, vi } from "vitest";
+import { RuntimeRequestTimeoutError } from "../../domain/errors.js";
 import {
   ActiveTurnResumeConflictError,
   type ApprovalDraft,
@@ -14,6 +15,7 @@ import {
 } from "./app-server-execution-adapter.js";
 import type { Model } from "./generated/v2/Model.js";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse.js";
+import { RpcRequestTimeoutError } from "./jsonl-rpc-client.js";
 
 const TEST_EXECUTION_CONTEXT: {
   effectiveConfig: EffectiveThreadConfigSnapshot;
@@ -235,6 +237,127 @@ describe("AppServerExecutionAdapter", () => {
     );
   });
 
+  test.each([
+    ["thread/start", null],
+    ["thread/resume", "thread-1"],
+  ] as const)(
+    "treats a %s timeout as temporary Runtime unavailability instead of quarantining the account",
+    async (method, existingThreadId) => {
+      const rpc = new FakeRpc();
+      const runtime = runtimePort();
+      if (existingThreadId) {
+        vi.mocked(runtime.resumeThread).mockRejectedValue(
+          new RpcRequestTimeoutError(method, 120_000),
+        );
+      } else {
+        vi.mocked(runtime.startThread).mockRejectedValue(
+          new RpcRequestTimeoutError(method, 120_000),
+        );
+      }
+      const stopAccount = vi.fn(async () => undefined);
+      const adapter = new AppServerExecutionAdapter({
+        supervisor: {
+          startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+          stopAccount,
+          stopAll: async () => undefined,
+        },
+        tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+        actors: new ActorRegistry(),
+      });
+      const crashes: unknown[] = [];
+      adapter.on("accountCrashed", (event) => crashes.push(event));
+
+      const error = await adapter
+        .startTask({
+          accountId: "account-1",
+          codexHome: "/tmp/account-1",
+          taskId: "task-1",
+          userId: "user-1",
+          cwd: "/workspace",
+          prompt: "Try after a temporary timeout",
+          existingThreadId,
+          ...TEST_EXECUTION_CONTEXT,
+        })
+        .catch((cause: unknown) => cause);
+
+      expect(error).toBeInstanceOf(RuntimeRequestTimeoutError);
+      expect(error).toMatchObject({
+        code: "RUNTIME_REQUEST_TIMEOUT",
+        httpStatus: 503,
+      });
+      expect(stopAccount).toHaveBeenCalledWith("account-1");
+      expect(crashes).toEqual([]);
+      expect(runtime.startTurn).not.toHaveBeenCalled();
+    },
+  );
+
+  test("starts a new Turn after resuming a system-error Thread with no in-progress Turn", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.resumeThread).mockResolvedValue(
+      resumeResponse("thread-1", { type: "systemError" }, [
+        { id: "turn-failed", status: "failed" },
+      ]),
+    );
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await expect(
+      adapter.startTask({
+        accountId: "account-1",
+        codexHome: "/tmp/account-1",
+        taskId: "task-1",
+        userId: "user-1",
+        cwd: "/workspace",
+        prompt: "Retry with an available model",
+        existingThreadId: "thread-1",
+        ...TEST_EXECUTION_CONTEXT,
+      }),
+    ).resolves.toEqual({ threadId: "thread-1", turnId: "turn-1" });
+    expect(runtime.resumeThread).toHaveBeenCalledOnce();
+    expect(runtime.disableThreadMemory).toHaveBeenCalledWith("thread-1");
+    expect(runtime.startTurn).toHaveBeenCalledOnce();
+  });
+
+  test("clears a stale native Goal before starting a resumed Turn without a platform Goal", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.resumeThread).mockResolvedValue(
+      resumeResponse("thread-1", { type: "idle" }, []),
+    );
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Continue",
+      existingThreadId: "thread-1",
+      goal: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    expect(runtime.clearThreadGoal).toHaveBeenCalledWith("thread-1");
+    expect(vi.mocked(runtime.clearThreadGoal).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.startTurn).mock.invocationCallOrder[0] as number,
+    );
+  });
+
   test("disables native memory after creating a Thread and before starting its Turn", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();
@@ -265,6 +388,554 @@ describe("AppServerExecutionAdapter", () => {
     expect(vi.mocked(runtime.disableThreadMemory).mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(runtime.startTurn).mock.invocationCallOrder[0] as number,
     );
+  });
+
+  test("prepares the Runtime Thread then syncs Goal before starting the Turn", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    const prepared = vi.fn();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Start safely",
+      existingThreadId: null,
+      goal: {
+        objective: "持续完成",
+        status: "ACTIVE",
+        tokenBudget: 200_000,
+        tokensUsed: 0,
+        timeBudgetSeconds: 3_600,
+        timeUsedSeconds: 0,
+      },
+      onThreadPrepared: prepared,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    expect(prepared).toHaveBeenCalledWith("thread-1");
+    expect(vi.mocked(runtime.disableThreadMemory).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.setThreadGoal).mock.invocationCallOrder[0] as number,
+    );
+    expect(vi.mocked(runtime.setThreadGoal).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(runtime.startTurn).mock.invocationCallOrder[0] as number,
+    );
+  });
+
+  test("probes Goal support from the initialized locked Runtime instead of advertising it statically", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.readGoalProtocolCapability).mockReturnValue({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "Codex App Server 0.143.0 predates the locked Goal protocol",
+    });
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await expect(
+      adapter.readGoalCapability({
+        id: "account-1",
+        alias: "Codex A",
+        status: "AVAILABLE",
+        authStatus: "AUTHENTICATED",
+        maxActiveUsers: 4,
+        activeUsers: 0,
+        activeTurns: 0,
+        healthScore: 100,
+        weeklyRemaining: null,
+        quotaUpdatedAt: null,
+        quotaResetsAt: null,
+        allowUnknownQuota: true,
+        codexHome: "/tmp/account-1",
+      }),
+    ).resolves.toMatchObject({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+    });
+  });
+
+  test("synchronizes an attached Goal immediately and verifies the Runtime projection", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.getThreadGoal).mockResolvedValue({
+      objective: "新的持续目标",
+      status: "paused",
+      tokenBudget: 200_000,
+      tokensUsed: 25,
+      timeUsedSeconds: 12,
+      updatedAt: 2,
+    });
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Run",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    await expect(
+      adapter.syncThreadGoal("thread-1", {
+        objective: "新的持续目标",
+        status: "PAUSED",
+        tokenBudget: 200_000,
+        tokensUsed: 25,
+        timeBudgetSeconds: 3_600,
+        timeUsedSeconds: 12,
+      }),
+    ).resolves.toMatchObject({
+      attachment: "ATTACHED",
+      goal: { status: "PAUSED", tokensUsed: 25, timeUsedSeconds: 12 },
+    });
+    expect(runtime.setThreadGoal).toHaveBeenLastCalledWith("thread-1", {
+      objective: "新的持续目标",
+      status: "paused",
+      tokenBudget: 200_000,
+    });
+    expect(runtime.getThreadGoal).toHaveBeenCalledWith("thread-1");
+  });
+
+  test.each([
+    ["objective", { objective: "错误目标" }],
+    ["status", { status: "active" }],
+    ["tokenBudget", { tokenBudget: 199_999 }],
+    ["tokensUsed", { tokensUsed: 24 }],
+  ] as const)("rejects a Runtime Goal verification conflict in %s", async (_field, patch) => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.getThreadGoal).mockResolvedValue({
+      objective: "新的持续目标",
+      status: "paused",
+      tokenBudget: 200_000,
+      tokensUsed: 25,
+      timeUsedSeconds: 12,
+      updatedAt: 2,
+      ...patch,
+    });
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Run",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    await expect(
+      adapter.syncThreadGoal("thread-1", {
+        objective: "新的持续目标",
+        status: "PAUSED",
+        tokenBudget: 200_000,
+        tokensUsed: 25,
+        timeBudgetSeconds: 3_600,
+        timeUsedSeconds: 12,
+      }),
+    ).rejects.toMatchObject({ code: "GOAL_SYNC_CONFLICT" });
+  });
+
+  test("verifies that an attached Runtime Goal is absent after clear", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Run",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    await expect(adapter.clearThreadGoal("thread-1")).rejects.toMatchObject({
+      code: "GOAL_SYNC_CONFLICT",
+    });
+    expect(runtime.getThreadGoal).toHaveBeenCalledWith("thread-1");
+  });
+
+  test("does not negative-cache a transient Goal capability probe failure", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.readGoalProtocolCapability)
+      .mockImplementationOnce(() => {
+        throw new Error("spawn /Users/private/.codex/app-server --token secret_goal_probe failed");
+      })
+      .mockReturnValueOnce({ availability: "AVAILABLE", reasonCode: null, reason: null });
+    const startAccount = vi.fn(async () => ({ accountId: "account-1", rpc, runtime }));
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: { startAccount, stopAll: async () => undefined },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const account = {
+      id: "account-1",
+      alias: "Codex A",
+      status: "AVAILABLE" as const,
+      authStatus: "AUTHENTICATED" as const,
+      maxActiveUsers: 4,
+      activeUsers: 0,
+      activeTurns: 0,
+      healthScore: 100,
+      weeklyRemaining: null,
+      quotaUpdatedAt: null,
+      quotaResetsAt: null,
+      allowUnknownQuota: true,
+      codexHome: "/tmp/account-1",
+    };
+
+    await expect(adapter.readGoalCapability(account)).resolves.toEqual({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+      reason: "Goal Runtime capability probe failed",
+    });
+    await expect(adapter.readGoalCapability(account)).resolves.toMatchObject({
+      availability: "AVAILABLE",
+    });
+    expect(runtime.readGoalProtocolCapability).toHaveBeenCalledTimes(2);
+  });
+
+  test("does not negative-cache a transient Plan directory failure", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.listCollaborationModes)
+      .mockRejectedValueOnce(new Error("exec /private/bin/codex --auth secret_plan_probe failed"))
+      .mockResolvedValueOnce([
+        {
+          name: "Default",
+          mode: "default",
+          settings: {
+            model: "gpt-5.5",
+            reasoningEffort: "medium",
+            developerInstructions: null,
+          },
+        },
+        {
+          name: "Plan",
+          mode: "plan",
+          settings: {
+            model: "gpt-5.6-sol",
+            reasoningEffort: "high",
+            developerInstructions: null,
+          },
+        },
+      ]);
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const account = {
+      id: "account-1",
+      alias: "Codex A",
+      status: "AVAILABLE" as const,
+      authStatus: "AUTHENTICATED" as const,
+      maxActiveUsers: 4,
+      activeUsers: 0,
+      activeTurns: 0,
+      healthScore: 100,
+      weeklyRemaining: null,
+      quotaUpdatedAt: null,
+      quotaResetsAt: null,
+      allowUnknownQuota: true,
+      codexHome: "/tmp/account-1",
+    };
+
+    await expect(
+      adapter.readPlanModeCatalog(account, { model: "gpt-5.5", reasoningEffort: "medium" }),
+    ).resolves.toEqual({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+      reason: "Plan mode Runtime capability probe failed",
+      presets: [],
+    });
+    await expect(
+      adapter.readPlanModeCatalog(account, { model: "gpt-5.5", reasoningEffort: "medium" }),
+    ).resolves.toMatchObject({
+      availability: "AVAILABLE",
+      presets: [
+        expect.objectContaining({ mode: "default" }),
+        expect.objectContaining({ mode: "plan" }),
+      ],
+    });
+    expect(runtime.listCollaborationModes).toHaveBeenCalledTimes(2);
+  });
+
+  test("fails closed before reading Plan presets when the locked protocol is unavailable", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.readPlanProtocolCapability).mockReturnValue({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "old Runtime",
+    });
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const account = {
+      id: "account-1",
+      alias: "Codex A",
+      status: "AVAILABLE" as const,
+      authStatus: "AUTHENTICATED" as const,
+      maxActiveUsers: 4,
+      activeUsers: 0,
+      activeTurns: 0,
+      healthScore: 100,
+      weeklyRemaining: null,
+      quotaUpdatedAt: null,
+      quotaResetsAt: null,
+      allowUnknownQuota: true,
+      codexHome: "/tmp/account-1",
+    };
+
+    await expect(
+      adapter.readPlanModeCatalog(account, { model: "gpt-5.5", reasoningEffort: "medium" }),
+    ).resolves.toEqual({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "old Runtime",
+      presets: [],
+    });
+    expect(runtime.listCollaborationModes).not.toHaveBeenCalled();
+  });
+
+  test("clears a deterministic Goal capability cache when the Runtime generation changes", async () => {
+    const rpc1 = new FakeRpc();
+    const rpc2 = new FakeRpc();
+    const runtime1 = runtimePort();
+    const runtime2 = runtimePort();
+    vi.mocked(runtime1.readGoalProtocolCapability).mockReturnValue({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "old Runtime",
+    });
+    let current = { accountId: "account-1", rpc: rpc1, runtime: runtime1 };
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => current,
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const account = {
+      id: "account-1",
+      alias: "Codex A",
+      status: "AVAILABLE" as const,
+      authStatus: "AUTHENTICATED" as const,
+      maxActiveUsers: 4,
+      activeUsers: 0,
+      activeTurns: 0,
+      healthScore: 100,
+      weeklyRemaining: null,
+      quotaUpdatedAt: null,
+      quotaResetsAt: null,
+      allowUnknownQuota: true,
+      codexHome: "/tmp/account-1",
+    };
+
+    await expect(adapter.readGoalCapability(account)).resolves.toMatchObject({
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+    });
+    current = { accountId: "account-1", rpc: rpc2, runtime: runtime2 };
+    await adapter.listModels(account);
+    await expect(adapter.readGoalCapability(account)).resolves.toMatchObject({
+      availability: "AVAILABLE",
+    });
+    expect(runtime2.readGoalProtocolCapability).toHaveBeenCalledTimes(1);
+  });
+
+  test("never starts a Turn when Goal synchronization fails", async () => {
+    const rpc = new FakeRpc();
+    const runtime = runtimePort();
+    vi.mocked(runtime.setThreadGoal).mockRejectedValueOnce(new Error("Goal unavailable"));
+    const prepared = vi.fn();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+
+    await expect(
+      adapter.startTask({
+        accountId: "account-1",
+        codexHome: "/tmp/account-1",
+        taskId: "task-1",
+        userId: "user-1",
+        cwd: "/workspace",
+        prompt: "Must not run",
+        existingThreadId: null,
+        goal: {
+          objective: "持续完成",
+          status: "ACTIVE",
+          tokenBudget: 200_000,
+          tokensUsed: 0,
+          timeBudgetSeconds: 3_600,
+          timeUsedSeconds: 0,
+        },
+        onThreadPrepared: prepared,
+        ...TEST_EXECUTION_CONTEXT,
+      }),
+    ).rejects.toThrow("Goal unavailable");
+    expect(prepared).toHaveBeenCalledWith("thread-1");
+    expect(runtime.startTurn).not.toHaveBeenCalled();
+  });
+
+  test("projects Goal update and clear notifications onto the owning platform task", async () => {
+    const rpc = new FakeRpc();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime: runtimePort() }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const updates: unknown[] = [];
+    const clears: unknown[] = [];
+    adapter.on("goalUpdated", (event) => updates.push(event));
+    adapter.on("goalCleared", (event) => clears.push(event));
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Run",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    rpc.emit("notification", {
+      method: "thread/goal/updated",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        goal: {
+          status: "budgetLimited",
+          tokensUsed: 200_000,
+          timeUsedSeconds: 60,
+          updatedAt: 200,
+        },
+      },
+    });
+    rpc.emit("notification", {
+      method: "thread/goal/cleared",
+      params: { threadId: "thread-1" },
+    });
+
+    expect(updates).toEqual([
+      {
+        taskId: "task-1",
+        threadId: "thread-1",
+        status: "BUDGET_LIMITED",
+        tokensUsed: 200_000,
+        timeUsedSeconds: 60,
+        runtimeUpdatedAt: 200,
+      },
+    ]);
+    expect(clears).toEqual([{ taskId: "task-1", threadId: "thread-1" }]);
+  });
+
+  test("fails closed and quarantines the Runtime when a Goal notification has an unknown status", async () => {
+    const rpc = new FakeRpc();
+    const stopAccount = vi.fn(async () => undefined);
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime: runtimePort() }),
+        stopAccount,
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const crashes: unknown[] = [];
+    adapter.on("accountCrashed", (event) => crashes.push(event));
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Run",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    expect(() =>
+      rpc.emit("notification", {
+        method: "thread/goal/updated",
+        params: {
+          threadId: "thread-1",
+          goal: { status: "futureStatus", tokensUsed: 1, timeUsedSeconds: 1, updatedAt: 300 },
+        },
+      }),
+    ).not.toThrow();
+    await nextTick();
+
+    expect(crashes).toEqual([
+      expect.objectContaining({
+        accountId: "account-1",
+        sourceTaskId: "task-1",
+        reason: "Unsupported Runtime Goal status: futureStatus",
+      }),
+    ]);
+    expect(stopAccount).toHaveBeenCalledWith("account-1");
   });
 
   test.each([
@@ -1701,6 +2372,52 @@ describe("AppServerExecutionAdapter", () => {
     expect(rpc.respond).not.toHaveBeenCalled();
   });
 
+  test("binds root turn notifications to the canonical Turn returned by turn/start", async () => {
+    const rpc = new FakeRpc();
+    const adapter = new AppServerExecutionAdapter({
+      supervisor: {
+        startAccount: async () => ({ accountId: "account-1", rpc, runtime: runtimePort() }),
+        stopAll: async () => undefined,
+      },
+      tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+      actors: new ActorRegistry(),
+    });
+    const taskEvents: Array<{ type: string; turnId: string | null }> = [];
+    adapter.on("taskEvent", (event) => taskEvents.push({ type: event.type, turnId: event.turnId }));
+    await adapter.startTask({
+      accountId: "account-1",
+      codexHome: "/tmp/account-1",
+      taskId: "task-1",
+      userId: "user-1",
+      cwd: "/workspace",
+      prompt: "Build it",
+      existingThreadId: null,
+      ...TEST_EXECUTION_CONTEXT,
+    });
+
+    rpc.emit("notification", {
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: "thread-1",
+        turnId: "transport-turn-42",
+        itemId: "message-1",
+        delta: "done",
+      },
+    });
+    rpc.emit("notification", {
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turn: { id: "transport-turn-42", status: "completed" },
+      },
+    });
+
+    expect(taskEvents).toEqual([
+      { type: "AGENT_MESSAGE_DELTA", turnId: "turn-1" },
+      { type: "TURN_COMPLETED", turnId: "turn-1" },
+    ]);
+  });
+
   test("does not report a completed turn as failed when its worker later exits", async () => {
     const rpc = new FakeRpc();
     const runtime = runtimePort();
@@ -1743,10 +2460,39 @@ class FakeRpc extends EventEmitter {
 
 function runtimePort(threadId = "thread-1", turnId = "turn-1"): ManagedRuntimePort["runtime"] {
   return {
+    readGoalProtocolCapability: vi.fn(() => ({
+      availability: "AVAILABLE" as const,
+      reasonCode: null,
+      reason: null,
+    })),
+    readPlanProtocolCapability: vi.fn(() => ({
+      availability: "AVAILABLE" as const,
+      reasonCode: null,
+      reason: null,
+    })),
     startThread: vi.fn(async () => ({ thread: { id: threadId } })),
     resumeThread: vi.fn(async () => resumeResponse(threadId, { type: "idle" }, [])),
     startTurn: vi.fn(async () => ({ turn: { id: turnId } })),
     disableThreadMemory: vi.fn(async () => ({})),
+    setThreadGoal: vi.fn(async (_threadId, input) => ({
+      threadId,
+      ...input,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    })),
+    getThreadGoal: vi.fn(async () => ({
+      threadId,
+      objective: "新的持续目标",
+      status: "paused" as const,
+      tokenBudget: 200_000,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    })),
+    clearThreadGoal: vi.fn(async () => true),
     steerTurn: vi.fn(async () => undefined),
     interruptTurn: vi.fn(async () => undefined),
     startChatGptLogin: vi.fn(async () => ({
@@ -1754,6 +2500,26 @@ function runtimePort(threadId = "thread-1", turnId = "turn-1"): ManagedRuntimePo
       authUrl: "https://auth.example.test/codex",
     })),
     listModels: vi.fn(async () => []),
+    listCollaborationModes: vi.fn(async ({ model, reasoningEffort }) => [
+      {
+        name: "Default",
+        mode: "default" as const,
+        settings: {
+          model: model ?? "fake-codex-standard",
+          reasoningEffort,
+          developerInstructions: null,
+        },
+      },
+      {
+        name: "Plan",
+        mode: "plan" as const,
+        settings: {
+          model: model ?? "fake-codex-standard",
+          reasoningEffort: "high",
+          developerInstructions: null,
+        },
+      },
+    ]),
     readWeeklyQuota: vi.fn(async () => ({
       status: "KNOWN" as const,
       limitId: "codex",

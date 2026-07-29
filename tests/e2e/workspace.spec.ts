@@ -116,16 +116,20 @@ test("new Thread exposes governed Composer capabilities and submits its Runtime 
   await page.goto("/threads/new");
 
   await page.getByRole("button", { name: "Add files and more" }).click();
-  await expect(page.getByRole("menuitem", { name: /Files and folders/ })).toBeDisabled();
-  await expect(page.getByRole("menuitem", { name: /Goal/ })).toBeDisabled();
-  await expect(page.getByRole("menuitem", { name: /Plan mode/ })).toBeDisabled();
-  await expect(page.getByRole("menuitem", { name: /Record a skill/ })).toBeDisabled();
+  await expect(page.getByRole("menuitem", { name: /Files and folders/ })).toBeEnabled();
+  await expect(page.getByRole("menuitem", { name: /Goal/ })).toBeEnabled();
+  await expect(page.getByRole("menuitemcheckbox", { name: /Plan mode/ })).toBeEnabled();
+  await expect(page.getByRole("menuitem", { name: /Record a skill/ })).toHaveCount(0);
   if (process.env.CODEXPLATFORM_CAPTURE_UAT === "1") {
     await page.screenshot({ path: testInfo.outputPath("composer-add-menu.png") });
   }
-  await page.getByRole("button", { name: "Add files and more" }).press("Escape");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("menu")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Add files and more" })).toBeFocused();
 
+  await page.getByRole("button", { name: "Add files and more" }).click();
   await page.getByRole("button", { name: "Execution permissions" }).click();
+  await expect(page.getByRole("menu").filter({ hasText: "Add" })).toHaveCount(0);
   await expect(page.getByRole("menuitem", { name: /Full access/ })).toBeDisabled();
   if (process.env.CODEXPLATFORM_CAPTURE_UAT === "1") {
     await page.screenshot({ path: testInfo.outputPath("composer-permissions.png") });
@@ -135,6 +139,10 @@ test("new Thread exposes governed Composer capabilities and submits its Runtime 
   const picker = page.getByRole("button", { name: /Model and Effort:/ });
   await expect(picker).toContainText("Fake Standard");
   await expect(picker).toContainText("medium");
+  await picker.click();
+  await expect(page.getByRole("listbox", { name: "Runtime models" })).toBeVisible();
+  await page.mouse.click(1000, 40);
+  await expect(page.getByRole("listbox", { name: "Runtime models" })).toHaveCount(0);
   await picker.click();
   await page.getByRole("option", { name: /Fake Deep/ }).click();
   await expect(picker).toContainText("Fake Deep");
@@ -169,6 +177,109 @@ test("new Thread exposes governed Composer capabilities and submits its Runtime 
       }),
     }),
   ]);
+});
+
+test("Composer Draft restores files, Goal, and sticky Plan before an attachment-only Turn", async ({
+  page,
+}) => {
+  await page.goto("/threads/new");
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitem", { name: /Goal/ }).click();
+  await page.getByLabel("Goal objective").fill("持续验证附件驱动的计划");
+  await page.getByRole("button", { name: "Save Goal" }).click();
+  await expect(page.getByText("持续验证附件驱动的计划", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitemcheckbox", { name: /Plan mode/ }).click();
+  await expect(page.getByText("Plan mode · On", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitem", { name: /Files and folders/ }).click();
+  await chooseVirtualFolder(page, "uat-folder", [
+    { path: "readme.txt", content: "folder UAT" },
+    { path: "nested/spec.md", content: "# nested" },
+  ]);
+  await expect(page.getByRole("listitem", { name: /uat-folder.*Folder.*Ready/ })).toBeVisible();
+  await page.getByRole("button", { name: "Remove uat-folder" }).click();
+  await expect(page.getByRole("listitem", { name: /uat-folder/ })).toHaveCount(0);
+
+  await dropVirtualFile(page, "composer-uat.txt", "attachment-only UAT");
+  await expect(page.getByRole("listitem", { name: /composer-uat.txt.*Ready/ })).toBeVisible();
+  await page.reload();
+  await expect(page).toHaveURL(/\/threads\/new$/);
+  await expect(page.getByRole("listitem", { name: /composer-uat.txt.*Ready/ })).toBeVisible();
+  await expect(page.getByText("持续验证附件驱动的计划", { exact: true })).toBeVisible();
+  await expect(page.getByText("Plan mode · On", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitemcheckbox", { name: /Plan mode/ }).click();
+  await expect(page.getByText("Plan mode · On", { exact: true })).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByText("Plan mode · On", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitemcheckbox", { name: /Plan mode/ }).click();
+  await expect(page.getByText("Plan mode · On", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitem", { name: /Goal/ }).click();
+  await page.getByRole("button", { name: "Pause Goal" }).click();
+  await expect(
+    page.getByText(/PAUSED · 0\/60 min · 0\/200k tokens · (Syncing|Synced)/),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Resume Goal" }).click();
+  await expect(
+    page.getByText(/ACTIVE · 0\/60 min · 0\/200k tokens · (Syncing|Synced)/),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Complete Goal" }).click();
+  await expect(
+    page.getByText(/COMPLETE · 0\/60 min · 0\/200k tokens · (Syncing|Synced)/),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Clear Goal" }).click();
+  await expect(page.getByText("持续验证附件驱动的计划", { exact: true })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Remove composer-uat.txt" }).click();
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitem", { name: /Files and folders/ }).click();
+  await page.getByLabel("Choose files input").setInputFiles({
+    name: "blocked.exe",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.from("blocked"),
+  });
+  await expect(page.getByRole("listitem", { name: /blocked.exe.*Failed/ })).toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: "Unsupported installer" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send message" })).toBeDisabled();
+  await page.getByRole("button", { name: "Remove blocked.exe" }).click();
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  await page.getByRole("menuitem", { name: /Files and folders/ }).click();
+  await page.getByLabel("Choose files input").setInputFiles({
+    name: "composer-uat.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("attachment-only UAT"),
+  });
+  await expect(page.getByRole("listitem", { name: /composer-uat.txt.*Ready/ })).toBeVisible();
+
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(page).toHaveURL(/\/threads\/(?!new$)[^/]+$/);
+  await expect(page.getByRole("heading", { name: "composer-uat.txt" })).toBeVisible();
+  await expect(page.getByText(/Fake Runtime completed:/)).toBeVisible();
+  await expect(page.getByText("持续验证附件驱动的计划", { exact: true })).toHaveCount(0);
+
+  const threadId = new URL(page.url()).pathname.split("/").at(-1);
+  expect(threadId).toBeTruthy();
+  const response = await page.request.get(`/api/threads/${threadId}`);
+  expect(response.status()).toBe(200);
+  const thread = (await response.json()) as {
+    title: string;
+    composerState: { planMode: boolean };
+    turns: Array<{ prompt: string }>;
+  };
+  expect(thread).toMatchObject({
+    title: "composer-uat.txt",
+    composerState: { planMode: true },
+  });
+  expect(thread.turns).toEqual([expect.objectContaining({ prompt: "" })]);
 });
 
 test("Pinned, Side, and Bottom surfaces coexist while command output stays out of Transcript", async ({
@@ -287,6 +398,36 @@ test("queued Thread disables the composer and cannot submit another Turn", async
   expect(thread.queue?.position).toBe(1);
 });
 
+test("an active Thread accepts a dropped attachment-only Steer", async ({ page }) => {
+  await page.goto("/threads/new");
+  await page.getByLabel("Message Codex").fill("E2E delayed attachment Steer");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await expect(page).toHaveURL(/\/threads\/(?!new$)[^/]+$/);
+  const threadId = new URL(page.url()).pathname.split("/").at(-1);
+  expect(threadId).toBeTruthy();
+  await expect(page.getByRole("button", { name: /^Working for / })).toBeVisible();
+
+  await dropVirtualFile(page, "steer-evidence.txt", "steer attachment");
+  await expect(page.getByRole("listitem", { name: /steer-evidence.txt.*Ready/ })).toBeVisible();
+  const steerResponse = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      response.url().endsWith(`/api/threads/${threadId}/steer`),
+  );
+  await page.getByRole("button", { name: "发送 Steer" }).click();
+  const completedSteer = await steerResponse;
+  const completedSteerBody = await completedSteer.text();
+  if (completedSteer.status() !== 202) {
+    throw new Error(
+      `attachment-only Steer must be accepted: ${completedSteer.status()} ${completedSteerBody}`,
+    );
+  }
+  await expect(page.getByRole("listitem", { name: /steer-evidence.txt/ })).toHaveCount(0);
+  await expect(
+    page.getByText("Fake Runtime completed: E2E delayed attachment Steer"),
+  ).toBeVisible();
+});
+
 test("running Thread matches the Codex shell, message alignment, and Composer control", async ({
   page,
 }) => {
@@ -317,6 +458,12 @@ test("running Thread matches the Codex shell, message alignment, and Composer co
   ).toBeVisible();
 
   await expect(page.getByRole("button", { name: "停止" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Add files and more" }).click();
+  const lockedPlan = page.getByRole("menuitemcheckbox", { name: /Plan mode/ });
+  await expect(lockedPlan).toBeDisabled();
+  await expect(page.getByText("当前 Turn 执行中，Plan mode 已锁定")).toBeVisible();
+  await page.keyboard.press("Escape");
 
   const desktopHeaderBox = await header.boundingBox();
   const desktopPromptBox = await prompt.boundingBox();
@@ -540,4 +687,45 @@ async function readSseReplay(
 function assertNoBrowserLeaks(...values: Array<string | string[]>): void {
   const combined = values.flat().join("\n");
   for (const pattern of browserLeakPatterns) expect(combined).not.toContain(pattern);
+}
+
+async function chooseVirtualFolder(
+  page: Page,
+  root: string,
+  files: ReadonlyArray<{ path: string; content: string }>,
+): Promise<void> {
+  await page.getByLabel("Choose folder input").evaluate(
+    (input, payload) => {
+      const transfer = new DataTransfer();
+      for (const item of payload.files) {
+        const file = new File([item.content], item.path.split("/").at(-1) ?? "file.txt", {
+          type: item.path.endsWith(".md") ? "text/markdown" : "text/plain",
+        });
+        Object.defineProperty(file, "webkitRelativePath", {
+          configurable: true,
+          value: `${payload.root}/${item.path}`,
+        });
+        transfer.items.add(file);
+      }
+      Object.defineProperty(input, "files", { configurable: true, value: transfer.files });
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    },
+    { root, files },
+  );
+}
+
+async function dropVirtualFile(page: Page, name: string, content: string): Promise<void> {
+  await page.getByTestId("composer-drop-zone").evaluate(
+    (target, payload) => {
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([payload.content], payload.name, { type: "text/plain" }));
+      document.dispatchEvent(
+        new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+      );
+      target.dispatchEvent(
+        new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+      );
+    },
+    { name, content },
+  );
 }

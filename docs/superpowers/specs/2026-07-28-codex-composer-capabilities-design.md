@@ -1,8 +1,11 @@
 # CodexPlatform 1.1：Composer 权限、附件与能力菜单设计
 
 日期：2026-07-28
-状态：已确认，进入实现
+状态：1.1A 已实现并验证（2026-07-29）
 范围：用户端 Composer、Turn 输入、组织策略与 Codex App Server 适配
+
+验证结论：Files/Folders、隐藏 Draft、Goal 和 sticky Plan 已通过自动化验证与真实单操作者
+App Server UAT；生产恶意文件扫描、独立 Worker 和多人凭证隔离仍是后续门禁。
 
 ## 1. 决策
 
@@ -42,21 +45,22 @@ Composer 以 Codex 桌面端当前可观察交互为验收基准：输入区上�
 
 ## 3. Add files and more
 
-菜单按来源分区，而不是把所有项目硬编码在前端：
+1.1A 菜单只展示本轮真实交付的三个入口；未接入类别隐藏，不保留灰色空壳：
 
 ### 3.1 Add
 
-- `Files and folders`：浏览器上传后，服务端病毒/类型/大小检查并放入当前用户、当前 Thread 的隔离
+- `Files and folders`：点击后展示 `Choose files / Choose folder`，支持多文件、目录和拖放。浏览器
+  上传后，服务端类型/大小/路径检查并放入当前用户、当前 Thread 的隔离
   staging workspace。图片映射为 App Server `localImage`；其他文件和目录映射为受控路径引用及
   `additionalContext`，不把浏览器本地路径直接传给 Runtime。
-- `Goal`：调用稳定的 `thread/goal/set|get|clear`。Goal 属于 Thread，跨 Turn 保留；状态、预算和
-  用量进入 Pinned Summary 和审计。
-- `Plan mode`：通过 App Server `collaborationMode` 适配，属于实验接口。它只影响下一 Turn，运行中
-  不可切换；版本固定并由协议测试保护。
-- `Record a skill`：属于桌面宿主的 Computer Use/录制能力，不是裸 App Server 能力。1.1 显示为
-  禁用项并解释“需要管理员接入 Browser/Computer Use Worker”，不伪造录制。
+- `Goal`：调用稳定的 `thread/goal/set|get|clear`。Goal 属于 Thread，跨 Turn 保留；支持编辑、暂停、
+  恢复、完成和清除。默认 200k Token 与平台 60 分钟预算先到即暂停。
+- `Plan mode`：通过锁定版本的 App Server `collaborationMode` preset 适配，属于实验接口。它为
+  Thread sticky，对当前及后续新 Turn 生效，直到用户关闭；运行中不可切换。
+- `Record a skill`、Plugins、Apps、Skills 和 Files and chats 本轮隐藏；只有完整纵切通过后再进入
+  Capability Registry。
 
-### 3.2 Plugins / Skills
+### 3.2 后续能力：Plugins / Skills
 
 - 目录来自 `skills/list` 与管理员批准策略的交集。
 - 点击 Skill 后在 Composer 中形成可删除的上下文 Chip，并在 `TurnStartParams.input` 中发送
@@ -66,7 +70,7 @@ Composer 以 Codex 桌面端当前可观察交互为验收基准：输入区上�
 - Plugin 安装、卸载和市场接口仍处于 under development，不向普通用户开放；管理员只能管理平台
   已验证目录。
 
-### 3.3 Apps
+### 3.3 后续能力：Apps
 
 - 目录来自 `app/list` 与组织 Connector Policy 的交集。
 - App OAuth、Scope、到期和撤销以当前飞书用户隔离；共享 Codex 账号不共享 App 授权。
@@ -74,7 +78,7 @@ Composer 以 Codex 桌面端当前可观察交互为验收基准：输入区上�
   `ActorContext`。
 - 类似 “Attach WeChat” 的快捷项是已安装 App/Plugin 注入项，不是所有 Codex 客户端的固定能力。
 
-### 3.4 Files and chats
+### 3.4 后续能力：Files and chats
 
 - 展示当前飞书用户自己的 CodexPlatform Thread、已上传文件和可访问企业文档。
 - App Server `thread/search` 不提供用户个人 ChatGPT 历史；平台不得跨共享账号读取或展示个人
@@ -144,12 +148,12 @@ interface TurnInputBundle {
 
 ## 5. 提交与持久化
 
-1. 用户选择文件/Skill/App/Thread 后先创建 Draft Attachment，不启动 Turn。
+1. 用户在 `/threads/new` 选择文件或设置 Goal 时创建隐藏 Draft，不启动 Turn，也不进入历史列表。
 2. 服务端完成上传、扫描、ACL 和引用解析后，状态变为 `READY`。
 3. 提交时服务端重新校验所有引用、组织策略、权限模式和当前账号 Runtime capability。
 4. 生成不可变 `EffectiveTurnInputSnapshot`，包含文本、引用、权限展开值、Goal/Plan 与供应商输入。
 5. 先提交 Goal 变更，再调用 `turn/start`；任一步失败均不悄悄丢失或降级。
-6. Turn 开始后，文件、Skill、App 和 Thread 引用属于本 Turn；Goal 属于 Thread；权限为 Thread
+6. 首次发送时 Draft 原子转为正式 Thread；文件引用属于本 Turn；Goal 属于 Thread；权限为 Thread
    sticky；Plan mode 保持到用户关闭或组织策略变化。
 7. 已发生外部写副作用的 Tool Call 不因上传、网络或 Runtime 错误自动重试。
 
@@ -157,10 +161,15 @@ interface TurnInputBundle {
 
 ```text
 GET    /api/composer/capabilities?threadId=:id
+POST   /api/threads/drafts
+DELETE /api/threads/:id/draft
 POST   /api/threads/:id/attachments
 DELETE /api/threads/:id/attachments/:attachmentId
-POST   /api/threads/:id/goal
+GET    /api/threads/:id/goal
+PUT    /api/threads/:id/goal
+PATCH  /api/threads/:id/goal
 DELETE /api/threads/:id/goal
+PATCH  /api/threads/:id/composer
 POST   /api/threads/:id/turns
 ```
 
@@ -191,7 +200,7 @@ POST   /api/threads/:id/turns
 - `ComposerCapability` API 和 Codex 式 Add 菜单。
 - 文件/图片上传、隔离 staging、Chip、删除和 Turn 提交。
 - Goal 稳定 RPC；Plan mode 实验适配并锁版本。
-- 受管 Skills 只读目录与真实 `skill` input。
+- Record a skill、Plugins、Apps、Skills 和历史会话引用均隐藏。
 
 ### 1.1A-P1
 
@@ -215,6 +224,6 @@ POST   /api/threads/:id/turns
 - Add 菜单由 capability API 驱动，未接入项不会伪装可用。
 - 用户只能上传、搜索、引用和删除自己的 Thread 上下文。
 - 文件名、路径、MIME、大小、目录穿越、符号链接和超限输入均 Fail Closed。
-- 图片使用 `localImage`；Skill 使用结构化 `skill` input；普通文件只引用服务端受控路径。
+- 图片使用 `localImage`；普通文件只引用服务端受控路径。
 - Goal 跨 Turn 保留；Plan mode 只影响配置快照；运行中 Steer 不改变二者。
 - 所有 Browser、日志、SSE 和审计响应均不包含本地浏览器路径、共享凭证或其他用户资源。

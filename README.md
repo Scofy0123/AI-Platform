@@ -35,6 +35,9 @@ Project → Thread → Turn → Item
 - `Project → Thread → Turn → Item` 的连续多轮模型；旧 `/tasks/:id` 链接保留兼容并重定向到 Thread。
 - REST 命令与支持 `Last-Event-ID` 重放的 Thread SSE；消息增量仅在相同 `threadId + turnId + itemId + type` 内合并。
 - 停止、继续、Steer、审批，以及 Plan、推理摘要、命令、Tool、Diff 和结果展示。
+- `Add files and more` 当前只开放真实可用的 Files/Folders、Goal 和 Plan mode：支持隐藏 Draft、
+  多文件/目录/拖放、附件扫描与纯附件 Turn；Goal 跨 Turn 保留并受 200k Token / 60 分钟预算约束；
+  Plan mode 为 Thread sticky，并映射到锁定 App Server 的真实 collaboration preset。
 - 用户级 Settings 采用 General、Profile、Execution、Personalization、Connections、Plugins、Usage、Archived chats 八组信息架构。1.1A 中执行偏好、Personalization 和默认 Project 会进入实际流程；Profile、Connections、Usage 为只读视图，Plugins 与 Archived chats 仍是明确标注的空目录/占位，语言、主题和通知目前只持久化偏好。
 - Subagent 的 Active/Done 列表、摘要、独立详情、父用户身份继承和 Thread 树用量归集。1.1A 详情以只读检查为主，不承诺直接控制任意子 Agent 或已完成生产级预算治理。
 - 用户界面和普通用户 API 不返回共享账号别名、邮箱、Token、Cookie、`CODEX_HOME` 或原始 reasoning。
@@ -116,6 +119,11 @@ pnpm verify
 ```
 
 真实 Codex 和真实飞书 Smoke Test 都是显式门禁测试，默认跳过；存在测试代码不代表外部链路已经跑通。只有实际执行并保留成功输出后，才能把对应链路标记为已验证。命令见 [验收手册](docs/acceptance.md#真实外部-smoke-test)。
+
+2026-07-29 已完成本轮 Composer 纵切验证：`pnpm verify` 通过（694 项 Vitest、14 项
+Playwright、协议校验与 Production Build）；真实单操作者 App Server UAT 完成 Plan 规划 Turn 与
+Goal 跨 Turn 保留，并在关闭 Plan 后真实创建、回读 `real-goal-plan-uat.txt`。Files/Folders 的上传、
+目录、拖放、纯附件提交与 Steer 附件由浏览器 E2E 覆盖；生产多人恶意文件扫描仍是 1.1B 门禁。
 
 ## 文档
 

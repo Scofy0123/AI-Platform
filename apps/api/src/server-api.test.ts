@@ -4,16 +4,24 @@ import type {
   ComposerCapability,
   ModelCatalog,
   ModelOption,
+  TaskDetail,
+  TaskEvent,
   Thread,
   UserSettingsView,
 } from "@codexplatform/contracts";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
+  GoalCapabilityUnavailableError,
+  GoalMutationBlockedByPendingTurnError,
+  PlanModeMutationBlockedError,
+  RuntimeRequestTimeoutError,
+} from "./domain/errors.js";
+import {
   ActiveTurnResumeConflictError,
   InvalidThreadResumeResponseError,
   ModelCatalogUnavailableError,
 } from "./domain/platform-service.js";
-import { buildApp, streamTaskEvents, subscribeWithReplay } from "./server.js";
+import { buildApp, readMultipartStream, streamTaskEvents, subscribeWithReplay } from "./server.js";
 import type { AuthApi, PlatformApi } from "./web-api.js";
 
 const STANDARD_MODEL: ModelOption = {
@@ -849,6 +857,28 @@ describe("CodexPlatform HTTP API", () => {
     expect(response.body).not.toContain("turn-internal");
   });
 
+  test("returns a retryable 503 when the App Server request times out", async () => {
+    const { auth, platform } = services();
+    platform.startTurn.mockRejectedValueOnce(new RuntimeRequestTimeoutError("thread/start"));
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/tasks/task-1/turns",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "Retry when the Runtime is ready" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: "RUNTIME_REQUEST_TIMEOUT",
+      code: "RUNTIME_REQUEST_TIMEOUT",
+      message: "Codex Runtime took too long to prepare. Retry this Turn.",
+    });
+  });
+
   test("serves the 1.1 bootstrap and actor-aware Thread routes while preserving task routes", async () => {
     const { auth, platform } = services();
     const baseThread = await platform.getThread();
@@ -1080,6 +1110,478 @@ describe("CodexPlatform HTTP API", () => {
     expect(platform.listArchivedThreads).toHaveBeenCalledWith("user-1");
     expect(platform.archiveThread).toHaveBeenCalledWith("thread-1", "user-1");
     expect(platform.unarchiveThread).toHaveBeenCalledWith("thread-1", "user-1");
+  });
+
+  test("exposes owner-scoped Goal CRUD and protects every mutation with CSRF", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const cookies = { codexplatform_session: "valid-session" };
+    const write = { ...cookies, codexplatform_csrf: "valid-csrf" };
+    const headers = { "x-csrf-token": "valid-csrf" };
+
+    expect(
+      (
+        await app.inject({
+          method: "PUT",
+          url: "/api/threads/thread-1/goal",
+          cookies,
+          payload: { objective: "持续完成" },
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "PUT",
+          url: "/api/threads/thread-1/goal",
+          cookies: write,
+          headers,
+          payload: { objective: "持续完成" },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(platform.putThreadGoal).toHaveBeenCalledWith("thread-1", "user-1", {
+      objective: "持续完成",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: "/api/threads/thread-1/goal",
+          cookies: write,
+          headers,
+          payload: { action: "PAUSE" },
+        })
+      ).statusCode,
+    ).toBe(200);
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: "/api/threads/thread-1/goal",
+      cookies: write,
+      headers,
+    });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({ cleared: true, runtimeSyncState: "SYNCED" });
+  });
+
+  test("returns a machine-readable conflict when a pending Turn freezes the Goal snapshot", async () => {
+    const { auth, platform } = services();
+    platform.patchThreadGoal.mockRejectedValueOnce(
+      new GoalMutationBlockedByPendingTurnError("QUEUED"),
+    );
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/threads/thread-1/goal",
+      cookies: {
+        codexplatform_session: "valid-session",
+        codexplatform_csrf: "valid-csrf",
+      },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { action: "PAUSE" },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN",
+      code: "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN",
+      message: "A QUEUED Turn already froze the Goal input snapshot",
+    });
+  });
+
+  test("patches Thread Composer state with CSRF and returns typed Plan conflicts", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const cookies = {
+      codexplatform_session: "valid-session",
+      codexplatform_csrf: "valid-csrf",
+    };
+    const headers = { "x-csrf-token": "valid-csrf" };
+
+    const updated = await app.inject({
+      method: "PATCH",
+      url: "/api/threads/thread-1/composer",
+      cookies,
+      headers,
+      payload: { planMode: true, revision: 2 },
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toEqual({ planMode: true, revision: 3 });
+    expect(platform.patchThreadComposer).toHaveBeenCalledWith("thread-1", "user-1", {
+      planMode: true,
+      revision: 2,
+    });
+
+    platform.patchThreadComposer.mockRejectedValueOnce(new PlanModeMutationBlockedError("RUNNING"));
+    const blocked = await app.inject({
+      method: "PATCH",
+      url: "/api/threads/thread-1/composer",
+      cookies,
+      headers,
+      payload: { planMode: false, revision: 3 },
+    });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({
+      error: "PLAN_MODE_MUTATION_BLOCKED_BY_PENDING_TURN",
+      code: "PLAN_MODE_MUTATION_BLOCKED_BY_PENDING_TURN",
+    });
+  });
+
+  test.each([
+    ["RUNTIME_VERSION_UNSUPPORTED", 409],
+    ["RUNTIME_CAPABILITY_PROBE_FAILED", 503],
+  ] as const)(
+    "maps unavailable Goal capability %s to a machine-readable response",
+    async (reasonCode, statusCode) => {
+      const { auth, platform } = services();
+      platform.putThreadGoal.mockRejectedValueOnce(
+        new GoalCapabilityUnavailableError(reasonCode, "Goal protocol unavailable", statusCode),
+      );
+      const app = buildApp({ auth, platform });
+      apps.push(app);
+
+      const response = await app.inject({
+        method: "PUT",
+        url: "/api/threads/thread-1/goal",
+        cookies: {
+          codexplatform_session: "valid-session",
+          codexplatform_csrf: "valid-csrf",
+        },
+        headers: { "x-csrf-token": "valid-csrf" },
+        payload: { objective: "持续完成" },
+      });
+
+      expect(response.statusCode).toBe(statusCode);
+      expect(response.json()).toEqual({
+        error: "GOAL_CAPABILITY_UNAVAILABLE",
+        code: "GOAL_CAPABILITY_UNAVAILABLE",
+        reasonCode,
+        message: "Goal protocol unavailable",
+      });
+    },
+  );
+
+  test("returns not found when archive routes target a Draft or expired Draft", async () => {
+    const { auth, platform } = services();
+    platform.archiveThread.mockRejectedValue(new Error("Thread not found"));
+    platform.unarchiveThread.mockRejectedValue(new Error("Thread not found"));
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const responses = await Promise.all(
+      ["draft-1", "expired-1"].flatMap((threadId) =>
+        ["archive", "unarchive"].map((action) =>
+          app.inject({
+            method: "POST",
+            url: `/api/threads/${threadId}/${action}`,
+            cookies: { codexplatform_session: "valid-session" },
+            headers: { "x-csrf-token": "valid-csrf" },
+          }),
+        ),
+      ),
+    );
+
+    expect(responses.map((response) => response.statusCode)).toEqual([404, 404, 404, 404]);
+    expect(responses.map((response) => response.json())).toEqual([
+      { error: "Thread not found" },
+      { error: "Thread not found" },
+      { error: "Thread not found" },
+      { error: "Thread not found" },
+    ]);
+  });
+
+  test("creates and deletes hidden Drafts through owner-scoped CSRF routes", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const missingCsrf = await app.inject({
+      method: "POST",
+      url: "/api/threads/drafts",
+      cookies: { codexplatform_session: "valid-session" },
+      payload: { projectId: "project-1" },
+    });
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/threads/drafts",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { projectId: "project-1" },
+    });
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: "/api/threads/draft-1/draft",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+    });
+
+    expect(missingCsrf.statusCode).toBe(403);
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toMatchObject({ id: "draft-1", lifecycleState: "DRAFT" });
+    expect(deleted.statusCode).toBe(204);
+    expect(platform.createDraft).toHaveBeenCalledWith("user-1", { projectId: "project-1" });
+    expect(platform.deleteDraft).toHaveBeenCalledWith("draft-1", "user-1");
+  });
+
+  test("restores an owner-scoped hidden Draft and its Composer state", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const draft = await app.inject({
+      method: "GET",
+      url: "/api/threads/draft-1/draft",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const composer = await app.inject({
+      method: "GET",
+      url: "/api/threads/draft-1/composer",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    expect(draft.statusCode).toBe(200);
+    expect(draft.json()).toEqual({
+      id: "draft-1",
+      projectId: "project-1",
+      lifecycleState: "DRAFT",
+    });
+    expect(composer.statusCode).toBe(200);
+    expect(composer.json()).toEqual({ planMode: true, revision: 2 });
+    expect(platform.getDraft).toHaveBeenCalledWith("draft-1", "user-1");
+    expect(platform.getThreadComposer).toHaveBeenCalledWith("draft-1", "user-1");
+  });
+
+  test("does not expose a Draft through legacy task detail or event routes", async () => {
+    const { auth, platform } = services();
+    platform.getTask.mockResolvedValue(null);
+    platform.listTaskEvents.mockResolvedValue(null);
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const detail = await app.inject({
+      method: "GET",
+      url: "/api/tasks/draft-1",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+    const replay = await app.inject({
+      method: "GET",
+      url: "/api/tasks/draft-1/events",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { accept: "application/json" },
+    });
+    const stream = await app.inject({
+      method: "GET",
+      url: "/api/tasks/draft-1/events",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { accept: "text/event-stream" },
+    });
+
+    expect(detail.statusCode).toBe(404);
+    expect(replay.statusCode).toBe(404);
+    expect(stream.statusCode).toBe(404);
+    expect(`${detail.body}${replay.body}${stream.body}`).not.toContain("DRAFT");
+  });
+
+  test("accepts an attachment-only Steer on Thread and legacy task routes", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const thread = await app.inject({
+      method: "POST",
+      url: "/api/threads/thread-1/steer",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "", attachmentIds: ["attachment-1"] },
+    });
+    const task = await app.inject({
+      method: "POST",
+      url: "/api/tasks/task-1/steer",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "", attachmentIds: ["attachment-2"] },
+    });
+
+    expect(thread.statusCode).toBe(202);
+    expect(task.statusCode).toBe(202);
+    expect(platform.steerThread).toHaveBeenCalledWith("thread-1", "user-1", "", ["attachment-1"]);
+    expect(platform.steerTask).toHaveBeenCalledWith("task-1", "user-1", "", ["attachment-2"]);
+  });
+
+  test("stops reading multipart content as soon as the aggregate limit is exceeded", async () => {
+    let yielded = 0;
+    async function* chunks() {
+      for (const value of ["1234", "5678", "must-not-read"]) {
+        yielded += 1;
+        yield Buffer.from(value);
+      }
+    }
+
+    await expect(readMultipartStream(chunks(), 5)).rejects.toThrow(
+      "Attachments exceed the aggregate upload limit",
+    );
+    expect(yielded).toBe(2);
+  });
+
+  test("accepts multipart attachment uploads without exposing an absolute path", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const boundary = "codexplatform-test-boundary";
+    const payload = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="file"; filename="notes.txt"',
+      "Content-Type: text/plain",
+      "",
+      "hello",
+      `--${boundary}--`,
+      "",
+    ].join("\r\n");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/threads/draft-1/attachments",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: {
+        "x-csrf-token": "valid-csrf",
+        "content-type": `multipart/form-data; boundary=${boundary}`,
+      },
+      payload,
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json()).toMatchObject({
+      id: "attachment-1",
+      scanStatus: "READY",
+    });
+    expect(response.json()).not.toHaveProperty("relativePath");
+    expect(response.body).not.toContain(".codexplatform/attachments");
+    expect(response.body).not.toContain("/private/");
+    expect(platform.uploadAttachment).toHaveBeenCalledWith(
+      "draft-1",
+      "user-1",
+      expect.objectContaining({
+        files: [
+          {
+            name: "notes.txt",
+            relativePath: "notes.txt",
+            mimeType: "text/plain",
+            content: Buffer.from("hello"),
+          },
+        ],
+      }),
+    );
+  });
+
+  test("lists only the current user's unclaimed Composer attachments", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/threads/thread-1/attachments",
+      cookies: { codexplatform_session: "valid-session" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([
+      expect.objectContaining({ id: "attachment-1", scanStatus: "READY" }),
+    ]);
+    expect(response.body).not.toContain("relativePath");
+    expect(response.body).not.toContain(".codexplatform/attachments");
+    expect(platform.listAttachments).toHaveBeenCalledWith("thread-1", "user-1");
+  });
+
+  test("maps attachment validation errors to 400 and size limits to 413", async () => {
+    const { auth, platform } = services();
+    platform.uploadAttachment
+      .mockRejectedValueOnce(new Error("Attachment root limit exceeded"))
+      .mockRejectedValueOnce(new Error("Attachments exceed the 200 MiB Turn limit"));
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const boundary = "codexplatform-error-boundary";
+    const payload = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="file"; filename="notes.txt"',
+      "Content-Type: text/plain",
+      "",
+      "hello",
+      `--${boundary}--`,
+      "",
+    ].join("\r\n");
+    const upload = () =>
+      app.inject({
+        method: "POST",
+        url: "/api/threads/draft-1/attachments",
+        cookies: { codexplatform_session: "valid-session" },
+        headers: {
+          "x-csrf-token": "valid-csrf",
+          "content-type": `multipart/form-data; boundary=${boundary}`,
+        },
+        payload,
+      });
+
+    const invalid = await upload();
+    const tooLarge = await upload();
+
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json()).toEqual({ error: "Attachment root limit exceeded" });
+    expect(tooLarge.statusCode).toBe(413);
+    expect(tooLarge.json()).toEqual({ error: "Attachments exceed the 200 MiB Turn limit" });
+  });
+
+  test("preserves a multipart folder tree as one attachment root", async () => {
+    const { auth, platform } = services();
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+    const boundary = "codexplatform-folder-boundary";
+    const payload = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="files"; filename="research/a.txt"',
+      "Content-Type: text/plain",
+      "",
+      "a",
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="files"; filename="research/nested/b.txt"',
+      "Content-Type: text/plain",
+      "",
+      "b",
+      `--${boundary}--`,
+      "",
+    ].join("\r\n");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/threads/draft-1/attachments",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: {
+        "x-csrf-token": "valid-csrf",
+        "content-type": `multipart/form-data; boundary=${boundary}`,
+      },
+      payload,
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(platform.uploadAttachment).toHaveBeenCalledWith(
+      "draft-1",
+      "user-1",
+      expect.objectContaining({
+        files: [
+          expect.objectContaining({ relativePath: "research/a.txt", content: Buffer.from("a") }),
+          expect.objectContaining({
+            relativePath: "research/nested/b.txt",
+            content: Buffer.from("b"),
+          }),
+        ],
+      }),
+    );
   });
 
   test("returns conflict when an active Thread cannot be archived", async () => {
@@ -1423,16 +1925,18 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
     listProjects: vi.fn(async () => []),
     createTask: vi.fn(async () => ({ id: "task-1" })),
     listTasks: vi.fn(async () => []),
-    getTask: vi.fn(async () => ({
-      id: "task-1",
-      projectId: "project-1",
-      title: "Build it",
-      status: "RUNNING" as const,
-      updatedAt: "2026-07-21T12:00:00.000Z",
-      prompt: "Build it",
-      accountAlias: "Codex A",
-      queue: null,
-    })),
+    getTask: vi.fn(
+      async (): Promise<TaskDetail | null> => ({
+        id: "task-1",
+        projectId: "project-1",
+        title: "Build it",
+        status: "RUNNING" as const,
+        updatedAt: "2026-07-21T12:00:00.000Z",
+        prompt: "Build it",
+        accountAlias: "Codex A",
+        queue: null,
+      }),
+    ),
     createThread: vi.fn(async () => ({
       id: "thread-new",
       projectId: "project-1",
@@ -1444,6 +1948,86 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
       turns: [],
       queue: null,
       items: [],
+    })),
+    createDraft: vi.fn(async () => ({
+      id: "draft-1",
+      projectId: "project-1",
+      lifecycleState: "DRAFT" as const,
+      expiresAt: "2026-07-28T13:00:00.000Z",
+    })),
+    getDraft: vi.fn(async () => ({
+      id: "draft-1",
+      projectId: "project-1",
+      lifecycleState: "DRAFT" as const,
+    })),
+    getThreadComposer: vi.fn(async () => ({ planMode: true, revision: 2 })),
+    deleteDraft: vi.fn(async () => undefined),
+    uploadAttachment: vi.fn(async () => ({
+      id: "attachment-1",
+      threadId: "draft-1",
+      kind: "FILE" as const,
+      name: "notes.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      fileCount: 1,
+      scanStatus: "READY" as const,
+      createdAt: "2026-07-28T12:00:00.000Z",
+    })),
+    listAttachments: vi.fn(async () => [
+      {
+        id: "attachment-1",
+        threadId: "thread-1",
+        kind: "FILE" as const,
+        name: "notes.txt",
+        mimeType: "text/plain",
+        sizeBytes: 5,
+        fileCount: 1,
+        scanStatus: "READY" as const,
+        createdAt: "2026-07-28T12:00:00.000Z",
+      },
+    ]),
+    deleteAttachment: vi.fn(async () => undefined),
+    getThreadGoal: vi.fn(async () => ({
+      threadId: "thread-1",
+      objective: "持续完成",
+      status: "ACTIVE" as const,
+      tokenBudget: 200_000,
+      tokensUsed: 0,
+      timeBudgetSeconds: 3_600,
+      timeUsedSeconds: 0,
+      runtimeSyncState: "SYNCED" as const,
+      createdAt: "2026-07-28T12:00:00.000Z",
+      updatedAt: "2026-07-28T12:00:00.000Z",
+    })),
+    putThreadGoal: vi.fn(async (_threadId, _userId, input) => ({
+      threadId: "thread-1",
+      ...input,
+      status: "ACTIVE" as const,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      runtimeSyncState: "PENDING" as const,
+      createdAt: "2026-07-28T12:00:00.000Z",
+      updatedAt: "2026-07-28T12:00:00.000Z",
+    })),
+    patchThreadGoal: vi.fn(async () => ({
+      threadId: "thread-1",
+      objective: "持续完成",
+      status: "PAUSED" as const,
+      tokenBudget: 200_000,
+      tokensUsed: 0,
+      timeBudgetSeconds: 3_600,
+      timeUsedSeconds: 0,
+      runtimeSyncState: "PENDING" as const,
+      createdAt: "2026-07-28T12:00:00.000Z",
+      updatedAt: "2026-07-28T12:00:01.000Z",
+    })),
+    deleteThreadGoal: vi.fn(async () => ({
+      cleared: true as const,
+      runtimeSyncState: "SYNCED" as const,
+    })),
+    patchThreadComposer: vi.fn(async (_threadId, _userId, input) => ({
+      planMode: input.planMode,
+      revision: input.revision + 1,
     })),
     listThreads: vi.fn(async () => []),
     listArchivedThreads: vi.fn(async (): Promise<Thread[]> => []),
@@ -1559,7 +2143,7 @@ function services(role: "ADMIN" | "MEMBER" = "ADMIN") {
     startTurn: vi.fn(async () => ({ status: "RUNNING" })),
     steerTask: vi.fn(async () => ({ status: "RUNNING" })),
     interruptTask: vi.fn(async () => ({ status: "INTERRUPTING" })),
-    listTaskEvents: vi.fn(async () => [event]),
+    listTaskEvents: vi.fn(async (): Promise<TaskEvent[] | null> => [event]),
     subscribeTaskEvents: vi.fn(() => () => undefined),
     listApprovals: vi.fn(async () => []),
     decideApproval: vi.fn(async () => ({ id: "approval-1", status: "DECIDED" })),

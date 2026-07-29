@@ -114,6 +114,8 @@ export interface PlanDetail {
   itemId: string;
   sequence: number;
   timestamp: string;
+  title: string | null;
+  markdown: string | null;
   explanation: string | null;
   steps: unknown[];
 }
@@ -222,6 +224,7 @@ const PRESENTABLE_EVENT_TYPES = new Set<string>([
   "AGENT_MESSAGE_PHASE",
   "REASONING_SUMMARY_DELTA",
   "PLAN_UPDATED",
+  "PROPOSED_PLAN_PUBLISHED",
   "COMMAND_STARTED",
   "COMMAND_OUTPUT",
   "COMMAND_COMPLETED",
@@ -387,21 +390,42 @@ function orderTurns(turns: Turn[]): Turn[] {
 export function selectPlanDetails(events: TaskEvent[], turnId?: string | null): PlanDetail[] {
   const plans = new Map<string, PlanDetail>();
   for (const event of normalizePresentationEvents(events)) {
-    if (event.type !== "PLAN_UPDATED" || (turnId !== undefined && event.turnId !== turnId)) {
+    if (
+      (event.type !== "PLAN_UPDATED" && event.type !== "PROPOSED_PLAN_PUBLISHED") ||
+      (turnId !== undefined && event.turnId !== turnId)
+    ) {
       continue;
     }
     const itemId = eventItemId(event);
     const id = rowId(event.threadId, event.turnId, itemId);
-    plans.set(id, {
+    plans.set(
       id,
-      threadId: event.threadId,
-      turnId: event.turnId,
-      itemId,
-      sequence: event.sequence,
-      timestamp: event.timestamp,
-      explanation: event.payload.explanation,
-      steps: sanitizePlanSteps(event.payload.plan),
-    });
+      event.type === "PROPOSED_PLAN_PUBLISHED"
+        ? {
+            id,
+            threadId: event.threadId,
+            turnId: event.turnId,
+            itemId,
+            sequence: event.sequence,
+            timestamp: event.timestamp,
+            title: event.payload.title,
+            markdown: event.payload.markdown,
+            explanation: null,
+            steps: [],
+          }
+        : {
+            id,
+            threadId: event.threadId,
+            turnId: event.turnId,
+            itemId,
+            sequence: event.sequence,
+            timestamp: event.timestamp,
+            title: null,
+            markdown: null,
+            explanation: event.payload.explanation,
+            steps: sanitizePlanSteps(event.payload.plan),
+          },
+    );
   }
   return [...plans.values()].sort(compareDetails);
 }
@@ -618,7 +642,7 @@ function projectEventRow(
       rows.set(id, {
         ...identity,
         kind: "assistant",
-        text: event.payload.delta,
+        text: unwrapProposedPlanEnvelope(event.payload.delta),
         messagePhase: messagePhases.get(messagePhaseKey(event)) ?? null,
       });
       return;
@@ -635,6 +659,8 @@ function projectEventRow(
         explanation: event.payload.explanation,
         steps: sanitizePlanSteps(event.payload.plan),
       });
+      return;
+    case "PROPOSED_PLAN_PUBLISHED":
       return;
     case "COMMAND_STARTED":
       rows.set(id, {
@@ -1009,6 +1035,13 @@ function sanitizeProjectionValue(value: unknown): unknown {
 function sanitizePlanSteps(value: unknown[]): unknown[] {
   const clean = sanitizeProjectionValue(value);
   return Array.isArray(clean) ? clean : [];
+}
+
+function unwrapProposedPlanEnvelope(value: string): string {
+  return value
+    .replace(/^\s*<proposed_plan>\s*/i, "")
+    .replace(/\s*<\/proposed_plan>\s*$/i, "")
+    .trim();
 }
 
 function visitRecords(value: unknown, visit: (record: Record<string, unknown>) => void): void {

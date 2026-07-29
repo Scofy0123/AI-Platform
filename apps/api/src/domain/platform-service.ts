@@ -1,11 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { lstat, mkdir, open, realpath, rm } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
   type ActorContext,
   type Bootstrap,
+  type BrowserDraftAttachment,
+  BrowserDraftAttachmentSchema,
+  type CollaborationModePreset,
   type ComposerCapability,
+  type ComposerState,
+  type ComposerStatePatch,
+  type DraftAttachment,
   type EffectiveConfigOverride,
   EffectiveConfigOverrideSchema,
   type EffectiveThreadConfigSnapshot,
@@ -25,6 +32,13 @@ import {
   TaskStatusSchema,
   type TaskSummary,
   type Thread,
+  type ThreadGoalInput,
+  ThreadGoalInputSchema,
+  type ThreadGoalPatch,
+  ThreadGoalPatchSchema,
+  type ThreadGoalSnapshot,
+  type ThreadGoalView,
+  ThreadGoalViewSchema,
   type ThreadItem,
   TurnStatusSchema,
   type UserSettings,
@@ -32,13 +46,28 @@ import {
   type UserSettingsView,
 } from "@codexplatform/contracts";
 import type { WeeklyQuota } from "../infra/codex/codex-runtime.js";
+import { RpcError } from "../infra/codex/jsonl-rpc-client.js";
 import type { PlatformApi } from "../web-api.js";
 import type { AccountAdminStore, InternalAccount } from "./account-admin-store.js";
+import {
+  type AttachmentScanner,
+  BasicAttachmentScanner,
+  MAX_FOLDER_FILES,
+  MAX_TURN_ATTACHMENT_BYTES,
+} from "./attachments.js";
 import { listComposerCapabilities as buildComposerCapabilities } from "./composer-capabilities.js";
+import {
+  GoalCapabilityUnavailableError,
+  GoalMutationBlockedByPendingTurnError,
+  PlanModeCapabilityChangedError,
+  PlanPresetModelUnavailableError,
+} from "./errors.js";
 import type { LeasedTurn, SQLiteLeaseStore } from "./lease-store.js";
 import type {
   ApprovalTransportIdentity,
+  AttachmentCleanupJob,
   SQLitePlatformStore,
+  StoredThreadGoalView,
   TaskRecord,
   TurnRecord,
 } from "./platform-store.js";
@@ -108,6 +137,11 @@ export class AllocatedModelSelectionChangedError extends Error {
   }
 }
 
+interface PreRuntimeFailure {
+  code: string;
+  publicMessage: string;
+}
+
 export abstract class ThreadResumeSafetyError extends Error {
   abstract readonly code: string;
   readonly promptAccepted = false;
@@ -147,8 +181,45 @@ export class InvalidThreadResumeResponseError extends ThreadResumeSafetyError {
   }
 }
 
+export interface GoalRuntimeCapability {
+  availability: "AVAILABLE" | "UNAVAILABLE";
+  reasonCode: string | null;
+  reason: string | null;
+}
+
+export interface PlanModeCatalogCapability {
+  availability: "AVAILABLE" | "UNAVAILABLE";
+  reasonCode: string | null;
+  reason: string | null;
+  presets: CollaborationModePreset[];
+}
+
+export type AttachedGoalRuntimeResult<T> =
+  | { attachment: "DETACHED" }
+  | ({ attachment: "ATTACHED" } & T);
+
+export interface RuntimeGoalProjection {
+  goal: ThreadGoalSnapshot | null;
+  runtimeUpdatedAt: number | null;
+}
+
 export interface TaskExecutionAdapter {
   listModels(account: InternalAccount): Promise<ModelOption[]>;
+  readGoalCapability(account: InternalAccount): Promise<GoalRuntimeCapability>;
+  readPlanModeCatalog(
+    account: InternalAccount,
+    requested?: { model: string | null; reasoningEffort: string },
+  ): Promise<PlanModeCatalogCapability>;
+  setThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>>;
+  getThreadGoal(threadId: string): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>>;
+  clearThreadGoal(threadId: string): Promise<AttachedGoalRuntimeResult<{ cleared: boolean }>>;
+  syncThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>>;
   startTask(input: {
     accountId: string;
     codexHome: string;
@@ -159,8 +230,16 @@ export interface TaskExecutionAdapter {
     existingThreadId: string | null;
     effectiveConfig: EffectiveThreadConfigSnapshot;
     actorContext: ActorContext;
+    goal?: ThreadGoalSnapshot | null;
+    onThreadPrepared?(threadId: string): void;
+    attachments?: Array<{ name: string; path: string; mimeType: string }>;
   }): Promise<{ threadId: string; turnId: string }>;
-  steerTask(threadId: string, turnId: string, prompt: string): Promise<void>;
+  steerTask(
+    threadId: string,
+    turnId: string,
+    prompt: string,
+    attachments?: Array<{ name: string; path: string; mimeType: string }>,
+  ): Promise<void>;
   interruptTask(threadId: string, turnId: string): Promise<void>;
   respondApproval(
     requestId: string,
@@ -180,6 +259,18 @@ export interface TaskExecutionAdapter {
     event: "accountQuotaUpdated",
     listener: (event: { accountId: string; quota: WeeklyQuota }) => void,
   ): this;
+  on(
+    event: "goalUpdated",
+    listener: (event: {
+      taskId: string;
+      threadId: string;
+      status: ThreadGoalView["status"];
+      tokensUsed: number;
+      timeUsedSeconds: number;
+      runtimeUpdatedAt: number;
+    }) => void,
+  ): this;
+  on(event: "goalCleared", listener: (event: { taskId: string; threadId: string }) => void): this;
   on(
     event: "accountCrashed",
     listener: (event: {
@@ -203,6 +294,7 @@ interface LocalPlatformServiceOptions {
   safety: RuntimeSafetyPort;
   dataDir: string;
   now?: () => Date;
+  attachmentScanner?: AttachmentScanner;
 }
 
 type BufferedExecutionSignal =
@@ -249,6 +341,7 @@ export class LocalPlatformService implements PlatformApi {
   >();
   private readonly modelCatalogGenerationByAccount = new Map<string, number>();
   private readonly modelCatalogCooldownUntilByAccount = new Map<string, Date>();
+  private readonly goalMutationTailByThread = new Map<string, Promise<void>>();
 
   constructor(private readonly options: LocalPlatformServiceOptions) {
     this.now = options.now ?? (() => new Date());
@@ -293,6 +386,26 @@ export class LocalPlatformService implements PlatformApi {
         this.publish(event);
       }
       this.startPromotedTurns(options.leases.promoteQueue(occurredAt));
+    });
+    options.execution.on("goalUpdated", (event) => {
+      const ownerId = options.store.getTaskOwnerId(event.taskId);
+      if (!ownerId || !options.store.getThreadGoal(event.taskId, ownerId)) return;
+      options.store.syncThreadGoal({
+        threadId: event.taskId,
+        ownerId,
+        runtimeThreadId: event.threadId,
+        status: event.status,
+        tokensUsed: event.tokensUsed,
+        timeUsedSeconds: event.timeUsedSeconds,
+        runtimeUpdatedAt: event.runtimeUpdatedAt,
+        now: this.now(),
+      });
+    });
+    options.execution.on("goalCleared", ({ taskId }) => {
+      const ownerId = options.store.getTaskOwnerId(taskId);
+      if (ownerId && options.store.getThreadGoal(taskId, ownerId)) {
+        options.store.markThreadGoalRecovery(taskId, ownerId, this.now());
+      }
     });
   }
 
@@ -386,21 +499,274 @@ export class LocalPlatformService implements PlatformApi {
   }
 
   async listComposerCapabilities(userId: string, threadId?: string): Promise<ComposerCapability[]> {
-    if (threadId && !this.options.store.getTaskForUser(threadId, userId)) {
-      throw new Error("Thread not found");
-    }
+    const task = threadId ? this.options.store.getTaskForUser(threadId, userId) : null;
+    if (threadId && !task) throw new Error("Thread not found");
+    const goalCapability = await this.readGoalCapabilityForUser(userId, task?.accountId ?? null);
+    const planCapability = await this.readPlanCapabilityForUser(userId, task?.accountId ?? null);
     return buildComposerCapabilities({
-      stagingAvailable: false,
-      stagingUnavailableReason: "File staging is not enabled in this build",
-      goalAvailable: false,
-      goalUnavailableReason: "Goal persistence is not enabled in this build",
-      planModeAvailable: false,
-      planModeUnavailableReason: "Plan mode is awaiting locked-version protocol validation",
+      stagingAvailable: true,
+      goalAvailable: goalCapability.availability === "AVAILABLE",
+      goalUnavailableReason:
+        goalCapability.reason ?? "Goal protocol is unavailable for this Runtime",
+      ...(goalCapability.reasonCode
+        ? { goalUnavailableReasonCode: goalCapability.reasonCode }
+        : {}),
+      planModeAvailable: planCapability.availability === "AVAILABLE",
+      planModeUnavailableReason:
+        planCapability.reason ?? "Plan mode is unavailable for this Runtime",
+      ...(planCapability.reasonCode
+        ? { planModeUnavailableReasonCode: planCapability.reasonCode }
+        : {}),
       skillRecorderAvailable: false,
       skillRecorderUnavailableReason: "Requires an isolated Computer Use Worker",
       approvedSkills: [],
       approvedApps: [],
       recentThreads: [],
+    });
+  }
+
+  async patchThreadComposer(
+    threadId: string,
+    userId: string,
+    patch: ComposerStatePatch,
+  ): Promise<ComposerState> {
+    const task = this.requireTask(threadId, userId);
+    if (patch.planMode) {
+      const capability = await this.readPlanCapabilityForUser(userId, task.accountId);
+      if (capability.availability !== "AVAILABLE") {
+        throw new PlanModeCapabilityChangedError();
+      }
+    }
+    return this.options.store.patchComposerState({
+      threadId,
+      ownerId: userId,
+      planMode: patch.planMode,
+      expectedRevision: patch.revision,
+      now: this.now(),
+    });
+  }
+
+  async createDraft(userId: string, input: { projectId: string }) {
+    return this.options.store.createDraft({
+      ownerId: userId,
+      projectId: input.projectId,
+      now: this.now(),
+      expiresAt: new Date(this.now().getTime() + 60 * 60_000),
+    });
+  }
+
+  async getDraft(
+    threadId: string,
+    userId: string,
+  ): Promise<{ id: string; projectId: string; lifecycleState: "DRAFT" } | null> {
+    const task = this.options.store.getTaskForUser(threadId, userId);
+    return task?.lifecycleState === "DRAFT"
+      ? { id: task.id, projectId: task.projectId, lifecycleState: "DRAFT" }
+      : null;
+  }
+
+  async getThreadComposer(threadId: string, userId: string): Promise<ComposerState | null> {
+    return this.options.store.getComposerState(threadId, userId);
+  }
+
+  async deleteDraft(threadId: string, userId: string): Promise<void> {
+    this.options.store.deleteDraft(threadId, userId, this.now());
+    await this.processAttachmentCleanupJobs(this.now());
+  }
+
+  async cleanupExpiredDrafts(now = this.now()): Promise<number> {
+    const expired = this.options.store.expireDrafts(now);
+    await this.processAttachmentCleanupJobs(now);
+    return expired.length;
+  }
+
+  async uploadAttachment(
+    threadId: string,
+    userId: string,
+    input: {
+      files: Array<{ name: string; relativePath: string; mimeType: string; content: Buffer }>;
+    },
+  ): Promise<BrowserDraftAttachment> {
+    const task = this.options.store.getTaskForUser(threadId, userId);
+    if (!task || task.lifecycleState === "EXPIRED") throw new Error("Thread not found");
+    if (task.archivedAt) throw new Error("Thread is archived");
+    if (input.files.length === 0) throw new Error("Missing attachment file");
+    if (input.files.length > MAX_FOLDER_FILES) throw new Error("Folder exceeds the 500 file limit");
+    const totalBytes = input.files.reduce((sum, file) => sum + file.content.byteLength, 0);
+    if (totalBytes > MAX_TURN_ATTACHMENT_BYTES) {
+      throw new Error("Attachments exceed the 200 MiB Turn limit");
+    }
+    const scanner = this.options.attachmentScanner ?? new BasicAttachmentScanner();
+    const scannedFiles = await Promise.all(
+      input.files.map(async (file) => {
+        const scan = await scanner.scan({
+          name: file.name,
+          relativePath: file.relativePath,
+          mimeType: file.mimeType,
+          sizeBytes: file.content.byteLength,
+          content: file.content,
+        });
+        if (scan.status !== "READY") throw new Error(scan.reason);
+        return { ...file, relativePath: scan.normalizedRelativePath };
+      }),
+    );
+    if (new Set(scannedFiles.map((file) => file.relativePath)).size !== scannedFiles.length) {
+      throw new Error("Duplicate attachment path");
+    }
+    const attachmentId = randomUUID();
+    const attachmentRoot = join(
+      this.options.dataDir,
+      "workspaces",
+      threadId,
+      ".codexplatform",
+      "attachments",
+      attachmentId,
+    );
+    let stagingPrepared = false;
+    const isFolder = scannedFiles.length > 1 || scannedFiles[0]?.relativePath.includes("/");
+    const commonRoot = commonAttachmentRoot(scannedFiles.map((file) => file.relativePath));
+    const relativePath = isFolder
+      ? join(".codexplatform", "attachments", attachmentId, ...(commonRoot ? [commonRoot] : []))
+      : join(
+          ".codexplatform",
+          "attachments",
+          attachmentId,
+          scannedFiles[0]?.relativePath as string,
+        );
+    try {
+      await prepareSafeAttachmentRoot(this.options.dataDir, threadId, attachmentId);
+      stagingPrepared = true;
+      for (const file of scannedFiles) {
+        await writeSafeAttachmentFile(attachmentRoot, file.relativePath, file.content);
+      }
+      const stored = this.options.store.createAttachment({
+        id: attachmentId,
+        threadId,
+        ownerId: userId,
+        kind: isFolder ? "FOLDER" : "FILE",
+        name: isFolder
+          ? (commonRoot ?? "attachments")
+          : basename(scannedFiles[0]?.relativePath as string),
+        relativePath,
+        mimeType: isFolder ? "application/x-directory" : (scannedFiles[0]?.mimeType as string),
+        sizeBytes: totalBytes,
+        fileCount: scannedFiles.length,
+        scanStatus: "READY",
+        now: this.now(),
+      });
+      return projectBrowserAttachment(stored);
+    } catch (error) {
+      if (stagingPrepared) {
+        await removeSafeAttachmentRoot(this.options.dataDir, threadId, attachmentId);
+      }
+      throw error;
+    }
+  }
+
+  async deleteAttachment(threadId: string, attachmentId: string, userId: string): Promise<void> {
+    this.options.store.deleteAttachment(attachmentId, threadId, userId, this.now());
+    await this.processAttachmentCleanupJobs(this.now());
+  }
+
+  async listAttachments(threadId: string, userId: string): Promise<BrowserDraftAttachment[]> {
+    return this.options.store
+      .listUnclaimedAttachments(threadId, userId)
+      .map(projectBrowserAttachment);
+  }
+
+  async getThreadGoal(threadId: string, userId: string): Promise<ThreadGoalView | null> {
+    return this.options.store.getThreadGoal(threadId, userId);
+  }
+
+  async putThreadGoal(
+    threadId: string,
+    userId: string,
+    input: ThreadGoalInput,
+  ): Promise<ThreadGoalView> {
+    return this.withGoalMutationLock(threadId, async () => {
+      const task = this.requireTask(threadId, userId);
+      await this.ensureGoalCapability(userId, task.accountId);
+      await this.interruptGoalMutationTurn(task);
+      const parsed = ThreadGoalInputSchema.parse(input);
+      const pending = this.options.store.putThreadGoal({
+        threadId,
+        ownerId: userId,
+        ...parsed,
+        now: this.now(),
+      });
+      return this.synchronizeStoredGoal(task, userId, pending);
+    });
+  }
+
+  async patchThreadGoal(
+    threadId: string,
+    userId: string,
+    patch: ThreadGoalPatch,
+  ): Promise<ThreadGoalView> {
+    return this.withGoalMutationLock(threadId, async () => {
+      const task = this.requireTask(threadId, userId);
+      await this.ensureGoalCapability(userId, task.accountId);
+      await this.interruptGoalMutationTurn(task);
+      const pending = this.options.store.patchThreadGoal({
+        threadId,
+        ownerId: userId,
+        patch: ThreadGoalPatchSchema.parse(patch),
+        now: this.now(),
+      });
+      return this.synchronizeStoredGoal(task, userId, pending);
+    });
+  }
+
+  async deleteThreadGoal(
+    threadId: string,
+    userId: string,
+  ): Promise<{ cleared: true; runtimeSyncState: "PENDING" | "SYNCED" }> {
+    return this.withGoalMutationLock(threadId, async () => {
+      const task = this.requireTask(threadId, userId);
+      const current = this.options.store.getThreadGoal(threadId, userId);
+      if (!current) throw new Error("Goal not found");
+      await this.ensureGoalCapability(userId, task.accountId);
+      await this.interruptGoalMutationTurn(task);
+      const deletion = this.options.store.deleteThreadGoalMutation(threadId, userId, this.now());
+      if (!deletion.deleted) throw new Error("Goal not found");
+      if (!task.threadId) {
+        this.options.store.finalizeThreadGoalDelete({
+          threadId,
+          ownerId: userId,
+          expectedRevision: deletion.revision,
+          runtimeSyncState: "PENDING",
+          now: this.now(),
+        });
+        return { cleared: true, runtimeSyncState: "PENDING" };
+      }
+      try {
+        const cleared = await this.options.execution.clearThreadGoal(task.threadId);
+        if (cleared.attachment === "DETACHED") {
+          this.options.store.finalizeThreadGoalDelete({
+            threadId,
+            ownerId: userId,
+            expectedRevision: deletion.revision,
+            runtimeSyncState: "PENDING",
+            now: this.now(),
+          });
+          return { cleared: true, runtimeSyncState: "PENDING" };
+        }
+        const verified = await this.options.execution.getThreadGoal(task.threadId);
+        if (verified.attachment !== "ATTACHED" || verified.goal !== null) {
+          throw new Error("Runtime Goal remained present after clear");
+        }
+        this.options.store.finalizeThreadGoalDelete({
+          threadId,
+          ownerId: userId,
+          expectedRevision: deletion.revision,
+          runtimeSyncState: "SYNCED",
+          now: this.now(),
+        });
+        return { cleared: true, runtimeSyncState: "SYNCED" };
+      } catch (error) {
+        this.options.store.markThreadGoalRecovery(threadId, userId, this.now());
+        throw error;
+      }
     });
   }
 
@@ -410,7 +776,7 @@ export class LocalPlatformService implements PlatformApi {
 
   async getTask(taskId: string, userId: string): Promise<TaskDetail | null> {
     const task = this.options.store.getTaskForUser(taskId, userId);
-    if (!task) return null;
+    if (task?.lifecycleState !== "ACTIVE") return null;
     const queued = this.options.leases.getQueueEntry(taskId, userId);
     return {
       ...toTaskSummary(task),
@@ -477,7 +843,7 @@ export class LocalPlatformService implements PlatformApi {
 
   async getThread(threadId: string, userId: string): Promise<Thread | null> {
     const task = this.options.store.getTaskForUser(threadId, userId);
-    return task ? this.projectThread(task, userId) : null;
+    return task?.lifecycleState === "ACTIVE" ? this.projectThread(task, userId) : null;
   }
 
   async getAdminThread(threadId: string, adminUserId: string): Promise<Thread | null> {
@@ -488,7 +854,7 @@ export class LocalPlatformService implements PlatformApi {
     const owner = this.options.store.getUserIdentity(ownerId);
     if (owner.tenantKey !== admin.tenantKey) return null;
     const task = this.options.store.getTaskForUser(threadId, ownerId);
-    return task ? this.projectThread(task, ownerId) : null;
+    return task?.lifecycleState === "ACTIVE" ? this.projectThread(task, ownerId) : null;
   }
 
   async startThreadTurn(
@@ -496,12 +862,18 @@ export class LocalPlatformService implements PlatformApi {
     userId: string,
     prompt: string,
     config?: EffectiveConfigOverride,
+    attachmentIds: string[] = [],
   ) {
-    return this.startTurn(threadId, userId, prompt, config);
+    return this.startTurn(threadId, userId, prompt, config, attachmentIds);
   }
 
-  async steerThread(threadId: string, userId: string, prompt: string) {
-    return this.steerTask(threadId, userId, prompt);
+  async steerThread(
+    threadId: string,
+    userId: string,
+    prompt: string,
+    attachmentIds: string[] = [],
+  ) {
+    return this.steerTask(threadId, userId, prompt, attachmentIds);
   }
 
   async interruptThread(threadId: string, userId: string) {
@@ -571,6 +943,7 @@ export class LocalPlatformService implements PlatformApi {
     userId: string,
     prompt: string,
     turnConfig?: EffectiveConfigOverride,
+    attachmentIds: string[] = [],
   ) {
     const task = this.requireTask(taskId, userId);
     if (task.threadId && !task.accountId) {
@@ -602,6 +975,7 @@ export class LocalPlatformService implements PlatformApi {
       prompt,
       status: "ALLOCATING",
       configSnapshot,
+      attachmentIds,
       now: this.now(),
     });
     const allocation = this.options.leases.acquireTurn({
@@ -638,7 +1012,7 @@ export class LocalPlatformService implements PlatformApi {
     return this.startAllocatedTurn(allocation);
   }
 
-  async steerTask(taskId: string, userId: string, prompt: string) {
+  async steerTask(taskId: string, userId: string, prompt: string, attachmentIds: string[] = []) {
     const task = this.requireTask(taskId, userId);
     if (task.status !== "RUNNING" && task.status !== "WAITING_APPROVAL") {
       throw new Error(`Task status ${task.status} does not accept Steer`);
@@ -649,7 +1023,71 @@ export class LocalPlatformService implements PlatformApi {
       task.currentTurnId,
     );
     if (!platformTurnId) throw new Error("Active Turn projection is unavailable");
-    await this.options.execution.steerTask(task.threadId, task.currentTurnId, prompt);
+    const steerInputId = randomUUID();
+    const inputSnapshot = this.options.store.claimSteerInput({
+      id: steerInputId,
+      taskId,
+      turnId: platformTurnId,
+      ownerId: userId,
+      prompt,
+      attachmentIds,
+      now: this.now(),
+    });
+    const attachments = inputSnapshot.attachments.map((attachment) => ({
+      name: attachment.name,
+      path: join(this.options.dataDir, "workspaces", taskId, attachment.relativePath),
+      mimeType: attachment.mimeType,
+    }));
+    try {
+      if (attachments.length > 0) {
+        await this.options.execution.steerTask(
+          task.threadId,
+          task.currentTurnId,
+          prompt,
+          attachments,
+        );
+      } else {
+        await this.options.execution.steerTask(task.threadId, task.currentTurnId, prompt);
+      }
+    } catch (error) {
+      try {
+        const occurredAt = this.now();
+        const message = error instanceof Error ? error.message : "Runtime Steer failed";
+        if (error instanceof RpcError) {
+          this.options.store.failSteerInputDelivery(steerInputId, message, occurredAt);
+        } else {
+          this.options.store.markSteerInputDeliveryUnknown(steerInputId, message, occurredAt);
+          const recoveryReason =
+            "Steer delivery outcome is unknown after a Runtime transport failure; explicit Turn recovery is required.";
+          this.options.store.markTurnApprovalsForRecovery(taskId, task.currentTurnId);
+          this.finishSchedulerTurn(platformTurnId, "NEEDS_RECOVERY", occurredAt);
+          const schedulerKey = runtimeTurnKey(taskId, task.currentTurnId);
+          if (schedulerKey) this.schedulerTurnByRuntimeTurn.delete(schedulerKey);
+          this.options.store.setTaskInactiveIfCurrent(
+            taskId,
+            task.currentTurnId,
+            "NEEDS_RECOVERY",
+            occurredAt,
+          );
+          const recoveryEvent = this.options.store.appendTaskEvent({
+            taskId,
+            threadId: task.threadId,
+            turnId: platformTurnId,
+            type: "RECOVERY_REQUIRED",
+            payload: { reason: recoveryReason },
+            now: occurredAt,
+          });
+          this.publish(recoveryEvent);
+        }
+      } catch (compensationError) {
+        throw new AggregateError(
+          [error, compensationError],
+          "Runtime Steer failed and attachment compensation failed",
+        );
+      }
+      throw error;
+    }
+    this.options.store.completeSteerInputDelivery(steerInputId, this.now());
     const event = this.options.store.appendTaskEvent({
       taskId,
       threadId: task.threadId,
@@ -937,10 +1375,21 @@ export class LocalPlatformService implements PlatformApi {
           }
         : null,
       items: events.map((event) => eventToThreadItem(task.id, event)),
+      composerState: {
+        planMode: task.planMode,
+        revision: task.composerRevision,
+      },
     };
   }
 
   async runMaintenance(now = this.now()): Promise<void> {
+    await this.cleanupExpiredDrafts(now);
+    const limitedGoals = this.options.store.applyGoalWatchdog(now);
+    await Promise.all(
+      limitedGoals.map(({ ownerId, goal }) =>
+        this.enforceGoalBudgetLimit(goal.threadId, ownerId, goal).catch(() => undefined),
+      ),
+    );
     this.recoverExpiredModelCatalogCooldowns(now);
     for (const schedulerTurnId of this.schedulerTurnByRuntimeTurn.values()) {
       this.options.leases.heartbeatTurn(schedulerTurnId, now);
@@ -970,6 +1419,20 @@ export class LocalPlatformService implements PlatformApi {
       "The API process restarted; resume must occur at a Turn boundary.",
       now,
     );
+    for (const goal of this.options.store.recoverPersistedRuntimeGoals(now)) {
+      const event = this.options.store.appendTaskEvent({
+        taskId: goal.taskId,
+        threadId: goal.runtimeThreadId,
+        turnId: null,
+        type: "RECOVERY_REQUIRED",
+        payload: {
+          reason:
+            "The API process restarted while a Runtime Goal remained unfinished; explicit recovery is required.",
+        },
+        now,
+      });
+      this.publish(event);
+    }
     return interrupted.size;
   }
 
@@ -1131,6 +1594,23 @@ export class LocalPlatformService implements PlatformApi {
     });
   }
 
+  private async validateAllocatedCollaborationPreset(
+    account: InternalAccount,
+    model: string,
+    reasoningEffort: string,
+  ): Promise<void> {
+    const catalog = await this.readAccountModelCatalog(account, {
+      allowStale: false,
+      forceRefresh: true,
+    });
+    try {
+      validateModelAgainstCatalog(catalog.models, model, reasoningEffort);
+      validateModelAgainstOrganizationPolicy(model, reasoningEffort);
+    } catch {
+      throw new PlanPresetModelUnavailableError();
+    }
+  }
+
   private validateSettingsPatch(patch: UserSettingsPatch): void {
     const execution = patch.execution;
     if (!execution) return;
@@ -1215,13 +1695,46 @@ export class LocalPlatformService implements PlatformApi {
     });
   }
 
-  private actorContextFor(userId: string): ActorContext {
+  private actorContextFor(
+    userId: string,
+    effectiveConfig: EffectiveThreadConfigSnapshot,
+  ): ActorContext {
     const identity = this.options.store.getUserIdentity(userId);
     return {
       ...identity,
       toolScopes: [...ORGANIZATION_TOOL_SCOPES],
-      approvalPolicy: "ASK",
+      approvalPolicy:
+        effectiveConfig.permissionMode === "APPROVE_FOR_ME" ||
+        effectiveConfig.permissionMode === "FULL_ACCESS"
+          ? "AUTO"
+          : "ASK",
     };
+  }
+
+  private async processAttachmentCleanupJobs(now: Date): Promise<void> {
+    const jobs = this.options.store.listAttachmentCleanupJobs();
+    await Promise.all(jobs.map((job) => this.processAttachmentCleanupJob(job, now)));
+  }
+
+  private async processAttachmentCleanupJob(job: AttachmentCleanupJob, now: Date): Promise<void> {
+    try {
+      const segments = job.relativePath.split("/");
+      if (
+        segments[0] !== ".codexplatform" ||
+        segments[1] !== "attachments" ||
+        segments[2] !== job.attachmentId
+      ) {
+        throw new Error("Invalid attachment staging reference");
+      }
+      await removeSafeAttachmentRoot(this.options.dataDir, job.threadId, job.attachmentId);
+      this.options.store.completeAttachmentCleanupJob(job.id);
+    } catch (error) {
+      this.options.store.failAttachmentCleanupJob(
+        job.id,
+        error instanceof Error ? error.message : "Attachment cleanup failed",
+        now,
+      );
+    }
   }
 
   private requireTask(taskId: string, userId: string) {
@@ -1229,6 +1742,187 @@ export class LocalPlatformService implements PlatformApi {
     if (!task) throw new Error("Task not found");
     if (task.archivedAt) throw new Error("Thread is archived");
     return task;
+  }
+
+  private async readGoalCapabilityForUser(
+    userId: string,
+    requiredAccountId: string | null,
+  ): Promise<GoalRuntimeCapability> {
+    this.options.store.getUserIdentity(userId);
+    const accountIds = this.options.leases.listModelRoutingAccountIdsForUser(
+      userId,
+      this.now(),
+      requiredAccountId,
+    );
+    if (accountIds.length === 0) {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "NO_ROUTABLE_CODEX_ACCOUNT",
+        reason: "No routable Codex account can provide the locked Goal protocol",
+      };
+    }
+    for (const accountId of accountIds) {
+      const account = this.options.accounts.getInternal(accountId);
+      if (!account) {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "CODEX_ACCOUNT_UNAVAILABLE",
+          reason: `Codex account ${accountId} is unavailable`,
+        };
+      }
+      const capability = await this.options.execution.readGoalCapability(account);
+      if (capability.availability !== "AVAILABLE") return capability;
+    }
+    return { availability: "AVAILABLE", reasonCode: null, reason: null };
+  }
+
+  private async readPlanCapabilityForUser(
+    userId: string,
+    requiredAccountId: string | null,
+  ): Promise<PlanModeCatalogCapability> {
+    this.options.store.getUserIdentity(userId);
+    const accountIds = this.options.leases.listAssignableAccountIdsForUser(
+      userId,
+      this.now(),
+      requiredAccountId,
+    );
+    if (accountIds.length === 0) {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "NO_ROUTABLE_CODEX_ACCOUNT",
+        reason: "No routable Codex account can provide Plan mode",
+        presets: [],
+      };
+    }
+    let representative: CollaborationModePreset[] | null = null;
+    for (const accountId of accountIds) {
+      const account = this.options.accounts.getInternal(accountId);
+      if (!account) {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "CODEX_ACCOUNT_UNAVAILABLE",
+          reason: `Codex account ${accountId} is unavailable`,
+          presets: [],
+        };
+      }
+      const capability = await this.options.execution.readPlanModeCatalog(account);
+      if (capability.availability !== "AVAILABLE") return capability;
+      if (
+        !capability.presets.some((preset) => preset.mode === "plan") ||
+        !capability.presets.some((preset) => preset.mode === "default")
+      ) {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "PLAN_PRESET_MISSING",
+          reason: "Runtime must expose both plan and default collaboration presets",
+          presets: [],
+        };
+      }
+      representative ??= capability.presets.map(cloneCollaborationPreset);
+    }
+    return {
+      availability: "AVAILABLE",
+      reasonCode: null,
+      reason: null,
+      presets: representative ?? [],
+    };
+  }
+
+  private async ensureGoalCapability(
+    userId: string,
+    requiredAccountId: string | null,
+  ): Promise<void> {
+    const capability = await this.readGoalCapabilityForUser(userId, requiredAccountId);
+    if (capability.availability !== "AVAILABLE") {
+      const reasonCode = capability.reasonCode ?? "GOAL_CAPABILITY_UNKNOWN";
+      throw new GoalCapabilityUnavailableError(
+        reasonCode,
+        capability.reason ?? "Goal is unavailable",
+        deterministicGoalCapabilityConflict(reasonCode) ? 409 : 503,
+      );
+    }
+  }
+
+  private async withGoalMutationLock<T>(threadId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.goalMutationTailByThread.get(threadId) ?? Promise.resolve();
+    let release: () => void = () => undefined;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.goalMutationTailByThread.set(threadId, tail);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.goalMutationTailByThread.get(threadId) === tail) {
+        this.goalMutationTailByThread.delete(threadId);
+      }
+    }
+  }
+
+  private async interruptGoalMutationTurn(task: TaskRecord): Promise<void> {
+    const active = this.options.store.getActiveTurnForTask(task.id, task.ownerId);
+    if (!active) return;
+    if (active.status === "ALLOCATING" || active.status === "QUEUED") {
+      throw new GoalMutationBlockedByPendingTurnError(active.status);
+    }
+    if (!task.threadId || !task.currentTurnId) return;
+    await this.options.execution.interruptTask(task.threadId, task.currentTurnId);
+  }
+
+  private async synchronizeStoredGoal(
+    task: TaskRecord,
+    ownerId: string,
+    pending: StoredThreadGoalView,
+  ): Promise<ThreadGoalView> {
+    if (!task.threadId) return publicThreadGoal(pending);
+    try {
+      const synced = await this.options.execution.syncThreadGoal(task.threadId, pending);
+      if (synced.attachment === "DETACHED") return publicThreadGoal(pending);
+      if (!synced.goal) throw new Error("Runtime Goal synchronization returned no Goal");
+      return publicThreadGoal(
+        this.options.store.syncThreadGoal({
+          threadId: task.id,
+          ownerId,
+          runtimeThreadId: task.threadId,
+          status: synced.goal.status,
+          tokensUsed: synced.goal.tokensUsed,
+          timeUsedSeconds: synced.goal.timeUsedSeconds,
+          expectedRevision: pending.revision,
+          ...(synced.runtimeUpdatedAt === null
+            ? {}
+            : { runtimeUpdatedAt: synced.runtimeUpdatedAt }),
+          source: "COMMAND",
+          now: this.now(),
+        }),
+      );
+    } catch (error) {
+      this.options.store.markThreadGoalRecovery(task.id, ownerId, this.now());
+      throw error;
+    }
+  }
+
+  private async enforceGoalBudgetLimit(
+    taskId: string,
+    ownerId: string,
+    limitedGoal: StoredThreadGoalView,
+  ): Promise<void> {
+    await this.withGoalMutationLock(taskId, async () => {
+      const task = this.options.store.getTaskForUser(taskId, ownerId);
+      if (!task) return;
+      try {
+        const active = this.options.store.getActiveTurnForTask(taskId, ownerId);
+        if (active && task.threadId && task.currentTurnId) {
+          await this.options.execution.interruptTask(task.threadId, task.currentTurnId);
+        }
+        await this.synchronizeStoredGoal(task, ownerId, limitedGoal);
+      } catch (error) {
+        this.options.store.markThreadGoalRecovery(taskId, ownerId, this.now());
+        throw error;
+      }
+    });
   }
 
   private receiveTaskEvent(draft: TaskEventDraft): void {
@@ -1291,13 +1985,20 @@ export class LocalPlatformService implements PlatformApi {
       }
       return;
     }
-    const schedulerKey = runtimeTurnKey(draft.taskId, draft.turnId);
+    const implicitActiveTurn =
+      !draft.turnId && ownerId
+        ? this.options.store.getActiveTurnForTask(draft.taskId, ownerId)
+        : null;
+    const runtimeTurnId = draft.turnId ?? implicitActiveTurn?.codexTurnId ?? null;
+    const schedulerKey = runtimeTurnKey(draft.taskId, runtimeTurnId);
     const schedulerTurnId = schedulerKey
       ? this.schedulerTurnByRuntimeTurn.get(schedulerKey)
       : undefined;
     const platformTurnId =
       schedulerTurnId ??
-      this.options.store.findPlatformTurnIdForRuntimeTurn(draft.taskId, draft.turnId);
+      this.options.store.findPlatformTurnIdForRuntimeTurn(draft.taskId, runtimeTurnId) ??
+      implicitActiveTurn?.id ??
+      null;
     if (schedulerTurnId) this.options.leases.heartbeatTurn(schedulerTurnId, occurredAt);
     if (draft.type === "TOKEN_USAGE_UPDATED" && ownerId && draft.threadId) {
       const payload = draft.payload as TaskEventPayloadMap["TOKEN_USAGE_UPDATED"];
@@ -1305,10 +2006,21 @@ export class LocalPlatformService implements PlatformApi {
         taskId: draft.taskId,
         ownerId,
         runtimeThreadId: draft.threadId,
-        turnId: draft.turnId,
+        turnId: runtimeTurnId,
         ...payload,
         now: occurredAt,
       });
+      const goalUpdate = this.options.store.updateThreadGoalTokens(
+        draft.taskId,
+        ownerId,
+        payload.total.totalTokens,
+        occurredAt,
+      );
+      if (goalUpdate?.triggered) {
+        void this.enforceGoalBudgetLimit(draft.taskId, ownerId, goalUpdate.goal).catch(
+          () => undefined,
+        );
+      }
     }
     const event = this.options.store.appendTaskEvent({
       taskId: draft.taskId,
@@ -1325,7 +2037,7 @@ export class LocalPlatformService implements PlatformApi {
           threadId: payload.agentThreadId,
           parentTaskId: draft.taskId,
           parentRuntimeThreadId: draft.threadId,
-          parentTurnId: draft.turnId,
+          parentTurnId: runtimeTurnId,
           ownerId,
           sessionId: null,
           name: payload.name ?? payload.agentThreadId,
@@ -1343,17 +2055,19 @@ export class LocalPlatformService implements PlatformApi {
       draft.type as keyof typeof TERMINAL_STATUS_BY_EVENT
     ] as "COMPLETED" | "FAILED" | "INTERRUPTED" | undefined;
     if (terminalStatus) {
-      if (draft.turnId) {
-        this.options.store.markTurnApprovalsForRecovery(draft.taskId, draft.turnId);
+      if (runtimeTurnId) {
+        this.options.store.markTurnApprovalsForRecovery(draft.taskId, runtimeTurnId);
       }
       if (schedulerTurnId) {
         this.finishSchedulerTurn(schedulerTurnId, terminalStatus, occurredAt);
+      } else if (implicitActiveTurn) {
+        this.finishSchedulerTurn(implicitActiveTurn.id, terminalStatus, occurredAt);
       }
       if (schedulerKey) this.schedulerTurnByRuntimeTurn.delete(schedulerKey);
-      if (draft.turnId) {
+      if (runtimeTurnId) {
         this.options.store.setTaskInactiveIfCurrent(
           draft.taskId,
-          draft.turnId,
+          runtimeTurnId,
           terminalStatus,
           occurredAt,
         );
@@ -1361,17 +2075,17 @@ export class LocalPlatformService implements PlatformApi {
       return;
     }
     if (draft.type === "RECOVERY_REQUIRED") {
-      if (draft.turnId) {
-        this.options.store.markTurnApprovalsForRecovery(draft.taskId, draft.turnId);
+      if (runtimeTurnId) {
+        this.options.store.markTurnApprovalsForRecovery(draft.taskId, runtimeTurnId);
       }
       if (platformTurnId) {
         this.finishSchedulerTurn(platformTurnId, "NEEDS_RECOVERY", occurredAt);
       }
       if (schedulerKey) this.schedulerTurnByRuntimeTurn.delete(schedulerKey);
-      if (draft.turnId) {
+      if (runtimeTurnId) {
         this.options.store.setTaskInactiveIfCurrent(
           draft.taskId,
-          draft.turnId,
+          runtimeTurnId,
           "NEEDS_RECOVERY",
           occurredAt,
         );
@@ -1405,6 +2119,10 @@ export class LocalPlatformService implements PlatformApi {
         if (schedulerKey) this.schedulerTurnByRuntimeTurn.delete(schedulerKey);
         const task = this.options.store.getTaskForUser(turn.taskId, turn.ownerId);
         if (!task) continue;
+        const goal = this.options.store.getThreadGoal(turn.taskId, turn.ownerId);
+        if (goal && (goal.status === "ACTIVE" || goal.status === "PAUSED")) {
+          this.options.store.markThreadGoalRecovery(turn.taskId, turn.ownerId, now);
+        }
         const sourceRuntimeTurnId =
           source?.sourceTaskId === turn.taskId
             ? source.sourceRuntimeTurnId
@@ -1566,8 +2284,43 @@ export class LocalPlatformService implements PlatformApi {
       if (!this.isAccountModelRoutingEligible(queuedTurn.ownerId, account.id)) {
         throw new AllocatedAccountIneligibleError();
       }
-      if (effectiveConfig.model !== queuedTurn.configSnapshot.model) {
-        this.options.store.updateTurnConfigSnapshot(allocation.turnId, effectiveConfig);
+      const turnInput = this.options.store.getTurnInputSnapshot(allocation.turnId);
+      if (!turnInput) throw new Error("Turn input snapshot is unavailable");
+      const planCapability = await this.options.execution.readPlanModeCatalog(account, {
+        model: effectiveConfig.model,
+        reasoningEffort: effectiveConfig.reasoningEffort,
+      });
+      if (planCapability.availability !== "AVAILABLE") {
+        throw new PlanModeCapabilityChangedError();
+      }
+      const targetMode = turnInput.planMode ? "plan" : "default";
+      const preset = planCapability.presets.find((candidate) => candidate.mode === targetMode);
+      if (!preset) {
+        throw new PlanModeCapabilityChangedError();
+      }
+      const requestedConfig = {
+        model: effectiveConfig.model,
+        reasoningEffort: effectiveConfig.reasoningEffort.toLowerCase(),
+        instructions: effectiveConfig.instructions,
+      };
+      const actualConfig = EffectiveThreadConfigSnapshotSchema.parse({
+        ...effectiveConfig,
+        model: preset.settings.model,
+        reasoningEffort:
+          preset.settings.reasoningEffort ?? effectiveConfig.reasoningEffort.toLowerCase(),
+        requestedConfig,
+        collaborationPreset: cloneCollaborationPreset(preset),
+      });
+      await this.validateAllocatedCollaborationPreset(
+        account,
+        actualConfig.model as string,
+        actualConfig.reasoningEffort,
+      );
+      effectiveConfig = actualConfig;
+      await mkdir(cwd, { recursive: true, mode: 0o700 });
+      this.options.store.updateTurnConfigSnapshot(allocation.turnId, effectiveConfig);
+      if (!this.isAccountModelRoutingEligible(queuedTurn.ownerId, account.id)) {
+        throw new AllocatedAccountIneligibleError();
       }
     } catch (error) {
       const accountBecameIneligible =
@@ -1579,13 +2332,11 @@ export class LocalPlatformService implements PlatformApi {
       this.pendingStartSignalsByTask.delete(queuedTurn.taskId);
       this.rejectAllocatedTurnBeforeRuntime(
         allocation,
-        accountBecameIneligible
-          ? "The allocated Codex account became unavailable before execution."
-          : error instanceof ModelCatalogUnavailableError
-            ? "Runtime model catalog became unavailable before execution."
-            : "The selected model or Effort became unavailable before execution.",
+        preRuntimeFailure(error, accountBecameIneligible),
       );
       if (error instanceof ModelCatalogUnavailableError && !accountBecameIneligible) throw error;
+      if (error instanceof PlanModeCapabilityChangedError) throw error;
+      if (error instanceof PlanPresetModelUnavailableError) throw error;
       throw new AllocatedModelSelectionChangedError(
         accountBecameIneligible
           ? "Allocated Codex account became unavailable; submit the Turn again"
@@ -1594,7 +2345,6 @@ export class LocalPlatformService implements PlatformApi {
     }
 
     try {
-      await mkdir(cwd, { recursive: true, mode: 0o700 });
       const started = await this.options.execution.startTask({
         accountId: account.id,
         codexHome: account.codexHome,
@@ -1604,20 +2354,45 @@ export class LocalPlatformService implements PlatformApi {
         prompt: queuedTurn.prompt,
         existingThreadId: task.threadId,
         effectiveConfig,
-        actorContext: this.actorContextFor(queuedTurn.ownerId),
+        actorContext: this.actorContextFor(queuedTurn.ownerId, effectiveConfig),
+        goal: this.options.store.getTurnInputSnapshot(allocation.turnId)?.goal ?? null,
+        onThreadPrepared: (threadId) => {
+          this.options.store.bindTaskRuntime(queuedTurn.taskId, {
+            accountId: account.id,
+            accountAlias: account.alias,
+            leaseId: allocation.leaseId,
+            threadId,
+            now: this.now(),
+          });
+        },
+        attachments:
+          this.options.store
+            .getTurnInputSnapshot(allocation.turnId)
+            ?.attachments.map((attachment) => ({
+              name: attachment.name,
+              path: join(cwd, attachment.relativePath),
+              mimeType: attachment.mimeType,
+            })) ?? [],
       });
       this.schedulerTurnByRuntimeTurn.set(
         runtimeTurnKey(queuedTurn.taskId, started.turnId) as string,
         allocation.turnId,
       );
       this.options.store.bindTurnRuntime(allocation.turnId, started.turnId, this.now());
-      this.options.store.bindTaskRuntime(queuedTurn.taskId, {
-        accountId: account.id,
-        accountAlias: account.alias,
-        leaseId: allocation.leaseId,
-        threadId: started.threadId,
-        now: this.now(),
-      });
+      const preparedTask = this.options.store.getTaskForUser(queuedTurn.taskId, queuedTurn.ownerId);
+      if (
+        preparedTask?.threadId !== started.threadId ||
+        preparedTask.accountId !== account.id ||
+        preparedTask.leaseId !== allocation.leaseId
+      ) {
+        this.options.store.bindTaskRuntime(queuedTurn.taskId, {
+          accountId: account.id,
+          accountAlias: account.alias,
+          leaseId: allocation.leaseId,
+          threadId: started.threadId,
+          now: this.now(),
+        });
+      }
       this.options.store.setCurrentTurn(queuedTurn.taskId, started.turnId, "RUNNING", this.now());
       const event = this.options.store.appendTaskEvent({
         taskId: queuedTurn.taskId,
@@ -1646,6 +2421,17 @@ export class LocalPlatformService implements PlatformApi {
       if (error instanceof ThreadResumeSafetyError) {
         this.options.accounts.setState(account.id, "QUARANTINED");
       }
+      const preparedTask = this.options.store.getTaskForUser(queuedTurn.taskId, queuedTurn.ownerId);
+      if (
+        preparedTask?.threadId &&
+        this.options.store.getThreadGoal(queuedTurn.taskId, queuedTurn.ownerId)
+      ) {
+        this.options.store.markThreadGoalRecovery(
+          queuedTurn.taskId,
+          queuedTurn.ownerId,
+          this.now(),
+        );
+      }
       const persisted = this.options.store.getTurn(allocation.turnId);
       if (persisted?.status !== "NEEDS_RECOVERY") {
         this.failAllocatedTurn(
@@ -1657,7 +2443,10 @@ export class LocalPlatformService implements PlatformApi {
     }
   }
 
-  private rejectAllocatedTurnBeforeRuntime(allocation: LeasedTurn, message: string): void {
+  private rejectAllocatedTurnBeforeRuntime(
+    allocation: LeasedTurn,
+    failure: PreRuntimeFailure,
+  ): void {
     const failedAt = this.now();
     const turn = this.options.store.getTurn(allocation.turnId);
     if (turn) {
@@ -1669,7 +2458,11 @@ export class LocalPlatformService implements PlatformApi {
         threadId: this.options.store.getTaskForUser(turn.taskId, turn.ownerId)?.threadId ?? null,
         turnId: allocation.turnId,
         type: "TURN_FAILED",
-        payload: { status: "failed", error: message },
+        payload: {
+          status: "failed",
+          code: failure.code,
+          error: failure.publicMessage,
+        },
         now: failedAt,
       });
       this.publish(event);
@@ -1849,6 +2642,47 @@ function validateModelAgainstCatalog(
   }
 }
 
+function preRuntimeFailure(error: unknown, accountBecameIneligible: boolean): PreRuntimeFailure {
+  if (accountBecameIneligible) {
+    return {
+      code: "ALLOCATED_ACCOUNT_INELIGIBLE",
+      publicMessage: "The allocated Codex account became unavailable before execution.",
+    };
+  }
+  if (error instanceof PlanModeCapabilityChangedError) {
+    return { code: error.code, publicMessage: error.message };
+  }
+  if (error instanceof PlanPresetModelUnavailableError) {
+    return { code: error.code, publicMessage: error.message };
+  }
+  if (error instanceof ModelCatalogUnavailableError) {
+    return {
+      code: "MODEL_CATALOG_UNAVAILABLE",
+      publicMessage: "Runtime model catalog became unavailable before execution.",
+    };
+  }
+  return {
+    code: "ALLOCATED_MODEL_SELECTION_CHANGED",
+    publicMessage: "The selected model or Effort became unavailable before execution.",
+  };
+}
+
+function validateModelAgainstOrganizationPolicy(model: string, reasoningEffort: string): void {
+  if (
+    SETTINGS_POLICY.allowedModels &&
+    !(SETTINGS_POLICY.allowedModels as readonly string[]).includes(model)
+  ) {
+    throw new Error("Model is not allowed by organization policy");
+  }
+  if (
+    !SETTINGS_POLICY.allowedReasoningEfforts.some(
+      (allowed) => allowed.toLowerCase() === reasoningEffort.toLowerCase(),
+    )
+  ) {
+    throw new Error("Reasoning effort is not allowed by organization policy");
+  }
+}
+
 const SETTINGS_POLICY = {
   // Model choices are runtime-owned and returned by GET /api/models, so this
   // organization-policy field stays null instead of duplicating that catalog.
@@ -1879,9 +2713,19 @@ const ORGANIZATION_DEFAULT_CONFIG: EffectiveConfigOverride = {
 const ORGANIZATION_TOOL_SCOPES = [
   "feishu_wiki_search",
   "feishu_doc_read",
+  "feishu_doc_create",
+  "feishu_doc_update",
   "demo_db_query",
   "demo_business_get",
 ] as const;
+
+function cloneCollaborationPreset(preset: CollaborationModePreset): CollaborationModePreset {
+  return {
+    name: preset.name,
+    mode: preset.mode,
+    settings: { ...preset.settings },
+  };
+}
 
 function withSettingsPolicy(settings: UserSettings): UserSettingsView {
   return {
@@ -1935,6 +2779,129 @@ function runtimeTurnKey(taskId: string, turnId: string | null): string | null {
   return turnId ? `${taskId}:${turnId}` : null;
 }
 
+function commonAttachmentRoot(paths: string[]): string | null {
+  const roots = paths.map((path) => path.split("/")[0]).filter(Boolean);
+  return roots.length > 0 && roots.every((root) => root === roots[0]) ? (roots[0] ?? null) : null;
+}
+
+async function prepareSafeAttachmentRoot(
+  dataDir: string,
+  threadId: string,
+  attachmentId: string,
+): Promise<void> {
+  const dataRoot = resolve(dataDir);
+  await mkdir(dataRoot, { recursive: true, mode: 0o700 });
+  const dataRootReal = await realpath(dataRoot);
+  const ancestry = attachmentAncestry(dataRoot, threadId, attachmentId);
+  for (const directory of ancestry) {
+    await createDirectoryWithoutSymlink(directory);
+    assertContainedPath(dataRootReal, await realpath(directory));
+  }
+}
+
+async function writeSafeAttachmentFile(
+  attachmentRoot: string,
+  relativePath: string,
+  content: Buffer,
+): Promise<void> {
+  const rootReal = await realpath(attachmentRoot);
+  const segments = relativePath.split("/");
+  const fileName = segments.pop();
+  if (!fileName) throw new Error("Unsafe attachment staging path");
+
+  let parent = attachmentRoot;
+  let parentReal = rootReal;
+  for (const segment of segments) {
+    parent = join(parent, segment);
+    await createDirectoryWithoutSymlink(parent);
+    parentReal = await realpath(parent);
+    assertContainedPath(rootReal, parentReal);
+  }
+
+  const target = join(parentReal, fileName);
+  assertContainedPath(rootReal, target);
+  try {
+    await lstat(target);
+    throw new Error("Unsafe attachment staging path");
+  } catch (error) {
+    if (!isFileSystemError(error, "ENOENT")) throw error;
+  }
+
+  const noFollow = "O_NOFOLLOW" in fsConstants ? fsConstants.O_NOFOLLOW : 0;
+  const handle = await open(
+    target,
+    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | noFollow,
+    0o600,
+  );
+  try {
+    await handle.writeFile(content);
+    await handle.chmod(0o600);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function createDirectoryWithoutSymlink(path: string): Promise<void> {
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (error) {
+    if (!isFileSystemError(error, "EEXIST")) throw error;
+  }
+  const stat = await lstat(path);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error("Unsafe attachment staging path");
+  }
+}
+
+async function removeSafeAttachmentRoot(
+  dataDir: string,
+  threadId: string,
+  attachmentId: string,
+): Promise<void> {
+  const dataRoot = resolve(dataDir);
+  let dataRootReal: string;
+  try {
+    dataRootReal = await realpath(dataRoot);
+  } catch (error) {
+    if (isFileSystemError(error, "ENOENT")) return;
+    throw error;
+  }
+
+  const ancestry = attachmentAncestry(dataRoot, threadId, attachmentId);
+  for (const path of ancestry) {
+    let stat: Awaited<ReturnType<typeof lstat>>;
+    try {
+      stat = await lstat(path);
+    } catch (error) {
+      if (isFileSystemError(error, "ENOENT")) return;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error("Unsafe attachment staging path");
+    }
+    assertContainedPath(dataRootReal, await realpath(path));
+  }
+  await rm(ancestry.at(-1) as string, { recursive: true, force: true });
+}
+
+function attachmentAncestry(dataRoot: string, threadId: string, attachmentId: string): string[] {
+  const workspaces = join(dataRoot, "workspaces");
+  const workspace = join(workspaces, threadId);
+  const privateRoot = join(workspace, ".codexplatform");
+  const attachments = join(privateRoot, "attachments");
+  return [workspaces, workspace, privateRoot, attachments, join(attachments, attachmentId)];
+}
+
+function assertContainedPath(base: string, candidate: string): void {
+  const child = relative(base, candidate);
+  if (child === "" || (!child.startsWith("..") && !isAbsolute(child))) return;
+  throw new Error("Unsafe attachment staging path");
+}
+
+function isFileSystemError(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error && error.code === code;
+}
+
 function projectTurn(threadId: string, turn: TurnRecord): Thread["turns"][number] {
   return {
     id: turn.id,
@@ -1953,6 +2920,24 @@ function projectTurn(threadId: string, turn: TurnRecord): Thread["turns"][number
 
 function joinInstructions(required: string, personal: string): string {
   return personal.length > 0 ? `${required}\n\n${personal}` : required;
+}
+
+function deterministicGoalCapabilityConflict(reasonCode: string): boolean {
+  return [
+    "RUNTIME_VERSION_UNSUPPORTED",
+    "RUNTIME_GOAL_METHOD_UNSUPPORTED",
+    "RUNTIME_GOAL_STATUS_UNSUPPORTED",
+  ].includes(reasonCode);
+}
+
+function publicThreadGoal(goal: StoredThreadGoalView): ThreadGoalView {
+  const { revision: _revision, ...view } = goal;
+  return ThreadGoalViewSchema.parse(view);
+}
+
+function projectBrowserAttachment(attachment: DraftAttachment): BrowserDraftAttachment {
+  const { relativePath: _relativePath, ...browserAttachment } = attachment;
+  return BrowserDraftAttachmentSchema.parse(browserAttachment);
 }
 
 function toTaskSummary(task: TaskRecord): TaskSummary {

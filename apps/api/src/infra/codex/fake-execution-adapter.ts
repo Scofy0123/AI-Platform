@@ -4,13 +4,92 @@ import type {
   ActorContext,
   EffectiveThreadConfigSnapshot,
   ModelOption,
+  ThreadGoalSnapshot,
 } from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
-import type { TaskEventDraft, TaskExecutionAdapter } from "../../domain/platform-service.js";
+import type {
+  AttachedGoalRuntimeResult,
+  GoalRuntimeCapability,
+  RuntimeGoalProjection,
+  TaskEventDraft,
+  TaskExecutionAdapter,
+} from "../../domain/platform-service.js";
 import type { WeeklyQuota } from "./codex-runtime.js";
 
 export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionAdapter {
   private readonly active = new Map<string, { taskId: string; turnId: string }>();
+  private readonly goalByThread = new Map<string, ThreadGoalSnapshot>();
+  private readonly workflowDelayMs = readFakeWorkflowDelay();
+
+  async readGoalCapability(_account: InternalAccount): Promise<GoalRuntimeCapability> {
+    return { availability: "AVAILABLE", reasonCode: null, reason: null };
+  }
+
+  async readPlanModeCatalog(
+    _account: InternalAccount,
+    requested = { model: "fake-codex-standard", reasoningEffort: "medium" },
+  ) {
+    const model = requested.model ?? "fake-codex-standard";
+    return {
+      availability: "AVAILABLE" as const,
+      reasonCode: null,
+      reason: null,
+      presets: [
+        {
+          name: "Default",
+          mode: "default" as const,
+          settings: {
+            model,
+            reasoningEffort: requested.reasoningEffort.toLowerCase(),
+            developerInstructions: null,
+          },
+        },
+        {
+          name: "Plan",
+          mode: "plan" as const,
+          settings: {
+            model,
+            reasoningEffort: "high",
+            developerInstructions: null,
+          },
+        },
+      ],
+    };
+  }
+
+  async setThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    this.goalByThread.set(threadId, { ...goal });
+    return {
+      attachment: "ATTACHED",
+      goal: { ...goal },
+      runtimeUpdatedAt: Date.now(),
+    };
+  }
+
+  async getThreadGoal(threadId: string): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    const goal = this.goalByThread.get(threadId);
+    return {
+      attachment: "ATTACHED",
+      goal: goal ? { ...goal } : null,
+      runtimeUpdatedAt: Date.now(),
+    };
+  }
+
+  async clearThreadGoal(
+    threadId: string,
+  ): Promise<AttachedGoalRuntimeResult<{ cleared: boolean }>> {
+    return { attachment: "ATTACHED", cleared: this.goalByThread.delete(threadId) };
+  }
+
+  async syncThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    return this.setThreadGoal(threadId, goal);
+  }
 
   async listModels(_account: InternalAccount): Promise<ModelOption[]> {
     return FAKE_MODEL_OPTIONS.map((model) => ({
@@ -30,11 +109,34 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
     existingThreadId: string | null;
     effectiveConfig: EffectiveThreadConfigSnapshot;
     actorContext: ActorContext;
+    goal?: ThreadGoalSnapshot | null;
+    onThreadPrepared?(threadId: string): void;
   }): Promise<{ threadId: string; turnId: string }> {
     const threadId = input.existingThreadId ?? `fake-thread-${randomUUID()}`;
+    input.onThreadPrepared?.(threadId);
+    if (input.goal) {
+      this.goalByThread.set(threadId, { ...input.goal });
+      this.emit("goalUpdated", {
+        taskId: input.taskId,
+        threadId,
+        status: input.goal.status,
+        tokensUsed: input.goal.tokensUsed,
+        timeUsedSeconds: input.goal.timeUsedSeconds,
+        runtimeUpdatedAt: Date.now(),
+      });
+    }
     const turnId = `fake-turn-${randomUUID()}`;
     this.active.set(threadId, { taskId: input.taskId, turnId });
-    setImmediate(() => this.emitWorkflow(input.taskId, threadId, turnId, input.prompt, input.cwd));
+    if (this.workflowDelayMs > 0) {
+      setTimeout(
+        () => this.emitWorkflow(input.taskId, threadId, turnId, input.prompt, input.cwd),
+        this.workflowDelayMs,
+      );
+    } else {
+      setImmediate(() =>
+        this.emitWorkflow(input.taskId, threadId, turnId, input.prompt, input.cwd),
+      );
+    }
     return { threadId, turnId };
   }
 
@@ -86,6 +188,7 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
 
   async close(): Promise<void> {
     this.active.clear();
+    this.goalByThread.clear();
     this.removeAllListeners();
   }
 
@@ -195,6 +298,11 @@ export class FakeExecutionAdapter extends EventEmitter implements TaskExecutionA
     for (const event of events) this.emit("taskEvent", event);
     this.active.delete(threadId);
   }
+}
+
+function readFakeWorkflowDelay(): number {
+  const configured = Number(process.env.CODEXPLATFORM_FAKE_WORKFLOW_DELAY_MS ?? 0);
+  return Number.isFinite(configured) && configured > 0 ? Math.min(configured, 10_000) : 0;
 }
 
 const FAKE_MODEL_OPTIONS = [

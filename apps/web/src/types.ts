@@ -1,6 +1,9 @@
 import type {
   Bootstrap,
+  BrowserDraftAttachment,
   ComposerCapability,
+  ComposerState,
+  ComposerStatePatch,
   EffectiveConfigOverride,
   ModelCatalog,
   SubagentThread,
@@ -9,13 +12,19 @@ import type {
   TaskEvent,
   TaskSummary,
   Thread,
+  ThreadGoalInput,
+  ThreadGoalPatch,
+  ThreadGoalView,
   UserSettingsPatch,
   UserSettingsView,
 } from "@codexplatform/contracts";
 
 export type {
   Bootstrap,
+  BrowserDraftAttachment,
   ComposerCapability,
+  ComposerState,
+  ComposerStatePatch,
   ModelCatalog,
   ModelOption,
   SubagentThread,
@@ -24,6 +33,9 @@ export type {
   TaskStatus,
   TaskSummary,
   Thread,
+  ThreadGoalInput,
+  ThreadGoalPatch,
+  ThreadGoalView,
   UserSettingsPatch,
   UserSettingsView,
 } from "@codexplatform/contracts";
@@ -193,12 +205,36 @@ export interface PlatformApi {
     title: string;
     config?: EffectiveConfigOverride;
   }): Promise<Thread>;
+  createDraft?(input: { projectId: string }): Promise<{ id: string }>;
+  getDraft?(threadId: string): Promise<{
+    id: string;
+    projectId: string;
+    lifecycleState: "DRAFT";
+  }>;
+  deleteDraft?(threadId: string): Promise<void>;
+  uploadAttachments?(threadId: string, files: readonly File[]): Promise<BrowserDraftAttachment>;
+  listThreadAttachments?(threadId: string): Promise<BrowserDraftAttachment[]>;
+  deleteAttachment?(threadId: string, attachmentId: string): Promise<void>;
+  getThreadGoal?(threadId: string): Promise<ThreadGoalView>;
+  putThreadGoal?(threadId: string, input: ThreadGoalInput): Promise<ThreadGoalView>;
+  patchThreadGoal?(threadId: string, patch: ThreadGoalPatch): Promise<ThreadGoalView>;
+  deleteThreadGoal?(
+    threadId: string,
+  ): Promise<{ cleared: true; runtimeSyncState: "PENDING" | "SYNCED" }>;
+  getThreadComposer?(threadId: string): Promise<ComposerState>;
+  patchThreadComposer?(threadId: string, patch: ComposerStatePatch): Promise<ComposerState>;
   startThreadTurn?(
     threadId: string,
     prompt: string,
     config?: EffectiveConfigOverride,
+    attachmentIds?: readonly string[],
   ): Promise<unknown>;
-  threadAction?(threadId: string, action: "interrupt" | "steer", input?: string): Promise<unknown>;
+  threadAction?(
+    threadId: string,
+    action: "interrupt" | "steer",
+    input?: string,
+    attachmentIds?: readonly string[],
+  ): Promise<unknown>;
   archiveThread?(threadId: string): Promise<{ ok: true }>;
   unarchiveThread?(threadId: string): Promise<{ ok: true }>;
   listSubagents?(threadId: string): Promise<SubagentThread[]>;

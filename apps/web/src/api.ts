@@ -17,6 +17,8 @@ import type {
   TaskDetail,
   TaskSummary,
   Thread,
+  ThreadGoalInput,
+  ThreadGoalPatch,
   UserSettingsView,
   UserUsage,
 } from "./types.js";
@@ -72,7 +74,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
 
-  if (init.body !== undefined) {
+  if (init.body !== undefined && !(init.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
   }
 
@@ -181,15 +183,71 @@ export const httpApi: PlatformApi = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  startThreadTurn: (threadId, prompt, config) =>
+  createDraft: (input) =>
+    request<{ id: string }>("/api/threads/drafts", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  getDraft: (threadId) => request(`/api/threads/${encodeURIComponent(threadId)}/draft`),
+  deleteDraft: (threadId) =>
+    request<void>(`/api/threads/${encodeURIComponent(threadId)}/draft`, {
+      method: "DELETE",
+    }),
+  uploadAttachments: (threadId, files) => {
+    const form = new FormData();
+    for (const file of files) {
+      form.append("files", file, file.webkitRelativePath || file.name);
+    }
+    return request(`/api/threads/${encodeURIComponent(threadId)}/attachments`, {
+      method: "POST",
+      body: form,
+    });
+  },
+  listThreadAttachments: (threadId) =>
+    request(`/api/threads/${encodeURIComponent(threadId)}/attachments`),
+  deleteAttachment: (threadId, attachmentId) =>
+    request<void>(
+      `/api/threads/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(attachmentId)}`,
+      { method: "DELETE" },
+    ),
+  getThreadGoal: (threadId) => request(`/api/threads/${encodeURIComponent(threadId)}/goal`),
+  putThreadGoal: (threadId, input: ThreadGoalInput) =>
+    request(`/api/threads/${encodeURIComponent(threadId)}/goal`, {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+  patchThreadGoal: (threadId, patch: ThreadGoalPatch) =>
+    request(`/api/threads/${encodeURIComponent(threadId)}/goal`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  deleteThreadGoal: (threadId) =>
+    request(`/api/threads/${encodeURIComponent(threadId)}/goal`, {
+      method: "DELETE",
+    }),
+  getThreadComposer: (threadId) => request(`/api/threads/${encodeURIComponent(threadId)}/composer`),
+  patchThreadComposer: (threadId, patch) =>
+    request(`/api/threads/${encodeURIComponent(threadId)}/composer`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+  startThreadTurn: (threadId, prompt, config, attachmentIds = []) =>
     request(`/api/threads/${encodeURIComponent(threadId)}/turns`, {
       method: "POST",
-      body: JSON.stringify({ prompt, ...(config ? { config } : {}) }),
+      body: JSON.stringify({
+        prompt,
+        ...(config ? { config } : {}),
+        ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+      }),
     }),
-  threadAction: (threadId, action, input) =>
+  threadAction: (threadId, action, input, attachmentIds = []) =>
     request(`/api/threads/${encodeURIComponent(threadId)}/${action}`, {
       method: "POST",
-      body: JSON.stringify(action === "steer" && input ? { prompt: input } : {}),
+      body: JSON.stringify(
+        action === "steer"
+          ? { prompt: input ?? "", ...(attachmentIds.length > 0 ? { attachmentIds } : {}) }
+          : {},
+      ),
     }),
   archiveThread: (threadId) =>
     request<{ ok: true }>(`/api/threads/${encodeURIComponent(threadId)}/archive`, {

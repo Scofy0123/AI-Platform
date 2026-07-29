@@ -3,6 +3,7 @@ import { createInterface, type Interface as ReadlineInterface } from "node:readl
 import type { Readable, Writable } from "node:stream";
 
 export type RpcId = number | string;
+export const DEFAULT_RPC_REQUEST_TIMEOUT_MS = 120_000;
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -33,6 +34,17 @@ export class RpcError extends Error {
   }
 }
 
+export class RpcRequestTimeoutError extends Error {
+  readonly name = "RpcRequestTimeoutError";
+
+  constructor(
+    readonly method: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`RPC request timed out: ${method}`);
+  }
+}
+
 export class JsonlRpcClient extends EventEmitter {
   private readonly writable: Writable;
   private readonly requestTimeoutMs: number;
@@ -45,7 +57,7 @@ export class JsonlRpcClient extends EventEmitter {
   constructor(options: JsonlRpcClientOptions) {
     super();
     this.writable = options.writable;
-    this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_RPC_REQUEST_TIMEOUT_MS;
     this.lines = createInterface({ input: options.readable, crlfDelay: Number.POSITIVE_INFINITY });
     this.lines.on("line", (line) => this.handleLine(line));
     this.lines.on("close", () => this.close(new Error("Codex App Server transport closed")));
@@ -64,7 +76,7 @@ export class JsonlRpcClient extends EventEmitter {
     const promise = new Promise<T>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`RPC request timed out: ${method}`));
+        reject(new RpcRequestTimeoutError(method, this.requestTimeoutMs));
       }, this.requestTimeoutMs);
       this.pending.set(id, {
         resolve: resolve as (value: unknown) => void,

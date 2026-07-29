@@ -147,6 +147,91 @@ describe("FeishuContentClient", () => {
     );
     expect(fetch).not.toHaveBeenCalled();
   });
+
+  test("creates a Docx and appends readable text blocks with the current user's token", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          code: 0,
+          data: {
+            document: { document_id: "doc-created", revision_id: 1, title: "华东出差计划" },
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          code: 0,
+          data: {
+            document_revision_id: 2,
+            children: [{ block_id: "block-1" }, { block_id: "block-2" }],
+          },
+        }),
+      );
+    const client = new FeishuContentClient("user-access-token", fetch);
+
+    await expect(
+      client.createDocument({
+        title: "华东出差计划",
+        content: "# 行程\n\n上海\n杭州",
+      }),
+    ).resolves.toEqual({
+      documentId: "doc-created",
+      revisionId: 2,
+      title: "华东出差计划",
+      url: "https://feishu.cn/docx/doc-created",
+      blockCount: 3,
+    });
+    expect(fetch.mock.calls[0]).toEqual([
+      "https://open.feishu.cn/open-apis/docx/v1/documents",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ title: "华东出差计划" }),
+      }),
+    ]);
+    expect(fetch.mock.calls[1]?.[0]).toBe(
+      "https://open.feishu.cn/open-apis/docx/v1/documents/doc-created/blocks/doc-created/children",
+    );
+    expect(JSON.parse(String(fetch.mock.calls[1]?.[1]?.body))).toMatchObject({
+      index: -1,
+      children: [
+        {
+          block_type: 2,
+          text: { elements: [{ text_run: { content: "# 行程" } }] },
+        },
+        {
+          block_type: 2,
+          text: { elements: [{ text_run: { content: "上海" } }] },
+        },
+        {
+          block_type: 2,
+          text: { elements: [{ text_run: { content: "杭州" } }] },
+        },
+      ],
+    });
+  });
+
+  test("appends content to an existing Docx URL", async () => {
+    const fetch = vi.fn().mockResolvedValue(
+      jsonResponse({
+        code: 0,
+        data: { document_revision_id: 9, children: [{ block_id: "block-1" }] },
+      }),
+    );
+    const client = new FeishuContentClient("user-access-token", fetch);
+
+    await expect(
+      client.updateDocument({
+        url: "https://example.feishu.cn/docx/doc-existing",
+        content: "补充事项",
+      }),
+    ).resolves.toEqual({
+      documentId: "doc-existing",
+      revisionId: 9,
+      url: "https://example.feishu.cn/docx/doc-existing",
+      blockCount: 1,
+    });
+  });
 });
 
 function jsonResponse(body: unknown, status = 200): Response {

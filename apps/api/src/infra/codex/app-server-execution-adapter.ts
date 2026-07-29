@@ -4,10 +4,17 @@ import {
   type EffectiveThreadConfigSnapshot,
   type ModelOption,
   ModelOptionSchema,
+  type ThreadGoalSnapshot,
+  type ThreadGoalView,
 } from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
+import { GoalSyncConflictError, RuntimeRequestTimeoutError } from "../../domain/errors.js";
 import type {
   ApprovalDraft,
+  AttachedGoalRuntimeResult,
+  GoalRuntimeCapability,
+  PlanModeCatalogCapability,
+  RuntimeGoalProjection,
   TaskEventDraft,
   TaskExecutionAdapter,
 } from "../../domain/platform-service.js";
@@ -32,6 +39,7 @@ import type { FileChangeRequestApprovalResponse } from "./generated/v2/FileChang
 import type { Model } from "./generated/v2/Model.js";
 import type { PermissionsRequestApprovalResponse } from "./generated/v2/PermissionsRequestApprovalResponse.js";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse.js";
+import { RpcRequestTimeoutError } from "./jsonl-rpc-client.js";
 
 interface RpcPort extends EventEmitter {
   respond(id: number | string, result: unknown): Promise<void>;
@@ -39,6 +47,8 @@ interface RpcPort extends EventEmitter {
 }
 
 interface RuntimePort {
+  readGoalProtocolCapability(): GoalRuntimeCapability;
+  readPlanProtocolCapability(): GoalRuntimeCapability;
   startThread(input: {
     cwd: string;
     dynamicTools: ReturnType<ToolRuntimePort["definitions"]>;
@@ -51,14 +61,47 @@ interface RuntimePort {
   startTurn(
     threadId: string,
     prompt: string,
-    options: { cwd: string; effectiveConfig: EffectiveThreadConfigSnapshot },
+    options: {
+      cwd: string;
+      effectiveConfig: EffectiveThreadConfigSnapshot;
+      attachments?: Array<{ name: string; path: string; mimeType: string }>;
+    },
   ): Promise<unknown>;
   disableThreadMemory(threadId: string): Promise<unknown>;
-  steerTurn(threadId: string, turnId: string, prompt: string): Promise<unknown>;
+  setThreadGoal(
+    threadId: string,
+    input: { objective: string; status: "active" | "paused" | "complete"; tokenBudget: number },
+  ): Promise<{
+    objective: string;
+    status: string;
+    tokenBudget: number | null;
+    tokensUsed: number;
+    timeUsedSeconds: number;
+    updatedAt: number;
+  }>;
+  getThreadGoal(threadId: string): Promise<{
+    objective: string;
+    status: string;
+    tokenBudget: number | null;
+    tokensUsed: number;
+    timeUsedSeconds: number;
+    updatedAt: number;
+  } | null>;
+  clearThreadGoal(threadId: string): Promise<boolean>;
+  steerTurn(
+    threadId: string,
+    turnId: string,
+    prompt: string,
+    attachments?: Array<{ name: string; path: string; mimeType: string }>,
+  ): Promise<unknown>;
   interruptTurn(threadId: string, turnId: string): Promise<unknown>;
   startChatGptLogin(): Promise<{ loginId: string; authUrl: string }>;
   readWeeklyQuota(): Promise<WeeklyQuota>;
   listModels(): Promise<Model[]>;
+  listCollaborationModes(input: {
+    model: string | null;
+    reasoningEffort: string;
+  }): Promise<import("@codexplatform/contracts").CollaborationModePreset[]>;
 }
 
 export interface ManagedRuntimePort {
@@ -132,6 +175,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
   private readonly normalizerByTask = new Map<string, CodexEventNormalizer>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private readonly startingSignalsByThread = new Map<string, BufferedRpcSignal[]>();
+  private readonly goalCapabilityByAccount = new Map<string, GoalRuntimeCapability>();
 
   constructor(private readonly options: AdapterOptions) {
     super();
@@ -146,6 +190,150 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     return (await managed.runtime.listModels()).map(mapRuntimeModel);
   }
 
+  async readGoalCapability(account: InternalAccount): Promise<GoalRuntimeCapability> {
+    try {
+      const managed = await this.options.supervisor.startAccount({
+        accountId: account.id,
+        codexHome: account.codexHome,
+      });
+      this.attach(managed);
+      const cached = this.goalCapabilityByAccount.get(account.id);
+      if (cached) return { ...cached };
+      const capability = managed.runtime.readGoalProtocolCapability();
+      if (cacheableGoalCapability(capability)) {
+        this.goalCapabilityByAccount.set(account.id, capability);
+      }
+      return { ...capability };
+    } catch {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+        reason: "Goal Runtime capability probe failed",
+      };
+    }
+  }
+
+  async readPlanModeCatalog(
+    account: InternalAccount,
+    requested?: { model: string | null; reasoningEffort: string },
+  ): Promise<PlanModeCatalogCapability> {
+    try {
+      const managed = await this.options.supervisor.startAccount({
+        accountId: account.id,
+        codexHome: account.codexHome,
+      });
+      this.attach(managed);
+      const protocol = managed.runtime.readPlanProtocolCapability();
+      if (protocol.availability !== "AVAILABLE") {
+        return { ...protocol, presets: [] };
+      }
+      const fallback = requested ?? (await planFallbackFromModels(managed.runtime.listModels()));
+      const presets = await managed.runtime.listCollaborationModes(fallback);
+      if (
+        !presets.some((preset) => preset.mode === "plan") ||
+        !presets.some((preset) => preset.mode === "default")
+      ) {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "PLAN_PRESET_MISSING",
+          reason: "Runtime collaboration mode directory is incomplete",
+          presets: [],
+        };
+      }
+      return { availability: "AVAILABLE", reasonCode: null, reason: null, presets };
+    } catch {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+        reason: "Plan mode Runtime capability probe failed",
+        presets: [],
+      };
+    }
+  }
+
+  async setThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    const runtime = this.runtimeByThread.get(threadId);
+    if (!runtime) return { attachment: "DETACHED" };
+    try {
+      const nativeGoal = await runtime.setThreadGoal(threadId, {
+        objective: goal.objective,
+        status: runtimeGoalStatus(goal.status),
+        tokenBudget: goal.tokenBudget,
+      });
+      return {
+        attachment: "ATTACHED",
+        goal: projectRuntimeGoal(goal, nativeGoal),
+        runtimeUpdatedAt: nativeGoal.updatedAt,
+      };
+    } catch (error) {
+      this.cacheAttachedGoalFailure(threadId, error);
+      throw error;
+    }
+  }
+
+  async getThreadGoal(threadId: string): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    const runtime = this.runtimeByThread.get(threadId);
+    if (!runtime) return { attachment: "DETACHED" };
+    try {
+      const nativeGoal = await runtime.getThreadGoal(threadId);
+      return {
+        attachment: "ATTACHED",
+        goal: nativeGoal ? projectRuntimeGoal(null, nativeGoal) : null,
+        runtimeUpdatedAt: nativeGoal?.updatedAt ?? null,
+      };
+    } catch (error) {
+      this.cacheAttachedGoalFailure(threadId, error);
+      throw error;
+    }
+  }
+
+  async clearThreadGoal(
+    threadId: string,
+  ): Promise<AttachedGoalRuntimeResult<{ cleared: boolean }>> {
+    const runtime = this.runtimeByThread.get(threadId);
+    if (!runtime) return { attachment: "DETACHED" };
+    try {
+      const cleared = await runtime.clearThreadGoal(threadId);
+      if ((await runtime.getThreadGoal(threadId)) !== null) {
+        throw new GoalSyncConflictError(
+          "clear",
+          "Runtime Goal remained present after thread/goal/clear",
+        );
+      }
+      return { attachment: "ATTACHED", cleared };
+    } catch (error) {
+      this.cacheAttachedGoalFailure(threadId, error);
+      throw error;
+    }
+  }
+
+  async syncThreadGoal(
+    threadId: string,
+    goal: ThreadGoalSnapshot,
+  ): Promise<AttachedGoalRuntimeResult<RuntimeGoalProjection>> {
+    const applied = await this.setThreadGoal(threadId, goal);
+    if (applied.attachment === "DETACHED") return applied;
+    const verified = await this.getThreadGoal(threadId);
+    if (verified.attachment === "DETACHED" || !verified.goal) {
+      throw new GoalSyncConflictError(
+        "clear",
+        "Runtime Goal verification returned no Goal after synchronization",
+      );
+    }
+    assertGoalProjectionMatches(goal, verified.goal);
+    return {
+      ...verified,
+      goal: {
+        ...verified.goal,
+        objective: verified.goal.objective || goal.objective,
+        timeBudgetSeconds: goal.timeBudgetSeconds,
+      },
+    };
+  }
+
   async startTask(input: {
     accountId: string;
     codexHome: string;
@@ -156,6 +344,9 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     existingThreadId: string | null;
     effectiveConfig: EffectiveThreadConfigSnapshot;
     actorContext: ActorContext;
+    goal?: ThreadGoalSnapshot | null;
+    onThreadPrepared?(threadId: string): void;
+    attachments?: Array<{ name: string; path: string; mimeType: string }>;
   }): Promise<{ threadId: string; turnId: string }> {
     const managed = await this.options.supervisor.startAccount({
       accountId: input.accountId,
@@ -176,6 +367,10 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         }
         assertMemoryDisabledResponse(await managed.runtime.disableThreadMemory(threadId));
       } catch (error) {
+        if (error instanceof RpcRequestTimeoutError) {
+          await this.options.supervisor.stopAccount?.(input.accountId).catch(() => undefined);
+          throw new RuntimeRequestTimeoutError(error.method);
+        }
         const safetyError =
           error instanceof ThreadResumeSafetyError
             ? error
@@ -201,6 +396,10 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         );
         assertMemoryDisabledResponse(await managed.runtime.disableThreadMemory(threadId));
       } catch (error) {
+        if (error instanceof RpcRequestTimeoutError) {
+          await this.options.supervisor.stopAccount?.(input.accountId).catch(() => undefined);
+          throw new RuntimeRequestTimeoutError(error.method);
+        }
         const safetyError =
           error instanceof ThreadResumeSafetyError
             ? error
@@ -212,6 +411,33 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         await this.options.supervisor.stopAccount?.(input.accountId).catch(() => undefined);
         throw safetyError;
       }
+    }
+    input.onThreadPrepared?.(threadId);
+    if (input.goal) {
+      const capability =
+        this.goalCapabilityByAccount.get(input.accountId) ??
+        managed.runtime.readGoalProtocolCapability();
+      if (capability.availability !== "AVAILABLE") {
+        if (cacheableGoalCapability(capability)) {
+          this.goalCapabilityByAccount.set(input.accountId, capability);
+        }
+        throw new Error(capability.reason ?? "Goal protocol is unavailable for this Runtime");
+      }
+      const synced = await managed.runtime.setThreadGoal(threadId, {
+        objective: input.goal.objective,
+        status: runtimeGoalStatus(input.goal.status),
+        tokenBudget: input.goal.tokenBudget,
+      });
+      this.emit("goalUpdated", {
+        taskId: input.taskId,
+        threadId,
+        status: platformGoalStatus(synced.status),
+        tokensUsed: synced.tokensUsed,
+        timeUsedSeconds: synced.timeUsedSeconds,
+        runtimeUpdatedAt: synced.updatedAt,
+      });
+    } else if (input.existingThreadId) {
+      await managed.runtime.clearThreadGoal(threadId);
     }
     const contextKey = connectionThreadKey(input.accountId, connectionGeneration, threadId);
     this.contextByThread.set(contextKey, {
@@ -241,6 +467,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         await managed.runtime.startTurn(threadId, input.prompt, {
           cwd: input.cwd,
           effectiveConfig: input.effectiveConfig,
+          ...(input.attachments?.length ? { attachments: input.attachments } : {}),
         }),
       );
       const context = this.contextByThread.get(contextKey);
@@ -289,8 +516,18 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     }
   }
 
-  async steerTask(threadId: string, turnId: string, prompt: string): Promise<void> {
-    await this.requireRuntime(threadId).steerTurn(threadId, turnId, prompt);
+  async steerTask(
+    threadId: string,
+    turnId: string,
+    prompt: string,
+    attachments?: Array<{ name: string; path: string; mimeType: string }>,
+  ): Promise<void> {
+    const runtime = this.requireRuntime(threadId);
+    if (attachments?.length) {
+      await runtime.steerTurn(threadId, turnId, prompt, attachments);
+    } else {
+      await runtime.steerTurn(threadId, turnId, prompt);
+    }
   }
 
   async interruptTask(threadId: string, turnId: string): Promise<void> {
@@ -348,6 +585,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     const attached = this.attachedConnectionByAccount.get(managed.accountId);
     if (attached?.rpc === managed.rpc) return attached.generation;
     const generation = (this.lastConnectionGenerationByAccount.get(managed.accountId) ?? 0) + 1;
+    this.goalCapabilityByAccount.delete(managed.accountId);
     this.lastConnectionGenerationByAccount.set(managed.accountId, generation);
     this.attachedConnectionByAccount.set(managed.accountId, { rpc: managed.rpc, generation });
     managed.rpc.on("notification", (message: unknown) => {
@@ -482,6 +720,52 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       if (quota.status === "KNOWN") this.emit("accountQuotaUpdated", { accountId, quota });
       return;
     }
+    if (message.method === "thread/goal/updated") {
+      const goalThreadId = stringValue(params.threadId);
+      if (!goalThreadId) return;
+      const goal = asRecord(params.goal);
+      const context = this.contextByThread.get(
+        connectionThreadKey(accountId, connectionGeneration, goalThreadId),
+      );
+      if (
+        context &&
+        typeof goal.status === "string" &&
+        Number.isInteger(goal.tokensUsed) &&
+        Number.isInteger(goal.timeUsedSeconds) &&
+        Number.isInteger(goal.updatedAt)
+      ) {
+        const status = platformGoalStatusOrNull(goal.status);
+        if (!status) {
+          const reason = `Unsupported Runtime Goal status: ${goal.status}`;
+          this.goalCapabilityByAccount.set(accountId, {
+            availability: "UNAVAILABLE",
+            reasonCode: "RUNTIME_GOAL_STATUS_UNSUPPORTED",
+            reason,
+          });
+          this.detachAccount(accountId, reason, { sourceTaskId: context.taskId });
+          void this.options.supervisor.stopAccount?.(accountId).catch(() => undefined);
+          return;
+        }
+        this.emit("goalUpdated", {
+          taskId: context.taskId,
+          threadId: context.threadId,
+          status,
+          tokensUsed: goal.tokensUsed,
+          timeUsedSeconds: goal.timeUsedSeconds,
+          runtimeUpdatedAt: goal.updatedAt,
+        });
+      }
+      return;
+    }
+    if (message.method === "thread/goal/cleared") {
+      const goalThreadId = stringValue(params.threadId);
+      if (!goalThreadId) return;
+      const context = this.contextByThread.get(
+        connectionThreadKey(accountId, connectionGeneration, goalThreadId),
+      );
+      if (context) this.emit("goalCleared", { taskId: context.taskId, threadId: context.threadId });
+      return;
+    }
     const threadId = stringValue(params.threadId);
     if (!threadId) return;
     const context = this.contextByThread.get(
@@ -491,14 +775,20 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     const normalizer = this.normalizerByTask.get(context.taskId);
     if (!normalizer) return;
     for (const event of normalizer.normalizeNotification(message)) {
-      if (event.type === "TURN_STARTED" && event.turnId) {
-        context.turnId = event.turnId;
+      // Root notifications can expose a transport-local Turn id that differs from turn/start.
+      // Keep the RPC response id as the platform's canonical identity for the attached Turn.
+      const eventTurnId =
+        context.parentThreadId === null && context.turnId
+          ? context.turnId
+          : (event.turnId ?? context.turnId);
+      if (event.type === "TURN_STARTED" && eventTurnId) {
+        if (context.parentThreadId !== null || !context.turnId) context.turnId = eventTurnId;
         this.options.actors.bind({
           taskId: context.taskId,
           accountId: context.accountId,
           connectionGeneration: context.connectionGeneration,
           threadId: context.threadId,
-          turnId: event.turnId,
+          turnId: eventTurnId,
           actorContext: context.actorContext,
         });
       }
@@ -508,7 +798,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       const draft: TaskEventDraft = {
         taskId: event.taskId,
         threadId: event.threadId,
-        turnId: event.turnId,
+        turnId: eventTurnId,
         ...(context.parentThreadId !== null && event.type !== "SUBAGENT_ACTIVITY"
           ? { subagentThreadId: context.threadId }
           : {}),
@@ -517,22 +807,35 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
       } as TaskEventDraft;
       this.emit("taskEvent", draft);
       if (
-        event.turnId &&
+        eventTurnId &&
         (event.type === "TURN_COMPLETED" ||
           event.type === "TURN_FAILED" ||
           event.type === "TURN_INTERRUPTED")
       ) {
-        this.deletePendingApprovalsForTurn(accountId, connectionGeneration, threadId, event.turnId);
+        this.deletePendingApprovalsForTurn(accountId, connectionGeneration, threadId, eventTurnId);
         this.options.actors.clearTurn({
           accountId,
           connectionGeneration,
           threadId,
-          turnId: event.turnId,
+          turnId: eventTurnId,
         });
-        if (context.turnId === event.turnId) context.turnId = null;
+        if (context.turnId === eventTurnId) context.turnId = null;
         this.detachDescendantContexts(context);
       }
     }
+  }
+
+  private cacheAttachedGoalFailure(threadId: string, error: unknown): void {
+    const context = [...this.contextByThread.values()].find(
+      (candidate) => candidate.threadId === threadId,
+    );
+    if (!context) return;
+    if (!isMethodNotFoundError(error)) return;
+    this.goalCapabilityByAccount.set(context.accountId, {
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_GOAL_METHOD_UNSUPPORTED",
+      reason: "Goal Runtime method is unsupported",
+    });
   }
 
   private attachSubagentContext(parent: ThreadContext, childThreadId: string): void {
@@ -737,6 +1040,7 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
     source?: { sourceTaskId: string; sourceRuntimeTurnId?: string },
   ): void {
     this.attachedConnectionByAccount.delete(accountId);
+    this.goalCapabilityByAccount.delete(accountId);
     for (const [contextKey, context] of this.contextByThread) {
       if (context.accountId !== accountId) continue;
       if (context.turnId) {
@@ -777,6 +1081,18 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
   }
 }
 
+async function planFallbackFromModels(
+  modelsPromise: Promise<Model[]>,
+): Promise<{ model: string | null; reasoningEffort: string }> {
+  const models = await modelsPromise;
+  const selected = models.find((model) => model.isDefault) ?? models[0];
+  if (!selected) throw new Error("Runtime model catalog is empty");
+  return {
+    model: selected.model,
+    reasoningEffort: selected.defaultReasoningEffort,
+  };
+}
+
 function mapRuntimeModel(model: Model): ModelOption {
   return ModelOptionSchema.parse({
     id: model.id,
@@ -807,6 +1123,91 @@ function cloneActorContext(actor: ActorContext): ActorContext {
     toolScopes: [...actor.toolScopes],
     approvalPolicy: actor.approvalPolicy,
   };
+}
+
+function runtimeGoalStatus(status: ThreadGoalView["status"]): "active" | "paused" | "complete" {
+  if (status === "ACTIVE") return "active";
+  if (status === "COMPLETE") return "complete";
+  return "paused";
+}
+
+function platformGoalStatus(status: string): ThreadGoalView["status"] {
+  const projected = platformGoalStatusOrNull(status);
+  if (projected) return projected;
+  throw new Error(`Unsupported Runtime Goal status: ${status}`);
+}
+
+function platformGoalStatusOrNull(status: string): ThreadGoalView["status"] | null {
+  if (status === "active") return "ACTIVE";
+  if (status === "complete") return "COMPLETE";
+  if (status === "budgetLimited" || status === "usageLimited") return "BUDGET_LIMITED";
+  if (status === "paused" || status === "blocked") return "PAUSED";
+  return null;
+}
+
+function projectRuntimeGoal(
+  fallback: ThreadGoalSnapshot | null,
+  nativeGoal: {
+    objective: string;
+    status: string;
+    tokenBudget: number | null;
+    tokensUsed: number;
+    timeUsedSeconds: number;
+  },
+): ThreadGoalSnapshot {
+  const tokenBudget = nativeGoal.tokenBudget ?? fallback?.tokenBudget;
+  const objective = nativeGoal.objective || fallback?.objective;
+  if (!tokenBudget || !objective) throw new Error("Runtime Goal projection is incomplete");
+  return {
+    objective,
+    status: platformGoalStatus(nativeGoal.status),
+    tokenBudget,
+    tokensUsed: nativeGoal.tokensUsed,
+    timeBudgetSeconds: fallback?.timeBudgetSeconds ?? 3_600,
+    timeUsedSeconds: nativeGoal.timeUsedSeconds,
+  };
+}
+
+function assertGoalProjectionMatches(
+  expected: ThreadGoalSnapshot,
+  actual: ThreadGoalSnapshot,
+): void {
+  if (actual.objective !== expected.objective) {
+    throw new GoalSyncConflictError("objective", "Runtime Goal objective did not match the write");
+  }
+  const expectedStatus = platformGoalStatus(runtimeGoalStatus(expected.status));
+  if (actual.status !== expectedStatus) {
+    throw new GoalSyncConflictError("status", "Runtime Goal status did not match the write");
+  }
+  if (actual.tokenBudget !== expected.tokenBudget) {
+    throw new GoalSyncConflictError(
+      "tokenBudget",
+      "Runtime Goal token budget did not match the write",
+    );
+  }
+  if (actual.tokensUsed < expected.tokensUsed) {
+    throw new GoalSyncConflictError("tokensUsed", "Runtime Goal token usage moved backwards");
+  }
+  if (actual.timeUsedSeconds < expected.timeUsedSeconds) {
+    throw new GoalSyncConflictError("timeUsedSeconds", "Runtime Goal elapsed time moved backwards");
+  }
+}
+
+function cacheableGoalCapability(capability: GoalRuntimeCapability): boolean {
+  return (
+    capability.availability === "AVAILABLE" ||
+    capability.reasonCode === "RUNTIME_VERSION_UNSUPPORTED" ||
+    capability.reasonCode === "RUNTIME_GOAL_METHOD_UNSUPPORTED"
+  );
+}
+
+function isMethodNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === -32_601
+  );
 }
 
 function messageThreadId(value: unknown): string | null {
@@ -936,7 +1337,10 @@ function inspectResumedThread(
   if (statusType === "idle" && "activeFlags" in status) {
     throw new Error("Idle thread.status must not contain activeFlags");
   }
-  if (statusType !== "idle") {
+  // App Server reports systemError after a failed Turn even though the Thread is no longer
+  // running; starting the next Turn clears that terminal error state. The in-progress check
+  // above remains the safety boundary that prevents attaching a new prompt to active work.
+  if (!["idle", "systemError"].includes(statusType)) {
     throw new Error(`Thread resume did not return an idle Thread: ${statusType}`);
   }
   return { kind: "IDLE", threadId };

@@ -74,6 +74,142 @@ describe("HTTP API adapter", () => {
     ]);
   });
 
+  test("stages files and folders with multipart requests without forcing JSON content type", async () => {
+    const attachment = {
+      id: "attachment-1",
+      threadId: "draft-1",
+      kind: "FOLDER",
+      name: "reports",
+      mimeType: "application/x-directory",
+      sizeBytes: 8,
+      fileCount: 2,
+      scanStatus: "READY",
+      createdAt: "2026-07-28T10:00:00.000Z",
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ id: "draft-1" }))
+      .mockResolvedValueOnce(jsonResponse(attachment))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetcher);
+    const first = new File(["one"], "one.txt", { type: "text/plain" });
+    Object.defineProperty(first, "webkitRelativePath", { value: "reports/one.txt" });
+    const second = new File(["two"], "two.txt", { type: "text/plain" });
+    Object.defineProperty(second, "webkitRelativePath", { value: "reports/two.txt" });
+
+    await expect(httpApi.createDraft?.({ projectId: "project-1" })).resolves.toEqual({
+      id: "draft-1",
+    });
+    await expect(httpApi.uploadAttachments?.("draft-1", [first, second])).resolves.toEqual(
+      attachment,
+    );
+    await httpApi.deleteAttachment?.("draft-1", "attachment-1");
+
+    const uploadInit = fetcher.mock.calls[1]?.[1];
+    expect(uploadInit?.body).toBeInstanceOf(FormData);
+    expect(new Headers(uploadInit?.headers).has("Content-Type")).toBe(false);
+    const uploadBody = uploadInit?.body as FormData;
+    expect(
+      uploadBody.getAll("files").map((entry) => (entry instanceof File ? entry.name : entry)),
+    ).toEqual(["reports/one.txt", "reports/two.txt"]);
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/threads/drafts",
+      "/api/threads/draft-1/attachments",
+      "/api/threads/draft-1/attachments/attachment-1",
+    ]);
+  });
+
+  test("reloads unclaimed attachments for an existing Thread", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse([]));
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(httpApi.listThreadAttachments?.("thread / 1")).resolves.toEqual([]);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/threads/thread%20%2F%201/attachments",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  test("validates and restores an owner Draft with its Composer state", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({ id: "draft-1", projectId: "project-1", lifecycleState: "DRAFT" }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ planMode: true, revision: 3 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(httpApi.getDraft?.("draft-1")).resolves.toMatchObject({
+      id: "draft-1",
+      lifecycleState: "DRAFT",
+    });
+    await expect(httpApi.getThreadComposer?.("draft-1")).resolves.toEqual({
+      planMode: true,
+      revision: 3,
+    });
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/threads/draft-1/draft",
+      "/api/threads/draft-1/composer",
+    ]);
+  });
+
+  test("uses Goal and sticky Composer endpoints and carries attachments into Turn and Steer", async () => {
+    const goal = {
+      threadId: "thread-1",
+      objective: "持续完成平台验收",
+      status: "ACTIVE",
+      tokenBudget: 200_000,
+      tokensUsed: 0,
+      timeBudgetSeconds: 3_600,
+      timeUsedSeconds: 0,
+      runtimeSyncState: "SYNCED",
+      createdAt: "2026-07-28T10:00:00.000Z",
+      updatedAt: "2026-07-28T10:00:00.000Z",
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(goal))
+      .mockResolvedValueOnce(jsonResponse(goal))
+      .mockResolvedValueOnce(jsonResponse({ ...goal, status: "PAUSED" }))
+      .mockResolvedValueOnce(jsonResponse({ cleared: true, runtimeSyncState: "SYNCED" }))
+      .mockResolvedValueOnce(jsonResponse({ planMode: true, revision: 2 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "RUNNING" }))
+      .mockResolvedValueOnce(jsonResponse({ status: "RUNNING" }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await httpApi.getThreadGoal?.("thread-1");
+    await httpApi.putThreadGoal?.("thread-1", {
+      objective: "持续完成平台验收",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await httpApi.patchThreadGoal?.("thread-1", { action: "PAUSE" });
+    await httpApi.deleteThreadGoal?.("thread-1");
+    await httpApi.patchThreadComposer?.("thread-1", { planMode: true, revision: 1 });
+    await httpApi.startThreadTurn?.("thread-1", "", { model: "gpt", reasoningEffort: "high" }, [
+      "attachment-1",
+    ]);
+    await httpApi.threadAction?.("thread-1", "steer", "", ["attachment-2"]);
+
+    expect(fetcher.mock.calls.map(([path]) => path)).toEqual([
+      "/api/threads/thread-1/goal",
+      "/api/threads/thread-1/goal",
+      "/api/threads/thread-1/goal",
+      "/api/threads/thread-1/goal",
+      "/api/threads/thread-1/composer",
+      "/api/threads/thread-1/turns",
+      "/api/threads/thread-1/steer",
+    ]);
+    expect(JSON.parse(String(fetcher.mock.calls[5]?.[1]?.body))).toMatchObject({
+      prompt: "",
+      attachmentIds: ["attachment-1"],
+    });
+    expect(JSON.parse(String(fetcher.mock.calls[6]?.[1]?.body))).toEqual({
+      prompt: "",
+      attachmentIds: ["attachment-2"],
+    });
+  });
+
   test("uses the actor-aware 1.1 Thread, settings and Subagent endpoints", async () => {
     const fetcher = vi
       .fn<typeof fetch>()

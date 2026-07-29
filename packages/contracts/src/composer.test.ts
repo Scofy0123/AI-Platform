@@ -1,7 +1,14 @@
 import { describe, expect, test } from "vitest";
 import {
+  BrowserDraftAttachmentSchema,
+  CollaborationModePresetSchema,
   ComposerCapabilitySchema,
+  ComposerStateSchema,
+  DraftAttachmentSchema,
+  EffectiveTurnInputSnapshotSchema,
   ExecutionPermissionSelectionSchema,
+  ThreadGoalInputSchema,
+  ThreadGoalViewSchema,
   TurnInputBundleSchema,
 } from "./composer.js";
 
@@ -56,6 +63,35 @@ describe("ComposerCapabilitySchema", () => {
 });
 
 describe("TurnInputBundleSchema", () => {
+  test("defines a revisioned sticky Composer state", () => {
+    expect(ComposerStateSchema.parse({ planMode: true, revision: 3 })).toEqual({
+      planMode: true,
+      revision: 3,
+    });
+  });
+
+  test("captures the exact runtime collaboration preset without pretending built-in instructions are known", () => {
+    expect(
+      CollaborationModePresetSchema.parse({
+        name: "Plan",
+        mode: "plan",
+        settings: {
+          model: "gpt-5.6-sol",
+          reasoningEffort: "high",
+          developerInstructions: null,
+        },
+      }),
+    ).toEqual({
+      name: "Plan",
+      mode: "plan",
+      settings: {
+        model: "gpt-5.6-sol",
+        reasoningEffort: "high",
+        developerInstructions: null,
+      },
+    });
+  });
+
   test("accepts a text-only turn with an explicit permission selection", () => {
     expect(
       TurnInputBundleSchema.parse({
@@ -68,5 +104,125 @@ describe("TurnInputBundleSchema", () => {
       prompt: "Inspect the repository",
       permission: { mode: "ASK_FOR_APPROVAL" },
     });
+  });
+
+  test("accepts an attachment-only Turn but rejects a completely empty Turn", () => {
+    expect(
+      TurnInputBundleSchema.parse({
+        prompt: "   ",
+        permission: { mode: "ASK_FOR_APPROVAL", profileId: null },
+        planMode: false,
+        attachmentIds: ["attachment-1"],
+      }),
+    ).toMatchObject({ prompt: "", attachmentIds: ["attachment-1"] });
+
+    expect(() =>
+      TurnInputBundleSchema.parse({
+        prompt: "   ",
+        permission: { mode: "ASK_FOR_APPROVAL", profileId: null },
+        planMode: false,
+        attachmentIds: [],
+      }),
+    ).toThrow();
+  });
+
+  test("defines safe attachment and immutable effective input contracts", () => {
+    const attachment = DraftAttachmentSchema.parse({
+      id: "attachment-1",
+      threadId: "thread-1",
+      kind: "FILE",
+      name: "diagram.png",
+      relativePath: ".codexplatform/attachments/attachment-1/diagram.png",
+      mimeType: "image/png",
+      sizeBytes: 128,
+      fileCount: 1,
+      scanStatus: "READY",
+      createdAt: "2026-07-28T12:00:00.000Z",
+    });
+    expect(JSON.stringify(attachment)).not.toContain("/private/");
+    const browserAttachment = BrowserDraftAttachmentSchema.parse({
+      id: attachment.id,
+      threadId: attachment.threadId,
+      kind: attachment.kind,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.sizeBytes,
+      fileCount: attachment.fileCount,
+      scanStatus: attachment.scanStatus,
+      createdAt: attachment.createdAt,
+    });
+    expect(browserAttachment).not.toHaveProperty("relativePath");
+    expect(() =>
+      BrowserDraftAttachmentSchema.parse({
+        ...browserAttachment,
+        relativePath: ".codexplatform/attachments/attachment-1/diagram.png",
+      }),
+    ).toThrow();
+    expect(
+      DraftAttachmentSchema.parse({
+        ...attachment,
+        name: "report..md",
+        relativePath: ".codexplatform/attachments/attachment-1/report..md",
+      }),
+    ).toMatchObject({ name: "report..md" });
+    expect(() =>
+      DraftAttachmentSchema.parse({
+        ...attachment,
+        relativePath: ".codexplatform/attachments/../secret.md",
+      }),
+    ).toThrow();
+
+    expect(
+      EffectiveTurnInputSnapshotSchema.parse({
+        prompt: "",
+        attachments: [attachment],
+        planMode: true,
+        capturedAt: "2026-07-28T12:00:01.000Z",
+      }),
+    ).toMatchObject({
+      prompt: "",
+      attachments: [{ id: "attachment-1", scanStatus: "READY" }],
+      planMode: true,
+    });
+  });
+
+  test("applies safe Goal defaults and exposes the platform status vocabulary", () => {
+    expect(ThreadGoalInputSchema.parse({ objective: "持续完成代码审查" })).toEqual({
+      objective: "持续完成代码审查",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    expect(
+      ThreadGoalViewSchema.parse({
+        threadId: "thread-1",
+        objective: "持续完成代码审查",
+        status: "ACTIVE",
+        tokenBudget: 200_000,
+        tokensUsed: 10,
+        timeBudgetSeconds: 3_600,
+        timeUsedSeconds: 2,
+        runtimeSyncState: "SYNCED",
+        createdAt: "2026-07-28T00:00:00.000Z",
+        updatedAt: "2026-07-28T00:00:02.000Z",
+      }).status,
+    ).toBe("ACTIVE");
+  });
+
+  test("captures an immutable Goal snapshot with each Turn input", () => {
+    expect(
+      EffectiveTurnInputSnapshotSchema.parse({
+        prompt: "继续",
+        attachments: [],
+        goal: {
+          objective: "持续完成代码审查",
+          status: "ACTIVE",
+          tokenBudget: 200_000,
+          tokensUsed: 10,
+          timeBudgetSeconds: 3_600,
+          timeUsedSeconds: 2,
+        },
+        capturedAt: "2026-07-28T00:00:00.000Z",
+      }).goal,
+    ).toMatchObject({ objective: "持续完成代码审查", status: "ACTIVE" });
   });
 });

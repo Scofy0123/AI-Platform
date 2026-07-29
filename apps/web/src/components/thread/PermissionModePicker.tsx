@@ -1,6 +1,6 @@
 import type { ExecutionPermissionSelection } from "@codexplatform/contracts";
-import { useState } from "react";
 import { Icon } from "../../icons.js";
+import { useDismissiblePopover } from "./useDismissiblePopover.js";
 
 export interface ExecutionPermissionOption {
   mode: ExecutionPermissionSelection["mode"];
@@ -24,7 +24,7 @@ export function PermissionModePicker({
   onChange,
   disabled = false,
 }: PermissionModePickerProps) {
-  const [open, setOpen] = useState(false);
+  const { close, open, rootRef, toggle, triggerRef } = useDismissiblePopover<HTMLDivElement>();
   const selected = options.find(
     (option) =>
       option.mode === value.mode &&
@@ -32,8 +32,9 @@ export function PermissionModePicker({
   );
 
   return (
-    <div className="composer-permission-picker">
+    <div ref={rootRef} className="composer-permission-picker">
       <button
+        ref={triggerRef}
         type="button"
         className={`composer-permission-trigger permission-${value.mode.toLowerCase()}`}
         data-permission-icon={permissionIcon(value.mode)}
@@ -42,22 +43,13 @@ export function PermissionModePicker({
         aria-expanded={open}
         title={selected?.label ?? "Execution permissions"}
         disabled={disabled}
-        onClick={() => setOpen((current) => !current)}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") setOpen(false);
-        }}
+        onClick={toggle}
       >
         <Icon name={permissionIcon(value.mode)} />
         <span className="sr-only">{selected?.label}</span>
       </button>
       {open ? (
-        <div
-          className="composer-permission-popover"
-          role="menu"
-          onKeyDown={(event) => {
-            if (event.key === "Escape") setOpen(false);
-          }}
-        >
+        <div className="composer-permission-popover" role="menu">
           <header>
             <span>How should Codex actions be approved?</span>
             <a
@@ -84,7 +76,7 @@ export function PermissionModePicker({
                 key={`${option.mode}:${option.profileId ?? ""}`}
                 onClick={() => {
                   if (!option.available) return;
-                  setOpen(false);
+                  close({ restoreFocus: true });
                   onChange(
                     option.mode === "CUSTOM"
                       ? { mode: "CUSTOM", profileId: option.profileId ?? "" }

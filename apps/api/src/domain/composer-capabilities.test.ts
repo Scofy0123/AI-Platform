@@ -3,8 +3,10 @@ import { listComposerCapabilities } from "./composer-capabilities.js";
 
 const BASE_INPUT = {
   stagingAvailable: true,
-  goalAvailable: true,
-  planModeAvailable: true,
+  goalAvailable: false,
+  goalUnavailableReason: "Goal persistence is not enabled in this build",
+  planModeAvailable: false,
+  planModeUnavailableReason: "Plan mode is awaiting locked-version protocol validation",
   skillRecorderAvailable: false,
   approvedSkills: [],
   approvedApps: [],
@@ -12,42 +14,14 @@ const BASE_INPUT = {
 } as const;
 
 describe("listComposerCapabilities", () => {
-  test("reports real Add capabilities and explains unsupported host features", () => {
+  test("returns only the three 1.1A registry entries", () => {
     const result = listComposerCapabilities(BASE_INPUT);
 
-    expect(result).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          id: "files-and-folders",
-          kind: "FILE_PICKER",
-          availability: "AVAILABLE",
-        }),
-        expect.objectContaining({
-          id: "goal",
-          kind: "GOAL",
-          availability: "AVAILABLE",
-        }),
-        expect.objectContaining({
-          id: "plan-mode",
-          kind: "PLAN_MODE",
-          availability: "AVAILABLE",
-        }),
-        expect.objectContaining({
-          id: "record-a-skill",
-          kind: "SKILL_RECORDER",
-          availability: "UNSUPPORTED",
-          unavailableReason: expect.stringContaining("Computer Use Worker"),
-        }),
-      ]),
-    );
-  });
-
-  test("does not infer plugin, app or thread capabilities without approved records", () => {
-    const result = listComposerCapabilities(BASE_INPUT);
-
-    expect(result.filter((capability) => capability.section === "PLUGINS")).toEqual([]);
-    expect(result.filter((capability) => capability.section === "APPS")).toEqual([]);
-    expect(result.filter((capability) => capability.section === "FILES_AND_CHATS")).toEqual([]);
+    expect(result.map(({ id, availability }) => ({ id, availability }))).toEqual([
+      { id: "files-and-folders", availability: "AVAILABLE" },
+      { id: "goal", availability: "UNSUPPORTED" },
+      { id: "plan-mode", availability: "UNSUPPORTED" },
+    ]);
   });
 
   test("preserves policy-blocked reasons instead of presenting a false action", () => {
@@ -69,7 +43,7 @@ describe("listComposerCapabilities", () => {
     });
   });
 
-  test("adds only server-approved skills, apps and current-user threads", () => {
+  test("does not return skill, app, recorder, or thread-reference entries", () => {
     const result = listComposerCapabilities({
       ...BASE_INPUT,
       approvedSkills: [
@@ -88,21 +62,6 @@ describe("listComposerCapabilities", () => {
       ],
     });
 
-    expect(result).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ id: "skill:pdf", kind: "SKILL", section: "PLUGINS" }),
-        expect.objectContaining({
-          id: "app:plugin-management",
-          kind: "APP",
-          section: "APPS",
-          availability: "AVAILABLE",
-        }),
-        expect.objectContaining({
-          id: "thread:thread-owned",
-          kind: "THREAD_REFERENCE",
-          section: "FILES_AND_CHATS",
-        }),
-      ]),
-    );
+    expect(result).toHaveLength(3);
   });
 });

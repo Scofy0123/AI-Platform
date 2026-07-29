@@ -15,6 +15,7 @@
     "@codexplatform/contracts": "workspace:*",
     "@fastify/cookie": "11.1.2",
     "@fastify/cors": "11.3.0",
+    "@fastify/multipart": "9.3.0",
     "@fastify/sensible": "6.0.4",
     "better-sqlite3": "13.0.1",
     "drizzle-orm": "0.45.2",

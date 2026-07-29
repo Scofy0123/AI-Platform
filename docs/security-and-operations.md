@@ -125,6 +125,17 @@ codex-cli 0.144.6
 - SQLite 内部审计保留租约、Thread、Turn、Tool 和审批关联；管理员浏览器接口只返回用户、账号别名、Thread、动作、结果、摘要和时间，不返回这些运行时关联 ID。
 - Demo SQL 只接受单条 allowlist `SELECT`，拒绝注释、多语句、DDL/DML、SQLite 系统对象和超限结果。
 - Runtime 错误和 Tool 错误做基础 Token 脱敏。
+- Composer 附件按用户和 Thread 隔离暂存；文件名规范化、真实路径 containment、符号链接、MIME、
+  大小、目录数量和 owner ACL 均在提交前重新校验。浏览器响应、SSE、日志和审计不返回绝对路径。
+- 1.1A 的 `AttachmentScanner` 只提供类型、大小、路径和可读性门禁；正式多人开放前必须接入恶意
+  文件扫描和 DLP。压缩包不自动解压，失败或未完成扫描的附件不能进入 Turn。
+- Goal 的 200k Token 预算由 Runtime Goal 管理，60 分钟预算由平台 Watchdog 管理；预算到达只暂停
+  Goal，不自动重试已经产生外部副作用的 Tool Call。
+- 2026-07-29 单操作者真实 UAT 已验证 Goal 跨 Plan/执行两个 Turn 保留，累计用量写入
+  `thread_goals` 并在终态后刷新到 Composer；这不替代生产恶意文件扫描、独立 Worker 或多人凭证隔离。
+- 同日真实飞书写入 UAT 已验证：当前飞书用户的 OAuth Token 通过 Tool Gateway 调用
+  `feishu_doc_create`，平台记录成功 Tool/审计关联，随后用 `lark-doc`/`lark-cli` 复读线上 revision
+  2 并核对标题与唯一哨兵。平台没有读取或复制宿主 `lark-cli` Token；CLI 只用于验收复读。
 
 ## 故障恢复
 
@@ -189,7 +200,11 @@ sqlite3 .data/real-codexplatform.sqlite ".backup '.data/real-codexplatform.backu
 7. **心跳仅为单进程实现。** 平台定时器和 Runtime 事件都会刷新心跳，但没有独立 Worker 健康探针或分布式租约仲裁。
 8. **单机状态。** SQLite、进程内事件总线和 ActorRegistry 不支持多实例或 HA。
 9. **Dynamic Tools 是实验接口。** 已锁定 Codex 版本并隔离适配层，但协议升级仍需重新生成类型并审查。
-10. **飞书范围有限。** 只支持搜索和 Wiki/Docx 文本读取；图片、表格语义、Sheet、Base、Slides 和写操作未接入。
+   最终 Plan 所需的 `experimentalRawEvents` 同样只在锁定版本适配层启用；浏览器、日志和审计只接收
+   归一化后的最终 assistant 文本，不接收 Raw reasoning 或加密内容。
+10. **飞书范围有限。** 支持搜索、Wiki/Docx 文本读取、Docx 创建和 append-only 追加写入；图片、
+    表格语义、块级替换、评论、Sheet、Base 和 Slides 未接入。写操作只在 `Approve for me` 或
+    `Full access` 下开放，使用持久幂等回执；`Ask for approval` 的 Tool 级交互审批卡尚未交付。
 11. **数据库/业务系统仍为 Mock。** SQL 仅访问两个 Demo 表；业务查询返回确定性假数据。
 12. **仅本机 HTTP。** Cookie 的 `Secure` 为 false，只能在 loopback 开发环境使用，不能直接暴露到局域网或公网。
 13. **真实外部测试默认跳过。** 测试文件存在不等于真实 Codex 登录、额度或飞书文档链路已通过。
@@ -198,3 +213,7 @@ sqlite3 .data/real-codexplatform.sqlite ".backup '.data/real-codexplatform.backu
 16. **Settings 仍是 1.1A 范围。** 用户偏好和 Turn 快照已实现；Project 级执行设置、完整组织策略编辑、插件安装和平台 Memory 尚未实现。
 17. **原生 Memory 已在 real Runtime 的 Thread 级关闭，但多人隔离仍未完成。** 1.1A real Runtime 已在每次新建/恢复 Thread 后强制下发 `thread/memoryMode=disabled`，并在失败时 fail closed；真实多人开放仍需通过跨用户 Memory、Thread 历史和文件哨兵测试，并完成独立 Worker/`CODEX_HOME` 隔离。
 18. **企业 App Server client 尚需登记。** 组织试点前必须按 OpenAI App Server 初始化要求联系 OpenAI，将 `codexplatform` 加入 known clients；本仓库发送 `clientInfo` 不等于已获准。
+19. **Runtime 超时不是协议安全故障。** stdio RPC 等待窗口为 120 秒；超时停止对应 App Server 并
+    返回可重试 503，不隔离账号、不伪装成 resume 安全错误，也不自动重放 Turn。
+19. **附件扫描尚非生产恶意文件检测。** 1.1A 只在单操作者本机完成格式、路径和配额门禁；多人或
+    企业文件开放前必须接入正式扫描器、DLP、保留期和安全删除策略。

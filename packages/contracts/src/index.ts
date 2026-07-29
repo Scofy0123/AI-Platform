@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { CollaborationModePresetSchema, ComposerStateSchema } from "./composer.js";
 
 export * from "./composer.js";
 
@@ -141,6 +142,7 @@ export const TASK_EVENT_TYPES = [
   "AGENT_MESSAGE_PHASE",
   "REASONING_SUMMARY_DELTA",
   "PLAN_UPDATED",
+  "PROPOSED_PLAN_PUBLISHED",
   "COMMAND_STARTED",
   "COMMAND_OUTPUT",
   "COMMAND_COMPLETED",
@@ -200,6 +202,15 @@ export const EffectiveThreadConfigSnapshotSchema = z
     personality: z.enum(["NONE", "FRIENDLY", "PRAGMATIC"]),
     instructions: z.string(),
     sourceVersion: z.string().min(1),
+    requestedConfig: z
+      .object({
+        model: z.string().trim().min(1).nullable(),
+        reasoningEffort: z.string().trim().min(1),
+        instructions: z.string(),
+      })
+      .strict()
+      .optional(),
+    collaborationPreset: CollaborationModePresetSchema.nullable().optional(),
   })
   .strict();
 export type EffectiveThreadConfigSnapshot = z.infer<typeof EffectiveThreadConfigSnapshotSchema>;
@@ -279,6 +290,7 @@ export const ThreadSchema = z
     turns: z.array(TurnSchema),
     queue: QueueStateSchema.nullable(),
     items: z.array(ThreadItemSchema),
+    composerState: ComposerStateSchema.optional(),
   })
   .strict();
 export type Thread = z.infer<typeof ThreadSchema>;
@@ -405,13 +417,14 @@ export type UserSettingsPatch = z.infer<typeof UserSettingsPatchSchema>;
 export interface TaskEventPayloadMap {
   TURN_STARTED: { status: "inProgress" };
   TURN_COMPLETED: { status: "completed"; durationMs?: number | null };
-  TURN_FAILED: { status: "failed"; error: string };
+  TURN_FAILED: { status: "failed"; code?: string; error: string };
   TURN_INTERRUPTED: { status: "interrupted" };
   USER_MESSAGE: { itemId: string; kind: "STEER"; text: string };
   AGENT_MESSAGE_DELTA: { itemId: string; delta: string };
   AGENT_MESSAGE_PHASE: { itemId: string; phase: AgentMessagePhase | null };
   REASONING_SUMMARY_DELTA: { itemId: string; delta: string };
   PLAN_UPDATED: { explanation: string | null; plan: unknown[] };
+  PROPOSED_PLAN_PUBLISHED: { itemId: string; title: string; markdown: string };
   COMMAND_STARTED: { itemId: string; command: string; cwd: string };
   COMMAND_OUTPUT: { itemId: string; delta: string };
   COMMAND_COMPLETED: {

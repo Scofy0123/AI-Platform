@@ -2,11 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deliver a Codex-style Composer whose permission choices, Add menu, attachments, Goal, Plan mode, Skills and policy gates map to real platform and App Server behavior.
+**Goal:** Deliver a Codex-style Composer whose Files/Folders, hidden Draft, Goal, Plan mode and policy gates map to real platform and App Server behavior. Record Skill, Plugins, Apps, Skills and history references stay hidden in this iteration.
 
 **Architecture:** Add vendor-neutral Composer contracts and a server-owned capability registry, then translate validated choices into locked Codex App Server parameters. Stage browser files in a per-user/per-thread server workspace, persist immutable Turn input snapshots, and expose each capability only when runtime, organization policy and user grants all allow it.
 
 **Tech Stack:** TypeScript, Zod, Fastify, React, SQLite WAL, Codex App Server JSONL, Vitest, Testing Library, Playwright.
+
+**Implementation status (2026-07-29):** Complete for 1.1A. Files/Folders, hidden Draft, Goal and
+sticky Plan are implemented; `pnpm verify` passes, and the real single-operator App Server UAT
+completed a Plan Turn followed by a file-create/read Turn with the same Goal. Record Skill and the
+non-core Add catalog remain intentionally hidden.
 
 ---
 
@@ -158,28 +163,28 @@ Run:
 `pnpm exec vitest run apps/api/src/domain/attachments.test.ts apps/api/src/infra/codex/codex-runtime.test.ts`
 Expected: PASS.
 
-### Task 5: Goal, Plan mode and managed Skills
+### Task 5: Goal and Plan mode
 
 - [ ] **Step 1: Write failing protocol tests**
 
-Verify `thread/goal/set|get|clear`, Goal persistence across Turns, `collaborationMode=plan` only for
-new Turns, and `skills/list` pagination plus approved-policy filtering.
+Verify `thread/goal/set|get|clear`, Goal persistence across Turns, and the locked
+`collaborationMode=plan` preset for the current and subsequent new Turns.
 
 - [ ] **Step 2: Run and confirm RED**
 
 Run:
 `pnpm exec vitest run apps/api/src/infra/codex/codex-runtime.test.ts apps/api/src/domain/composer-capabilities.test.ts`
-Expected: FAIL for missing Goal/Plan/Skill adapters.
+Expected: FAIL for missing Goal/Plan adapters.
 
 - [ ] **Step 3: Implement Runtime adapters and orchestration**
 
 Set Goal before `turn/start`; fail the submission explicitly if Goal mutation fails. Send Plan mode
-only in the Turn snapshot. Send Skill as structured UserInput.
+in the immutable Turn snapshot and keep the Thread setting until the user turns it off.
 
 - [ ] **Step 4: Add Composer dialogs and Chips**
 
-Goal has objective and optional token budget; Plan mode is a menu toggle; Skills are removable
-one-Turn chips.
+Goal supports objective, status, token budget and platform time budget; Plan mode is a Thread-sticky
+menu toggle. Unsupported Add categories are not rendered.
 
 - [ ] **Step 5: Run GREEN**
 
@@ -188,22 +193,22 @@ Expected: PASS.
 
 ### Task 6: Full verification and visual UAT
 
-- [x] **Step 1: Run static and unit verification**
+- [ ] **Step 1: Run static and unit verification**
 
 Run: `pnpm typecheck && pnpm lint && pnpm test`
 Expected: exit 0 with no failures.
 
-- [x] **Step 2: Run browser UAT**
+- [ ] **Step 2: Run browser UAT**
 
 Run: `pnpm test:e2e`
-Expected: permission menu, Add menu, upload, Goal, Plan, Skill and active-Turn lock scenarios pass.
+Expected: permission menu, Add menu, upload, Goal, Plan and active-Turn lock scenarios pass.
 
-- [x] **Step 3: Run complete repository verification**
+- [ ] **Step 3: Run complete repository verification**
 
 Run: `pnpm verify`
 Expected: exit 0.
 
-- [x] **Step 4: Perform visual comparison**
+- [ ] **Step 4: Perform visual comparison**
 
 Capture New Chat and active Thread at the same viewport as the stored Codex references. Check
 Composer proportions, menu anchoring, labels, spacing, selected state and disabled reasons; record

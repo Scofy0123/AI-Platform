@@ -1,6 +1,9 @@
 import type {
   Bootstrap,
+  BrowserDraftAttachment,
   ComposerCapability,
+  ComposerState,
+  ComposerStatePatch,
   EffectiveConfigOverride,
   ModelCatalog,
   SubagentThread,
@@ -9,6 +12,9 @@ import type {
   TaskEvent,
   TaskSummary,
   Thread,
+  ThreadGoalInput,
+  ThreadGoalPatch,
+  ThreadGoalView,
   UserSettingsPatch,
   UserSettingsView,
 } from "@codexplatform/contracts";
@@ -41,6 +47,38 @@ export interface PlatformApi {
     userId: string,
     input: { projectId: string; title: string; config?: EffectiveConfigOverride },
   ): Promise<Thread>;
+  createDraft(userId: string, input: { projectId: string }): Promise<unknown>;
+  getDraft(
+    threadId: string,
+    userId: string,
+  ): Promise<{ id: string; projectId: string; lifecycleState: "DRAFT" } | null>;
+  getThreadComposer(threadId: string, userId: string): Promise<ComposerState | null>;
+  deleteDraft(threadId: string, userId: string): Promise<void>;
+  uploadAttachment(
+    threadId: string,
+    userId: string,
+    input: {
+      files: Array<{ name: string; relativePath: string; mimeType: string; content: Buffer }>;
+    },
+  ): Promise<BrowserDraftAttachment>;
+  listAttachments(threadId: string, userId: string): Promise<BrowserDraftAttachment[]>;
+  deleteAttachment(threadId: string, attachmentId: string, userId: string): Promise<void>;
+  getThreadGoal(threadId: string, userId: string): Promise<ThreadGoalView | null>;
+  putThreadGoal(threadId: string, userId: string, input: ThreadGoalInput): Promise<ThreadGoalView>;
+  patchThreadGoal(
+    threadId: string,
+    userId: string,
+    patch: ThreadGoalPatch,
+  ): Promise<ThreadGoalView>;
+  deleteThreadGoal(
+    threadId: string,
+    userId: string,
+  ): Promise<{ cleared: true; runtimeSyncState: "PENDING" | "SYNCED" }>;
+  patchThreadComposer(
+    threadId: string,
+    userId: string,
+    patch: ComposerStatePatch,
+  ): Promise<ComposerState>;
   listThreads(userId: string, projectId?: string): Promise<Thread[]>;
   listArchivedThreads(userId: string): Promise<Thread[]>;
   archiveThread(threadId: string, userId: string): Promise<{ ok: true }>;
@@ -52,8 +90,14 @@ export interface PlatformApi {
     userId: string,
     prompt: string,
     config?: EffectiveConfigOverride,
+    attachmentIds?: string[],
   ): Promise<unknown>;
-  steerThread(threadId: string, userId: string, prompt: string): Promise<unknown>;
+  steerThread(
+    threadId: string,
+    userId: string,
+    prompt: string,
+    attachmentIds?: string[],
+  ): Promise<unknown>;
   interruptThread(threadId: string, userId: string): Promise<unknown>;
   listThreadEvents(
     threadId: string,
@@ -69,7 +113,12 @@ export interface PlatformApi {
   getMyConnections(userId: string): Promise<unknown>;
   getMyPlugins(userId: string): Promise<unknown>;
   startTurn(taskId: string, userId: string, prompt: string): Promise<unknown>;
-  steerTask(taskId: string, userId: string, prompt: string): Promise<unknown>;
+  steerTask(
+    taskId: string,
+    userId: string,
+    prompt: string,
+    attachmentIds?: string[],
+  ): Promise<unknown>;
   interruptTask(taskId: string, userId: string): Promise<unknown>;
   listTaskEvents(
     taskId: string,

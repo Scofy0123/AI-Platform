@@ -4,7 +4,7 @@ import { chmod, mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { CodexAppServerRuntime } from "./codex-runtime.js";
-import { JsonlRpcClient } from "./jsonl-rpc-client.js";
+import { DEFAULT_RPC_REQUEST_TIMEOUT_MS, JsonlRpcClient } from "./jsonl-rpc-client.js";
 
 export const CODEX_PINNED_VERSION = "0.144.6";
 
@@ -124,7 +124,7 @@ export class CodexRuntimeSupervisor extends EventEmitter {
       resolve(process.cwd(), "node_modules", ".bin", "codex");
     this.spawnProcess = options.spawnProcess ?? defaultSpawn;
     this.readVersion = options.readVersion ?? defaultReadVersion;
-    this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_RPC_REQUEST_TIMEOUT_MS;
   }
 
   startAccount(input: { accountId: string; codexHome: string }): Promise<ManagedCodexRuntime> {

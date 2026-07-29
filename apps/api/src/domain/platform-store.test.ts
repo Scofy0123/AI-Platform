@@ -38,6 +38,1130 @@ describe("SQLitePlatformStore", () => {
     expect(store.getTaskForUser(task.id, "user-2")).toBeNull();
   });
 
+  test("keeps Draft Threads out of every list and project count until activation", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Drafts", now: NOW });
+    const draft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+
+    expect(draft.lifecycleState).toBe("DRAFT");
+    expect(store.listTasks("user-1")).toEqual([]);
+    expect(store.listArchivedTasks("user-1")).toEqual([]);
+    expect(store.listProjects("user-1")).toEqual([
+      expect.objectContaining({ id: project.id, taskCount: 0 }),
+    ]);
+    expect(store.getUserUsage("user-1")).toMatchObject({ threads: 0, turns: 0 });
+    expect(store.getTaskForUser(draft.id, "user-2")).toBeNull();
+
+    store.activateDraft(draft.id, "user-1", new Date(NOW.getTime() + 1));
+    expect(store.listTasks("user-1")).toEqual([
+      expect.objectContaining({ id: draft.id, lifecycleState: "ACTIVE" }),
+    ]);
+    expect(store.listProjects("user-1")).toEqual([
+      expect.objectContaining({ id: project.id, taskCount: 1 }),
+    ]);
+  });
+
+  test("persists a revisioned sticky Plan mode and freezes it into each Turn input", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Plan", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Plan",
+      now: NOW,
+    });
+
+    expect(store.getComposerState(task.id, "user-1")).toEqual({
+      planMode: false,
+      revision: 0,
+    });
+    expect(
+      store.patchComposerState({
+        threadId: task.id,
+        ownerId: "user-1",
+        planMode: true,
+        expectedRevision: 0,
+        now: NOW,
+      }),
+    ).toEqual({ planMode: true, revision: 1 });
+
+    const turn = store.createTurn({
+      id: "planned-turn",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Plan first",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    expect(store.getTurnInputSnapshot(turn.id)).toMatchObject({ planMode: true });
+    expect(() =>
+      store.patchComposerState({
+        threadId: task.id,
+        ownerId: "user-1",
+        planMode: false,
+        expectedRevision: 1,
+        now: new Date(NOW.getTime() + 1),
+      }),
+    ).toThrowError(expect.objectContaining({ code: "PLAN_MODE_MUTATION_BLOCKED_BY_PENDING_TURN" }));
+    expect(store.getComposerState(task.id, "user-1")).toEqual({
+      planMode: true,
+      revision: 1,
+    });
+    store.completeTurn(turn.id, "COMPLETED", new Date(NOW.getTime() + 2));
+    const next = store.createTurn({
+      id: "planned-turn-2",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Continue planning",
+      status: "ALLOCATING",
+      now: new Date(NOW.getTime() + 3),
+    });
+    expect(store.getTurnInputSnapshot(next.id)).toMatchObject({ planMode: true });
+  });
+
+  test.each(["QUEUED", "RUNNING", "WAITING_APPROVAL"] as const)(
+    "blocks Plan mode mutation while a %s Turn owns the frozen snapshot",
+    (status) => {
+      const project = store.createProject({ ownerId: "user-1", name: status, now: NOW });
+      const task = store.createTask({
+        ownerId: "user-1",
+        projectId: project.id,
+        title: status,
+        now: NOW,
+      });
+      const turn = store.createTurn({
+        id: `plan-lock-${status}`,
+        taskId: task.id,
+        ownerId: "user-1",
+        prompt: "Run",
+        status: "ALLOCATING",
+        now: NOW,
+      });
+      store.setTurnStatus(turn.id, status);
+
+      expect(() =>
+        store.patchComposerState({
+          threadId: task.id,
+          ownerId: "user-1",
+          planMode: true,
+          expectedRevision: 0,
+          now: NOW,
+        }),
+      ).toThrowError(
+        expect.objectContaining({ code: "PLAN_MODE_MUTATION_BLOCKED_BY_PENDING_TURN" }),
+      );
+    },
+  );
+
+  test("rejects stale Composer revisions and cross-owner reads", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Revision", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Revision",
+      now: NOW,
+    });
+    expect(store.getComposerState(task.id, "user-2")).toBeNull();
+    expect(() =>
+      store.patchComposerState({
+        threadId: task.id,
+        ownerId: "user-1",
+        planMode: true,
+        expectedRevision: 7,
+        now: NOW,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "COMPOSER_REVISION_CONFLICT" }));
+  });
+
+  test("deletes only an owned unactivated Draft and expires stale Drafts", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Drafts", now: NOW });
+    const mine = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+    const stale = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() - 1),
+    });
+
+    expect(() => store.deleteDraft(mine.id, "user-2")).toThrow("Thread not found");
+    expect(store.deleteDraft(mine.id, "user-1")).toEqual({ attachmentRefs: [] });
+    expect(store.expireDrafts(NOW)).toEqual([
+      expect.objectContaining({ threadId: stale.id, attachmentRefs: [] }),
+    ]);
+    expect(store.getTaskForUser(stale.id, "user-1")).toBeNull();
+  });
+
+  test("atomically activates a Draft, claims READY attachments, and snapshots Turn input", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Inputs", now: NOW });
+    const draft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+    const attachment = store.createAttachment({
+      id: "attachment-1",
+      threadId: draft.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "diagram.png",
+      relativePath: ".codexplatform/attachments/attachment-1/diagram.png",
+      mimeType: "image/png",
+      sizeBytes: 128,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    expect(store.listUnclaimedAttachments(draft.id, "user-1")).toEqual([attachment]);
+    const turn = store.createTurn({
+      id: "turn-with-input",
+      taskId: draft.id,
+      ownerId: "user-1",
+      prompt: "",
+      status: "ALLOCATING",
+      attachmentIds: [attachment.id],
+      now: NOW,
+    });
+
+    expect(store.getReadyAttachments(draft.id, "user-1", [attachment.id])).toEqual([attachment]);
+    expect(store.getTurnInputSnapshot(turn.id)).toEqual({
+      prompt: "",
+      attachments: [attachment],
+      goal: null,
+      planMode: false,
+      capturedAt: NOW.toISOString(),
+    });
+    expect(store.getTaskForUser(draft.id, "user-1")).toMatchObject({
+      lifecycleState: "ACTIVE",
+      title: "diagram.png",
+    });
+    expect(() => store.deleteAttachment(attachment.id, draft.id, "user-1")).toThrow(
+      "Attachment is already claimed by a Turn",
+    );
+    expect(store.listUnclaimedAttachments(draft.id, "user-1")).toEqual([]);
+    expect(JSON.stringify(store.getTurnInputSnapshot(turn.id))).not.toContain("/private/");
+  });
+
+  test("derives a Draft title exactly once when the first Turn activates it", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Titles", now: NOW });
+    const draft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+    const longPrompt = `  ${"首次任务标题".repeat(20)}  `;
+
+    store.createTurn({
+      id: "draft-title-turn",
+      taskId: draft.id,
+      ownerId: "user-1",
+      prompt: longPrompt,
+      status: "ALLOCATING",
+      now: NOW,
+    });
+
+    expect(store.getTaskForUser(draft.id, "user-1")?.title).toBe(longPrompt.trim().slice(0, 80));
+
+    store.setTurnStatus("draft-title-turn", "COMPLETED");
+    store.createTurn({
+      id: "later-turn",
+      taskId: draft.id,
+      ownerId: "user-1",
+      prompt: "后续 Turn 不应改标题",
+      status: "ALLOCATING",
+      now: new Date(NOW.getTime() + 1_000),
+    });
+
+    expect(store.getTaskForUser(draft.id, "user-1")?.title).toBe(longPrompt.trim().slice(0, 80));
+  });
+
+  test("claims only owned, READY, unclaimed attachments into immutable Steer snapshots", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Steer", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Steer",
+      now: NOW,
+    });
+    const turn = store.createTurn({
+      id: "active-turn",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Initial",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    store.setTurnStatus(turn.id, "RUNNING");
+    store.setCurrentTurn(task.id, "runtime-active-turn", "RUNNING", NOW);
+    const ready = store.createAttachment({
+      id: "steer-ready",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "ready.txt",
+      relativePath: ".codexplatform/attachments/steer-ready/ready.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    const blocked = store.createAttachment({
+      id: "steer-blocked",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "blocked.txt",
+      relativePath: ".codexplatform/attachments/steer-blocked/blocked.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      fileCount: 1,
+      scanStatus: "BLOCKED",
+      now: NOW,
+    });
+
+    expect(
+      store.claimSteerInput({
+        id: "steer-input-1",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-1",
+        prompt: "",
+        attachmentIds: [ready.id],
+        now: NOW,
+      }),
+    ).toEqual({
+      prompt: "",
+      attachments: [ready],
+      goal: null,
+      planMode: false,
+      capturedAt: NOW.toISOString(),
+    });
+    expect(() =>
+      store.claimSteerInput({
+        id: "steer-input-repeat",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-1",
+        prompt: "",
+        attachmentIds: [ready.id],
+        now: NOW,
+      }),
+    ).toThrow("Attachments must exist, be owned, unclaimed, and READY");
+    expect(() =>
+      store.claimSteerInput({
+        id: "steer-input-blocked",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-1",
+        prompt: "",
+        attachmentIds: [blocked.id],
+        now: NOW,
+      }),
+    ).toThrow("Attachments must exist, be owned, unclaimed, and READY");
+    expect(() =>
+      store.claimSteerInput({
+        id: "steer-input-owner",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-2",
+        prompt: "steal",
+        attachmentIds: [],
+        now: NOW,
+      }),
+    ).toThrow("Task not found");
+    expect(() =>
+      store.claimSteerInput({
+        id: "steer-input-empty",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-1",
+        prompt: "",
+        attachmentIds: [],
+        now: NOW,
+      }),
+    ).toThrow("Invalid Steer input");
+  });
+
+  test("persists an owner-scoped Goal across Turns and snapshots it immutably", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Goals", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Goal thread",
+      now: NOW,
+    });
+    const goal = store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "持续完成安全审查",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+    expect(goal).toMatchObject({
+      status: "ACTIVE",
+      tokensUsed: 0,
+      runtimeSyncState: "PENDING",
+    });
+    expect(() => store.getThreadGoal(task.id, "user-2")).toThrow("Thread not found");
+    const first = store.createTurn({
+      id: "goal-turn-1",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "第一轮",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    store.completeTurn(first.id, "COMPLETED", new Date(NOW.getTime() + 500));
+    store.patchThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      patch: { objective: "更新后的目标", action: "PAUSE" },
+      now: new Date(NOW.getTime() + 1_000),
+    });
+    store.patchThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      patch: { action: "RESUME" },
+      now: new Date(NOW.getTime() + 1_700),
+    });
+    const second = store.createTurn({
+      id: "goal-turn-2",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "第二轮",
+      status: "ALLOCATING",
+      now: new Date(NOW.getTime() + 2_000),
+    });
+
+    expect(store.getTurnInputSnapshot(first.id)?.goal).toMatchObject({
+      objective: "持续完成安全审查",
+      status: "ACTIVE",
+    });
+    expect(store.getTurnInputSnapshot(second.id)?.goal).toMatchObject({
+      objective: "更新后的目标",
+      status: "ACTIVE",
+    });
+    store.completeTurn(second.id, "COMPLETED", new Date(NOW.getTime() + 2_500));
+    expect(store.deleteThreadGoal(task.id, "user-1")).toBe(true);
+    expect(store.getThreadGoal(task.id, "user-1")).toBeNull();
+  });
+
+  test("accounts Goal active time across pause and resets usage only for a replacement PUT", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Goal accounting", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Goal accounting",
+      now: NOW,
+    });
+    store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "原目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+    store.syncThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      runtimeThreadId: "runtime-thread-1",
+      status: "ACTIVE",
+      tokensUsed: 12_000,
+      timeUsedSeconds: 5,
+      now: new Date(NOW.getTime() + 5_000),
+    });
+    expect(
+      store.patchThreadGoal({
+        threadId: task.id,
+        ownerId: "user-1",
+        patch: { action: "PAUSE" },
+        now: new Date(NOW.getTime() + 15_000),
+      }),
+    ).toMatchObject({ status: "PAUSED", timeUsedSeconds: 15 });
+    expect(
+      store.patchThreadGoal({
+        threadId: task.id,
+        ownerId: "user-1",
+        patch: { action: "RESUME" },
+        now: new Date(NOW.getTime() + 20_000),
+      }),
+    ).toMatchObject({ status: "ACTIVE", timeUsedSeconds: 15 });
+    expect(
+      store.putThreadGoal({
+        threadId: task.id,
+        ownerId: "user-1",
+        objective: "替换目标",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+        now: new Date(NOW.getTime() + 25_000),
+      }),
+    ).toMatchObject({ tokensUsed: 0, timeUsedSeconds: 0 });
+  });
+
+  test("projects Runtime Goal notifications monotonically and never reopens a terminal platform state", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Goal projection", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Goal projection",
+      now: NOW,
+    });
+    store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "持续执行",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+
+    store.syncThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      runtimeThreadId: "runtime-thread-1",
+      status: "ACTIVE",
+      tokensUsed: 120,
+      timeUsedSeconds: 12,
+      runtimeUpdatedAt: 200,
+      now: new Date(NOW.getTime() + 2_000),
+    });
+    store.syncThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      runtimeThreadId: "runtime-thread-1",
+      status: "ACTIVE",
+      tokensUsed: 1,
+      timeUsedSeconds: 1,
+      runtimeUpdatedAt: 100,
+      now: new Date(NOW.getTime() + 3_000),
+    });
+    expect(store.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "ACTIVE",
+      tokensUsed: 120,
+      timeUsedSeconds: 12,
+    });
+
+    store.syncThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      runtimeThreadId: "runtime-thread-1",
+      status: "BUDGET_LIMITED",
+      tokensUsed: 200_000,
+      timeUsedSeconds: 20,
+      runtimeUpdatedAt: 300,
+      now: new Date(NOW.getTime() + 4_000),
+    });
+    store.syncThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      runtimeThreadId: "runtime-thread-1",
+      status: "ACTIVE",
+      tokensUsed: 150_000,
+      timeUsedSeconds: 19,
+      runtimeUpdatedAt: 400,
+      now: new Date(NOW.getTime() + 5_000),
+    });
+    expect(store.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "BUDGET_LIMITED",
+      tokensUsed: 200_000,
+      timeUsedSeconds: 20,
+    });
+  });
+
+  test("returns only the first atomic token-budget transition for enforcement", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Goal tokens", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Goal tokens",
+      now: NOW,
+    });
+    store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "有界目标",
+      tokenBudget: 100,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+
+    expect(
+      store.updateThreadGoalTokens(task.id, "user-1", 100, new Date(NOW.getTime() + 1)),
+    ).toMatchObject({
+      triggered: true,
+      goal: { status: "BUDGET_LIMITED", tokensUsed: 100 },
+    });
+    expect(
+      store.updateThreadGoalTokens(task.id, "user-1", 120, new Date(NOW.getTime() + 2)),
+    ).toMatchObject({
+      triggered: false,
+      goal: { status: "BUDGET_LIMITED", tokensUsed: 120 },
+    });
+    store.markThreadGoalRecovery(task.id, "user-1", new Date(NOW.getTime() + 3));
+    expect(
+      store.updateThreadGoalTokens(task.id, "user-1", 150, new Date(NOW.getTime() + 4)),
+    ).toMatchObject({
+      triggered: false,
+      goal: { status: "NEEDS_RECOVERY", tokensUsed: 150 },
+    });
+  });
+
+  test("uses Goal revision CAS to reject a stale Runtime synchronization", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Goal CAS", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Goal CAS",
+      now: NOW,
+    });
+    const first = store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "第一版",
+      tokenBudget: 100,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+    const second = store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "第二版",
+      tokenBudget: 200,
+      timeBudgetSeconds: 3_600,
+      now: new Date(NOW.getTime() + 1),
+    });
+
+    expect(second.revision).toBeGreaterThan(first.revision);
+    expect(() =>
+      store.syncThreadGoal({
+        threadId: task.id,
+        ownerId: "user-1",
+        runtimeThreadId: "runtime-thread",
+        status: "ACTIVE",
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        expectedRevision: first.revision,
+        source: "COMMAND",
+        now: new Date(NOW.getTime() + 2),
+      }),
+    ).toThrow(expect.objectContaining({ code: "GOAL_MUTATION_SUPERSEDED" }));
+    expect(store.getThreadGoal(task.id, "user-1")).toMatchObject({
+      objective: "第二版",
+      runtimeSyncState: "PENDING",
+    });
+  });
+
+  test.each(["PUT", "PATCH", "DELETE"] as const)(
+    "atomically rejects Goal %s after a pending Turn freezes its snapshot",
+    (operation) => {
+      const project = store.createProject({
+        ownerId: "user-1",
+        name: `Atomic ${operation}`,
+        now: NOW,
+      });
+      const task = store.createTask({
+        ownerId: "user-1",
+        projectId: project.id,
+        title: `Atomic ${operation}`,
+        now: NOW,
+      });
+      store.putThreadGoal({
+        threadId: task.id,
+        ownerId: "user-1",
+        objective: "原始 Goal",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+        now: NOW,
+      });
+      const turn = store.createTurn({
+        id: `atomic-${operation.toLowerCase()}`,
+        taskId: task.id,
+        ownerId: "user-1",
+        prompt: "冻结原始 Goal",
+        status: operation === "PUT" ? "ALLOCATING" : "QUEUED",
+        now: new Date(NOW.getTime() + 1),
+      });
+
+      let caught: unknown;
+      try {
+        if (operation === "PUT") {
+          store.putThreadGoal({
+            threadId: task.id,
+            ownerId: "user-1",
+            objective: "替换 Goal",
+            tokenBudget: 100_000,
+            timeBudgetSeconds: 1_800,
+            now: new Date(NOW.getTime() + 2),
+          });
+        } else if (operation === "PATCH") {
+          store.patchThreadGoal({
+            threadId: task.id,
+            ownerId: "user-1",
+            patch: { objective: "修改 Goal" },
+            now: new Date(NOW.getTime() + 2),
+          });
+        } else {
+          store.deleteThreadGoal(task.id, "user-1");
+        }
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toMatchObject({ code: "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN" });
+      expect(store.getThreadGoal(task.id, "user-1")).toMatchObject({
+        objective: "原始 Goal",
+      });
+      expect(store.getTurnInputSnapshot(turn.id)?.goal).toMatchObject({
+        objective: "原始 Goal",
+      });
+      expect(store.getTurn(turn.id)).toMatchObject({
+        status: operation === "PUT" ? "ALLOCATING" : "QUEUED",
+      });
+      expect(database.sqlite.inTransaction).toBe(false);
+    },
+  );
+
+  test("serializes Goal mutation before Turn snapshot creation in the opposite race order", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Atomic order", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Atomic order",
+      now: NOW,
+    });
+    store.putThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      objective: "旧 Goal",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+      now: NOW,
+    });
+
+    store.patchThreadGoal({
+      threadId: task.id,
+      ownerId: "user-1",
+      patch: { objective: "事务先提交的新 Goal" },
+      now: new Date(NOW.getTime() + 1),
+    });
+    const turn = store.createTurn({
+      id: "atomic-opposite-order",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "应冻结新 Goal",
+      status: "ALLOCATING",
+      now: new Date(NOW.getTime() + 2),
+    });
+
+    expect(store.getTurnInputSnapshot(turn.id)?.goal).toMatchObject({
+      objective: "事务先提交的新 Goal",
+    });
+    expect(database.sqlite.inTransaction).toBe(false);
+  });
+
+  test("tracks Steer delivery and releases failed attachments without marking them delivered", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Steer delivery", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Steer delivery",
+      now: NOW,
+    });
+    const turn = store.createTurn({
+      id: "delivery-turn",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Initial",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    store.setTurnStatus(turn.id, "RUNNING");
+    store.setCurrentTurn(task.id, "runtime-delivery-turn", "RUNNING", NOW);
+    const attachment = store.createAttachment({
+      id: "delivery-attachment",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "retry.txt",
+      relativePath: ".codexplatform/attachments/delivery-attachment/retry.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+
+    store.claimSteerInput({
+      id: "steer-delivery-1",
+      taskId: task.id,
+      turnId: turn.id,
+      ownerId: "user-1",
+      prompt: "",
+      attachmentIds: [attachment.id],
+      now: NOW,
+    });
+    expect(store.listSteerInputSnapshots(turn.id)).toEqual([
+      expect.objectContaining({
+        deliveryStatus: "PENDING",
+        deliveryError: null,
+        deliveredAt: null,
+        failedAt: null,
+      }),
+    ]);
+
+    store.failSteerInputDelivery(
+      "steer-delivery-1",
+      "runtime rejected steer",
+      new Date(NOW.getTime() + 1),
+    );
+    expect(store.listSteerInputSnapshots(turn.id)).toEqual([
+      expect.objectContaining({
+        deliveryStatus: "FAILED",
+        deliveryError: "runtime rejected steer",
+        deliveredAt: null,
+        failedAt: new Date(NOW.getTime() + 1).toISOString(),
+      }),
+    ]);
+    expect(store.getReadyAttachments(task.id, "user-1", [attachment.id])).toEqual([attachment]);
+
+    store.claimSteerInput({
+      id: "steer-delivery-2",
+      taskId: task.id,
+      turnId: turn.id,
+      ownerId: "user-1",
+      prompt: "",
+      attachmentIds: [attachment.id],
+      now: new Date(NOW.getTime() + 2),
+    });
+    store.completeSteerInputDelivery("steer-delivery-2", new Date(NOW.getTime() + 3));
+    expect(store.listSteerInputSnapshots(turn.id).at(-1)).toEqual(
+      expect.objectContaining({
+        deliveryStatus: "DELIVERED",
+        deliveryError: null,
+        deliveredAt: new Date(NOW.getTime() + 3).toISOString(),
+        failedAt: null,
+      }),
+    );
+    expect(() =>
+      store.completeSteerInputDelivery("steer-delivery-2", new Date(NOW.getTime() + 4)),
+    ).toThrow("Steer input is not pending");
+  });
+
+  test("keeps an UNKNOWN Steer attachment claimed because delivery may have occurred", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Unknown delivery", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Unknown",
+      now: NOW,
+    });
+    const turn = store.createTurn({
+      id: "unknown-delivery-turn",
+      taskId: task.id,
+      ownerId: "user-1",
+      prompt: "Initial",
+      status: "ALLOCATING",
+      now: NOW,
+    });
+    store.setTurnStatus(turn.id, "RUNNING");
+    store.setCurrentTurn(task.id, "runtime-unknown-turn", "RUNNING", NOW);
+    const attachment = store.createAttachment({
+      id: "unknown-delivery-attachment",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "unknown.txt",
+      relativePath: ".codexplatform/attachments/unknown-delivery-attachment/unknown.txt",
+      mimeType: "text/plain",
+      sizeBytes: 7,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    store.claimSteerInput({
+      id: "steer-unknown-1",
+      taskId: task.id,
+      turnId: turn.id,
+      ownerId: "user-1",
+      prompt: "",
+      attachmentIds: [attachment.id],
+      now: NOW,
+    });
+
+    store.markSteerInputDeliveryUnknown(
+      "steer-unknown-1",
+      "RPC request timed out: turn/steer",
+      new Date(NOW.getTime() + 1),
+    );
+
+    expect(store.listSteerInputSnapshots(turn.id)).toEqual([
+      expect.objectContaining({
+        deliveryStatus: "UNKNOWN",
+        deliveryError: "RPC request timed out: turn/steer",
+        deliveredAt: null,
+        failedAt: null,
+        unknownAt: new Date(NOW.getTime() + 1).toISOString(),
+      }),
+    ]);
+    expect(() => store.deleteAttachment(attachment.id, task.id, "user-1")).toThrow(
+      "Attachment is already claimed by a Turn",
+    );
+    expect(() =>
+      store.claimSteerInput({
+        id: "steer-unknown-retry",
+        taskId: task.id,
+        turnId: turn.id,
+        ownerId: "user-1",
+        prompt: "",
+        attachmentIds: [attachment.id],
+        now: new Date(NOW.getTime() + 2),
+      }),
+    ).toThrow("Attachments must exist, be owned, unclaimed, and READY");
+  });
+
+  test("excludes attachments claimed by prior inputs from new Composer upload quotas", () => {
+    const project = store.createProject({
+      ownerId: "user-1",
+      name: "Current input quotas",
+      now: NOW,
+    });
+    const rootsTask = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Roots",
+      now: NOW,
+    });
+    const rootIds = Array.from({ length: 32 }, (_, index) => `claimed-root-${index}`);
+    for (const id of rootIds) {
+      store.createAttachment({
+        id,
+        threadId: rootsTask.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: `${id}.txt`,
+        relativePath: `.codexplatform/attachments/${id}/${id}.txt`,
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      });
+    }
+    store.createTurn({
+      id: "claimed-roots-turn",
+      taskId: rootsTask.id,
+      ownerId: "user-1",
+      prompt: "",
+      status: "ALLOCATING",
+      attachmentIds: rootIds,
+      now: NOW,
+    });
+    expect(
+      store.createAttachment({
+        id: "new-composer-root",
+        threadId: rootsTask.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: "new.txt",
+        relativePath: ".codexplatform/attachments/new-composer-root/new.txt",
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      }),
+    ).toMatchObject({ id: "new-composer-root" });
+
+    const bytesTask = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Bytes",
+      now: NOW,
+    });
+    const byteIds = Array.from({ length: 4 }, (_, index) => `claimed-bytes-${index}`);
+    for (const id of byteIds) {
+      store.createAttachment({
+        id,
+        threadId: bytesTask.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: `${id}.bin`,
+        relativePath: `.codexplatform/attachments/${id}/${id}.bin`,
+        mimeType: "application/octet-stream",
+        sizeBytes: 50 * 1024 * 1024,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      });
+    }
+    store.createTurn({
+      id: "claimed-bytes-turn",
+      taskId: bytesTask.id,
+      ownerId: "user-1",
+      prompt: "",
+      status: "ALLOCATING",
+      attachmentIds: byteIds,
+      now: NOW,
+    });
+    expect(
+      store.createAttachment({
+        id: "new-composer-bytes",
+        threadId: bytesTask.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: "new.bin",
+        relativePath: ".codexplatform/attachments/new-composer-bytes/new.bin",
+        mimeType: "application/octet-stream",
+        sizeBytes: 50 * 1024 * 1024,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      }),
+    ).toMatchObject({ id: "new-composer-bytes" });
+  });
+
+  test("persists cleanup jobs before Draft expiry, Draft deletion, or attachment deletion", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Cleanup outbox", now: NOW });
+    const deletedDraft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+    const expiredDraft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() - 1),
+    });
+    const activeTask = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Delete attachment",
+      now: NOW,
+    });
+    for (const [id, threadId] of [
+      ["cleanup-delete-draft", deletedDraft.id],
+      ["cleanup-expire-draft", expiredDraft.id],
+      ["cleanup-delete-attachment", activeTask.id],
+    ] as const) {
+      store.createAttachment({
+        id,
+        threadId,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: `${id}.txt`,
+        relativePath: `.codexplatform/attachments/${id}/${id}.txt`,
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      });
+    }
+
+    store.deleteDraft(deletedDraft.id, "user-1", NOW);
+    store.expireDrafts(NOW);
+    store.deleteAttachment("cleanup-delete-attachment", activeTask.id, "user-1", NOW);
+
+    expect(store.listAttachmentCleanupJobs()).toEqual([
+      expect.objectContaining({
+        threadId: deletedDraft.id,
+        attachmentId: "cleanup-delete-draft",
+        relativePath: ".codexplatform/attachments/cleanup-delete-draft/cleanup-delete-draft.txt",
+        status: "PENDING",
+        attempts: 0,
+      }),
+      expect.objectContaining({
+        threadId: expiredDraft.id,
+        attachmentId: "cleanup-expire-draft",
+        relativePath: ".codexplatform/attachments/cleanup-expire-draft/cleanup-expire-draft.txt",
+        status: "PENDING",
+        attempts: 0,
+      }),
+      expect.objectContaining({
+        threadId: activeTask.id,
+        attachmentId: "cleanup-delete-attachment",
+        relativePath:
+          ".codexplatform/attachments/cleanup-delete-attachment/cleanup-delete-attachment.txt",
+        status: "PENDING",
+        attempts: 0,
+      }),
+    ]);
+    const first = store.listAttachmentCleanupJobs()[0];
+    if (!first) throw new Error("Expected a cleanup job");
+    store.completeAttachmentCleanupJob(first.id);
+    store.completeAttachmentCleanupJob(first.id);
+    expect(store.listAttachmentCleanupJobs()).toHaveLength(2);
+  });
+
+  test("enforces attachment root, aggregate-size, and folder-file limits", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Limits", now: NOW });
+    const thread = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Limits",
+      now: NOW,
+    });
+    for (let index = 0; index < 32; index += 1) {
+      store.createAttachment({
+        id: `attachment-${index}`,
+        threadId: thread.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: `file-${index}.txt`,
+        relativePath: `.codexplatform/attachments/attachment-${index}/file-${index}.txt`,
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      });
+    }
+    expect(() =>
+      store.createAttachment({
+        id: "attachment-33",
+        threadId: thread.id,
+        ownerId: "user-1",
+        kind: "FILE",
+        name: "extra.txt",
+        relativePath: ".codexplatform/attachments/attachment-33/extra.txt",
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        fileCount: 1,
+        scanStatus: "READY",
+        now: NOW,
+      }),
+    ).toThrow("Attachment root limit");
+    expect(() =>
+      store.createAttachment({
+        id: "folder-too-large",
+        threadId: thread.id,
+        ownerId: "user-1",
+        kind: "FOLDER",
+        name: "folder",
+        relativePath: ".codexplatform/attachments/folder-too-large/folder",
+        mimeType: "application/x-directory",
+        sizeBytes: 1,
+        fileCount: 501,
+        scanStatus: "READY",
+        now: NOW,
+      }),
+    ).toThrow("Folder exceeds the 500 file limit");
+  });
+
   test("separates active and archived Thread lists by owner and project", () => {
     const firstProject = store.createProject({
       ownerId: "user-1",
@@ -166,6 +1290,41 @@ describe("SQLitePlatformStore", () => {
     expect(database.sqlite.prepare("SELECT COUNT(*) AS count FROM audit_events").get()).toEqual({
       count: 0,
     });
+  });
+
+  test("rejects archive and unarchive for DRAFT or EXPIRED rows without audit history", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Hidden", now: NOW });
+    const draft = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() + 60_000),
+    });
+    const expired = store.createDraft({
+      ownerId: "user-1",
+      projectId: project.id,
+      now: NOW,
+      expiresAt: new Date(NOW.getTime() - 1),
+    });
+    store.expireDrafts(NOW);
+
+    for (const threadId of [draft.id, expired.id]) {
+      expect(() => store.archiveThread({ threadId, ownerId: "user-1", now: NOW })).toThrow(
+        "Thread not found",
+      );
+      expect(() => store.unarchiveThread({ threadId, ownerId: "user-1", now: NOW })).toThrow(
+        "Thread not found",
+      );
+    }
+
+    expect(
+      database.sqlite
+        .prepare(
+          `SELECT COUNT(*) AS count FROM audit_events
+           WHERE task_id IN (?, ?)`,
+        )
+        .get(draft.id, expired.id),
+    ).toEqual({ count: 0 });
   });
 
   test("appends monotonically sequenced events and replays from Last-Event-ID", () => {
@@ -1035,6 +2194,60 @@ describe("SQLitePlatformStore", () => {
         }),
       ]),
     );
+  });
+
+  test("claims Feishu writes before side effects and replays only the persisted receipt", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Write enterprise data",
+      now: NOW,
+    });
+    const input = {
+      callId: "write-call-1",
+      taskId: task.id,
+      turnId: "turn-1",
+      userId: "user-1",
+      tool: "feishu_doc_create",
+      arguments: { title: "confidential-title", content: "confidential-body" },
+      startedAt: NOW,
+    };
+
+    expect(store.claimToolWriteInvocation(input)).toEqual({ kind: "CLAIMED" });
+    expect(store.claimToolWriteInvocation(input)).toEqual({ kind: "IN_PROGRESS" });
+
+    const response = {
+      success: true,
+      contentItems: [
+        {
+          type: "inputText",
+          text: JSON.stringify({
+            documentId: "doc-1",
+            url: "https://feishu.cn/docx/doc-1",
+            revisionId: 2,
+          }),
+        },
+      ],
+    };
+    store.completeToolWriteInvocation({
+      ...input,
+      response,
+      success: true,
+      completedAt: new Date(NOW.getTime() + 5),
+    });
+
+    expect(store.claimToolWriteInvocation(input)).toEqual({ kind: "REPLAY", response });
+    expect(
+      store.claimToolWriteInvocation({
+        ...input,
+        arguments: { title: "different", content: "different" },
+      }),
+    ).toEqual({ kind: "CONFLICT" });
+    const persisted = database.sqlite
+      .prepare("SELECT input_digest, response_json FROM tool_calls WHERE call_id = ?")
+      .get(input.callId);
+    expect(JSON.stringify(persisted)).not.toMatch(/confidential-title|confidential-body/);
   });
 });
 

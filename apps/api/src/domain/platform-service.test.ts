@@ -1,4 +1,6 @@
 import { EventEmitter } from "node:events";
+import { access, mkdir, readdir, rename, rm, symlink, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import {
   BootstrapSchema,
   ModelCatalogSchema,
@@ -9,6 +11,7 @@ import {
   UserSettingsViewSchema,
 } from "@codexplatform/contracts";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { RpcError } from "../infra/codex/jsonl-rpc-client.js";
 import { createDatabase, type PlatformDatabase } from "../infra/db/database.js";
 import { migrateDatabase } from "../infra/db/migrate.js";
 import { encodeSse } from "../server.js";
@@ -18,8 +21,11 @@ import {
   ActiveTurnResumeConflictError,
   type ApprovalDraft,
   ApprovalTransportUnavailableError,
+  type AttachedGoalRuntimeResult,
   LocalPlatformService,
   ModelCatalogUnavailableError,
+  type PlanModeCatalogCapability,
+  type RuntimeGoalProjection,
   type RuntimeSafetyPort,
   type TaskEventDraft,
   type TaskExecutionAdapter,
@@ -154,6 +160,358 @@ describe("LocalPlatformService", () => {
     unsubscribe();
   });
 
+  test("enables Plan only from the eligible-account preset intersection and freezes the actual preset", async () => {
+    const project = await service.createProject("user-1", { name: "Plan mode" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Plan mode",
+    });
+
+    expect(
+      (await service.listComposerCapabilities("user-1", task.id)).find(
+        (capability) => capability.id === "plan-mode",
+      ),
+    ).toMatchObject({ availability: "AVAILABLE" });
+    await expect(
+      service.patchThreadComposer(task.id, "user-1", {
+        planMode: true,
+        revision: 0,
+      }),
+    ).resolves.toEqual({ planMode: true, revision: 1 });
+
+    await service.startTurn(task.id, "user-1", "Plan before acting", {
+      model: "fake-codex-standard",
+      reasoningEffort: "medium",
+      instructions: "requested",
+    });
+
+    expect(execution.startTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        effectiveConfig: expect.objectContaining({
+          model: "fake-codex-standard",
+          reasoningEffort: "high",
+          requestedConfig: {
+            model: "fake-codex-standard",
+            reasoningEffort: "medium",
+            instructions: expect.stringContaining("requested"),
+          },
+          collaborationPreset: {
+            name: "Plan",
+            mode: "plan",
+            settings: {
+              model: "fake-codex-standard",
+              reasoningEffort: "high",
+              developerInstructions: null,
+            },
+          },
+        }),
+      }),
+    );
+    const turn = database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+      id: string;
+    };
+    expect(store.getTurnInputSnapshot(turn.id)).toMatchObject({ planMode: true });
+  });
+
+  test("sends the explicit default preset after Plan is turned off", async () => {
+    const project = await service.createProject("user-1", { name: "Default mode" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Default mode",
+    });
+    await service.patchThreadComposer(task.id, "user-1", { planMode: true, revision: 0 });
+    await service.patchThreadComposer(task.id, "user-1", { planMode: false, revision: 1 });
+    await service.startTurn(task.id, "user-1", "Act", {
+      model: "fake-codex-standard",
+      reasoningEffort: "medium",
+    });
+    expect(execution.startTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        effectiveConfig: expect.objectContaining({
+          collaborationPreset: expect.objectContaining({ mode: "default", name: "Default" }),
+        }),
+      }),
+    );
+  });
+
+  test("fails closed when the allocated account Plan directory changed after capability display", async () => {
+    const project = await service.createProject("user-1", { name: "Changed Plan" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Changed Plan",
+    });
+    await service.listComposerCapabilities("user-1", task.id);
+    await service.patchThreadComposer(task.id, "user-1", { planMode: true, revision: 0 });
+    execution.readPlanModeCatalog.mockResolvedValueOnce({
+      availability: "UNAVAILABLE",
+      reasonCode: "PLAN_PRESET_MISSING",
+      reason: "spawn /Users/private/runtime --token secret_plan_probe",
+      presets: [],
+    });
+
+    await expect(
+      service.startTurn(task.id, "user-1", "Do not silently downgrade"),
+    ).rejects.toMatchObject({ code: "PLAN_MODE_CAPABILITY_CHANGED" });
+    expect(execution.startTask).not.toHaveBeenCalled();
+    expect(await service.listTaskEvents(task.id, "user-1", 0)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "TURN_FAILED",
+          payload: {
+            status: "failed",
+            code: "PLAN_MODE_CAPABILITY_CHANGED",
+            error: "Plan mode capability changed before execution.",
+          },
+        }),
+      ]),
+    );
+    expect(await service.listAudit()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "TURN_FAILED",
+          outcome: "FAILED",
+          summary: "PLAN_MODE_CAPABILITY_CHANGED: Plan mode capability changed before execution.",
+        }),
+      ]),
+    );
+    expect(JSON.stringify(await service.getThread(task.id, "user-1"))).not.toContain(
+      "secret_plan_probe",
+    );
+  });
+
+  test("revalidates the Plan preset model against the latest allocated-account catalog", async () => {
+    const planModel: ModelOption = {
+      ...STANDARD_MODEL,
+      id: "plan-model",
+      model: "plan-model",
+      displayName: "Plan Model",
+      isDefault: false,
+    };
+    execution.listModels
+      .mockResolvedValueOnce([STANDARD_MODEL, planModel])
+      .mockResolvedValueOnce([STANDARD_MODEL, planModel])
+      .mockResolvedValueOnce([STANDARD_MODEL]);
+    execution.readPlanModeCatalog.mockResolvedValue(planCatalog("plan-model", "high"));
+    const project = await service.createProject("user-1", { name: "Retired Plan model" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Retired Plan model",
+    });
+    await service.patchThreadComposer(task.id, "user-1", { planMode: true, revision: 0 });
+
+    await expect(
+      service.startTurn(task.id, "user-1", "Do not start retired model"),
+    ).rejects.toMatchObject({ code: "PLAN_PRESET_MODEL_UNAVAILABLE" });
+    expect(execution.listModels).toHaveBeenCalledTimes(3);
+    expect(execution.startTask).not.toHaveBeenCalled();
+    expect(await service.listTaskEvents(task.id, "user-1", 0)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "TURN_FAILED",
+          payload: {
+            status: "failed",
+            code: "PLAN_PRESET_MODEL_UNAVAILABLE",
+            error: "The selected collaboration preset is unavailable before execution.",
+          },
+        }),
+      ]),
+    );
+  });
+
+  test("rejects a collaboration preset effort unsupported by its actual model", async () => {
+    execution.listModels.mockResolvedValue([STANDARD_MODEL]);
+    execution.readPlanModeCatalog.mockResolvedValue(planCatalog("fake-codex-standard", "xhigh"));
+    const project = await service.createProject("user-1", { name: "Unsupported Plan effort" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Unsupported Plan effort",
+    });
+    await service.patchThreadComposer(task.id, "user-1", { planMode: true, revision: 0 });
+
+    await expect(
+      service.startTurn(task.id, "user-1", "Do not start unsupported effort"),
+    ).rejects.toMatchObject({ code: "PLAN_PRESET_MODEL_UNAVAILABLE" });
+    expect(execution.startTask).not.toHaveBeenCalled();
+  });
+
+  test("persists a promoted Plan failure code even though background promotion swallows rejection", async () => {
+    const project = await service.createProject("user-1", { name: "Promoted Plan failure" });
+    const tasks = await Promise.all(
+      ["First", "Second", "Promoted"].map((title) =>
+        service.createTask("user-1", { projectId: project.id, title }),
+      ),
+    );
+    await service.startTurn(tasks[0]?.id ?? "missing", "user-1", "First prompt");
+    await service.startTurn(tasks[1]?.id ?? "missing", "user-1", "Second prompt");
+    await service.startTurn(tasks[2]?.id ?? "missing", "user-1", "Promoted prompt");
+    execution.readPlanModeCatalog.mockResolvedValueOnce({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_CAPABILITY_PROBE_FAILED",
+      reason: "spawn /private/bin/codex --secret promoted_secret",
+      presets: [],
+    });
+
+    execution.emitTaskEvent({
+      taskId: tasks[0]?.id ?? "missing",
+      threadId: `thread-${tasks[0]?.id}`,
+      turnId: `codex-turn-${tasks[0]?.id}`,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed", durationMs: 10 },
+    });
+
+    await vi.waitFor(async () => {
+      expect(await service.listTaskEvents(tasks[2]?.id ?? "missing", "user-1", 0)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "TURN_FAILED",
+            payload: expect.objectContaining({ code: "PLAN_MODE_CAPABILITY_CHANGED" }),
+          }),
+        ]),
+      );
+    });
+    expect(execution.startTask).toHaveBeenCalledTimes(2);
+    expect(
+      JSON.stringify(await service.getThread(tasks[2]?.id ?? "missing", "user-1")),
+    ).not.toContain("promoted_secret");
+  });
+
+  test("advertises Plan only when every eligible account supports both collaboration presets", async () => {
+    leases.addAccount({
+      id: "account-2",
+      alias: "Codex B",
+      codexHome: "/tmp/codexplatform-test/account-2",
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+      maxActiveUsers: 4,
+      weeklyRemaining: 70,
+      quotaUpdatedAt: NOW,
+      allowUnknownQuota: false,
+      healthScore: 100,
+    });
+    execution.readPlanModeCatalog.mockImplementation(async (account, requested) => {
+      if (account.id === "account-2") {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+          reason: "Account B uses an older Runtime",
+          presets: [],
+        };
+      }
+      const model = requested?.model ?? "fake-codex-standard";
+      return {
+        availability: "AVAILABLE",
+        reasonCode: null,
+        reason: null,
+        presets: [
+          {
+            name: "Default",
+            mode: "default",
+            settings: {
+              model,
+              reasoningEffort: requested?.reasoningEffort ?? "medium",
+              developerInstructions: null,
+            },
+          },
+          {
+            name: "Plan",
+            mode: "plan",
+            settings: { model, reasoningEffort: "high", developerInstructions: null },
+          },
+        ],
+      };
+    });
+
+    expect(
+      (await service.listComposerCapabilities("user-1")).find(
+        (capability) => capability.id === "plan-mode",
+      ),
+    ).toMatchObject({
+      availability: "UNSUPPORTED",
+      unavailableReasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+    });
+  });
+
+  test("does not let a FULL account without this user's slot poison the Plan intersection", async () => {
+    leases.addAccount({
+      id: "account-full",
+      alias: "Codex Full",
+      codexHome: "/tmp/codexplatform-test/account-full",
+      status: "AVAILABLE",
+      authStatus: "AUTHENTICATED",
+      maxActiveUsers: 1,
+      weeklyRemaining: 90,
+      quotaUpdatedAt: NOW,
+      allowUnknownQuota: false,
+      healthScore: 100,
+    });
+    expect(
+      leases.acquireTurn({
+        userId: "user-2",
+        taskId: "occupy-full-account",
+        turnId: "occupy-full-account-turn",
+        now: NOW,
+      }),
+    ).toMatchObject({ kind: "LEASED", accountId: "account-full" });
+    execution.readPlanModeCatalog.mockImplementation(async (account) => {
+      if (account.id === "account-full") {
+        return {
+          availability: "UNAVAILABLE",
+          reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+          reason: "FULL account has an old Runtime",
+          presets: [],
+        };
+      }
+      return planCatalog();
+    });
+
+    expect(
+      (await service.listComposerCapabilities("user-1")).find(
+        (capability) => capability.id === "plan-mode",
+      ),
+    ).toMatchObject({ availability: "AVAILABLE" });
+    expect(execution.readPlanModeCatalog).toHaveBeenCalledTimes(1);
+    expect(execution.readPlanModeCatalog).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "account-1" }),
+    );
+  });
+
+  test.each(["DRAINING", "EXHAUSTED", "STALE_QUOTA"] as const)(
+    "does not start Runtime when the allocated account becomes %s during the Plan catalog probe",
+    async (transition) => {
+      const catalog = deferred<PlanModeCatalogCapability>();
+      execution.readPlanModeCatalog.mockReturnValueOnce(catalog.promise);
+      const project = await service.createProject("user-1", { name: `Plan race ${transition}` });
+      const thread = await service.createThread("user-1", {
+        projectId: project.id,
+        title: "Must not start",
+      });
+
+      const starting = service.startThreadTurn(thread.id, "user-1", "Do not run");
+      await vi.waitFor(() => expect(execution.readPlanModeCatalog).toHaveBeenCalledTimes(1));
+      if (transition === "STALE_QUOTA") {
+        leases.updateQuota("account-1", {
+          weeklyRemaining: 80,
+          quotaUpdatedAt: new Date(NOW.getTime() - 6 * 60_000),
+        });
+      } else {
+        leases.updateAccount("account-1", { status: transition });
+      }
+      catalog.resolve(planCatalog());
+
+      await expect(starting).rejects.toThrow();
+      expect(execution.startTask).not.toHaveBeenCalled();
+      expect(leases.getAccountOccupancy("account-1")).toEqual({
+        activeUsers: 0,
+        activeTurns: 0,
+      });
+      expect(await service.getThread(thread.id, "user-1")).toMatchObject({
+        status: "FAILED",
+        currentTurn: null,
+        turns: [expect.objectContaining({ status: "FAILED" })],
+      });
+    },
+  );
+
   test("persists a Steer only after the runtime accepts it and replays it as a platform Turn item", async () => {
     const project = await service.createProject("user-1", { name: "Steer persistence" });
     const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
@@ -194,11 +552,181 @@ describe("LocalPlatformService", () => {
       ],
     });
 
-    execution.steerTask.mockRejectedValueOnce(new Error("runtime rejected steer"));
+    execution.steerTask.mockRejectedValueOnce(new RpcError(-32000, "runtime rejected steer"));
     await expect(service.steerThread(task.id, "user-1", "不得落库")).rejects.toThrow(
       "runtime rejected steer",
     );
     expect(JSON.stringify(await service.getThread(task.id, "user-1"))).not.toContain("不得落库");
+  });
+
+  test("claims READY attachments into an immutable snapshot before an attachment-only Steer", async () => {
+    const project = await service.createProject("user-1", { name: "Steer attachment" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Initial");
+    const platformTurnId = (
+      database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+        id: string;
+      }
+    ).id;
+    const attachment = store.createAttachment({
+      id: "steer-attachment-1",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "diagram.png",
+      relativePath: ".codexplatform/attachments/steer-attachment-1/diagram.png",
+      mimeType: "image/png",
+      sizeBytes: 4,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+
+    await service.steerThread(task.id, "user-1", "", [attachment.id]);
+
+    expect(execution.steerTask).toHaveBeenLastCalledWith(
+      `thread-${task.id}`,
+      `codex-turn-${task.id}`,
+      "",
+      [
+        {
+          name: "diagram.png",
+          path: expect.stringContaining("/attachments/steer-attachment-1/diagram.png"),
+          mimeType: "image/png",
+        },
+      ],
+    );
+    expect(store.listSteerInputSnapshots(platformTurnId)).toEqual([
+      {
+        prompt: "",
+        attachments: [attachment],
+        goal: null,
+        planMode: false,
+        capturedAt: NOW.toISOString(),
+        deliveryStatus: "DELIVERED",
+        deliveryError: null,
+        deliveredAt: NOW.toISOString(),
+        failedAt: null,
+        unknownAt: null,
+      },
+    ]);
+    expect(() => store.deleteAttachment(attachment.id, task.id, "user-1")).toThrow(
+      "Attachment is already claimed by a Turn",
+    );
+  });
+
+  test("marks a rejected Steer failed and releases its attachment for a later delivery", async () => {
+    const project = await service.createProject("user-1", { name: "Steer retry" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Initial");
+    const platformTurnId = (
+      database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+        id: string;
+      }
+    ).id;
+    const attachment = store.createAttachment({
+      id: "steer-retry-attachment",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "retry.txt",
+      relativePath: ".codexplatform/attachments/steer-retry-attachment/retry.txt",
+      mimeType: "text/plain",
+      sizeBytes: 5,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    const deletable = store.createAttachment({
+      id: "steer-delete-after-failure",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "delete.txt",
+      relativePath: ".codexplatform/attachments/steer-delete-after-failure/delete.txt",
+      mimeType: "text/plain",
+      sizeBytes: 6,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    execution.steerTask.mockRejectedValueOnce(new RpcError(-32000, "runtime rejected steer"));
+
+    await expect(
+      service.steerThread(task.id, "user-1", "", [attachment.id, deletable.id]),
+    ).rejects.toThrow("runtime rejected steer");
+    expect(store.listSteerInputSnapshots(platformTurnId)).toEqual([
+      expect.objectContaining({
+        deliveryStatus: "FAILED",
+        deliveryError: "runtime rejected steer",
+        deliveredAt: null,
+        failedAt: NOW.toISOString(),
+      }),
+    ]);
+    await service.deleteAttachment(task.id, deletable.id, "user-1");
+    expect(store.getAttachment(deletable.id, task.id, "user-1")).toBeNull();
+
+    await expect(
+      service.steerThread(task.id, "user-1", "", [attachment.id]),
+    ).resolves.toMatchObject({ status: "RUNNING" });
+    expect(
+      store.listSteerInputSnapshots(platformTurnId).map((snapshot) => snapshot.deliveryStatus),
+    ).toEqual(["FAILED", "DELIVERED"]);
+  });
+
+  test("marks an uncertain Steer UNKNOWN, preserves its claim, and requires recovery", async () => {
+    const project = await service.createProject("user-1", { name: "Steer uncertain" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Initial");
+    const platformTurnId = (
+      database.sqlite.prepare("SELECT id FROM turns WHERE task_id = ?").get(task.id) as {
+        id: string;
+      }
+    ).id;
+    const attachment = store.createAttachment({
+      id: "steer-uncertain-attachment",
+      threadId: task.id,
+      ownerId: "user-1",
+      kind: "FILE",
+      name: "uncertain.txt",
+      relativePath: ".codexplatform/attachments/steer-uncertain-attachment/uncertain.txt",
+      mimeType: "text/plain",
+      sizeBytes: 9,
+      fileCount: 1,
+      scanStatus: "READY",
+      now: NOW,
+    });
+    execution.steerTask.mockRejectedValueOnce(new Error("RPC request timed out: turn/steer"));
+
+    await expect(service.steerThread(task.id, "user-1", "", [attachment.id])).rejects.toThrow(
+      "RPC request timed out",
+    );
+
+    expect(store.listSteerInputSnapshots(platformTurnId)).toEqual([
+      expect.objectContaining({
+        deliveryStatus: "UNKNOWN",
+        deliveryError: "RPC request timed out: turn/steer",
+      }),
+    ]);
+    expect(() => store.deleteAttachment(attachment.id, task.id, "user-1")).toThrow(
+      "Attachment is already claimed by a Turn",
+    );
+    expect(store.getTurn(platformTurnId)).toMatchObject({ status: "NEEDS_RECOVERY" });
+    expect(await service.getTask(task.id, "user-1")).toMatchObject({ status: "NEEDS_RECOVERY" });
+    expect(await service.listTaskEvents(task.id, "user-1", 0)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "RECOVERY_REQUIRED",
+          payload: expect.objectContaining({
+            reason: expect.stringContaining("delivery outcome is unknown"),
+          }),
+        }),
+      ]),
+    );
+    await expect(service.steerThread(task.id, "user-1", "", [attachment.id])).rejects.toThrow(
+      "does not accept Steer",
+    );
+    expect(execution.steerTask).toHaveBeenCalledTimes(1);
   });
 
   test("allows Steer only for RUNNING or WAITING_APPROVAL tasks", async () => {
@@ -208,6 +736,556 @@ describe("LocalPlatformService", () => {
       "does not accept Steer",
     );
     expect(execution.steerTask).not.toHaveBeenCalled();
+  });
+
+  test("does not expose an owned Draft through legacy task detail or event reads", async () => {
+    const project = await service.createProject("user-1", { name: "Hidden draft" });
+    const draft = await service.createDraft("user-1", { projectId: project.id });
+
+    await expect(service.getTask(draft.id, "user-1")).resolves.toBeNull();
+    await expect(service.listTaskEvents(draft.id, "user-1", 0)).resolves.toBeNull();
+    await expect(service.listThreadEvents(draft.id, "user-1", 0)).resolves.toBeNull();
+  });
+
+  test("restores a hidden Draft only to its owner with its Composer state", async () => {
+    const project = await service.createProject("user-1", { name: "Restore Draft" });
+    const draft = await service.createDraft("user-1", { projectId: project.id });
+    await service.patchThreadComposer(draft.id, "user-1", {
+      planMode: true,
+      revision: 0,
+    });
+
+    await expect(service.getDraft(draft.id, "user-1")).resolves.toEqual({
+      id: draft.id,
+      projectId: project.id,
+      lifecycleState: "DRAFT",
+    });
+    await expect(service.getThreadComposer(draft.id, "user-1")).resolves.toEqual({
+      planMode: true,
+      revision: 1,
+    });
+    await expect(service.getDraft(draft.id, "user-2")).resolves.toBeNull();
+    await expect(service.getThreadComposer(draft.id, "user-2")).resolves.toBeNull();
+  });
+
+  test("maintenance expires Drafts with their files idempotently using its supplied clock", async () => {
+    const project = await service.createProject("user-1", { name: "Draft maintenance" });
+    const draft = await service.createDraft("user-1", { projectId: project.id });
+    const attachment = await service.uploadAttachment(draft.id, "user-1", {
+      files: [
+        {
+          name: "notes.txt",
+          relativePath: "notes.txt",
+          mimeType: "text/plain",
+          content: Buffer.from("hello"),
+        },
+      ],
+    });
+    expect(attachment).not.toHaveProperty("relativePath");
+    await expect(service.listAttachments(draft.id, "user-1")).resolves.toEqual([
+      expect.not.objectContaining({ relativePath: expect.anything() }),
+    ]);
+    const attachmentRoot = join(
+      "/tmp/codexplatform-test",
+      "workspaces",
+      draft.id,
+      ".codexplatform",
+      "attachments",
+      attachment.id,
+    );
+    const maintenanceAt = new Date(NOW.getTime() + 2 * 60 * 60_000);
+
+    await access(attachmentRoot);
+    await service.runMaintenance(maintenanceAt);
+    await expect(access(attachmentRoot)).rejects.toThrow();
+    expect(store.getTaskForUser(draft.id, "user-1")).toBeNull();
+
+    await expect(service.runMaintenance(maintenanceAt)).resolves.toBeUndefined();
+  });
+
+  test("persists a Goal across Turns and sends its immutable snapshot after thread preparation", async () => {
+    const project = await service.createProject("user-1", { name: "Goal runtime" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await expect(
+      service.putThreadGoal(task.id, "user-1", {
+        objective: "持续完成",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      }),
+    ).resolves.toMatchObject({ status: "ACTIVE", runtimeSyncState: "PENDING" });
+    await expect(service.getThreadGoal(task.id, "user-2")).rejects.toThrow("Thread not found");
+
+    await service.startTurn(task.id, "user-1", "第一轮");
+    expect(execution.startTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        goal: expect.objectContaining({ objective: "持续完成", status: "ACTIVE" }),
+        onThreadPrepared: expect.any(Function),
+      }),
+    );
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "ACTIVE",
+      runtimeSyncState: "SYNCED",
+    });
+  });
+
+  test("fails closed with a machine-readable reason when the routed Runtime lacks Goal protocol", async () => {
+    execution.readGoalCapability.mockResolvedValueOnce({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "Locked Goal protocol is unavailable",
+    });
+    await expect(service.listComposerCapabilities("user-1")).resolves.toContainEqual(
+      expect.objectContaining({
+        id: "goal",
+        availability: "UNSUPPORTED",
+        unavailableReasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      }),
+    );
+
+    const project = await service.createProject("user-1", { name: "Old Runtime" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Old Runtime",
+    });
+    execution.readGoalCapability.mockResolvedValueOnce({
+      availability: "UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      reason: "Locked Goal protocol is unavailable",
+    });
+    await expect(
+      service.putThreadGoal(task.id, "user-1", {
+        objective: "不能被伪造为可用",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      }),
+    ).rejects.toMatchObject({
+      code: "GOAL_CAPABILITY_UNAVAILABLE",
+      reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+      httpStatus: 409,
+    });
+    expect(await service.getThreadGoal(task.id, "user-1")).toBeNull();
+  });
+
+  test("preserves a prepared Runtime Thread and requires recovery when Goal sync fails", async () => {
+    const project = await service.createProject("user-1", { name: "Goal recovery" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "持续完成",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    execution.startTask.mockImplementationOnce(async (input) => {
+      input.onThreadPrepared?.(`thread-${input.taskId}`);
+      throw new Error("Goal sync failed");
+    });
+
+    await expect(service.startTurn(task.id, "user-1", "执行")).rejects.toThrow("Goal sync failed");
+    expect(store.getTaskForUser(task.id, "user-1")).toMatchObject({
+      threadId: `thread-${task.id}`,
+      status: "NEEDS_RECOVERY",
+    });
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
+    });
+  });
+
+  test("limits an active Goal when its time budget expires and blocks another Turn", async () => {
+    const project = await service.createProject("user-1", { name: "Goal budget" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "短目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 1,
+    });
+    await service.runMaintenance(new Date(NOW.getTime() + 2_000));
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "BUDGET_LIMITED",
+    });
+    await expect(service.startTurn(task.id, "user-1", "不应执行")).rejects.toThrow(
+      "does not accept new Turns",
+    );
+  });
+
+  test("limits an active Goal from authoritative Runtime token usage", async () => {
+    const project = await service.createProject("user-1", { name: "Goal tokens" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "有界执行",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await service.startTurn(task.id, "user-1", "执行");
+    execution.interruptTask.mockClear();
+    execution.syncThreadGoal.mockClear();
+    execution.emitTaskEvent({
+      taskId: task.id,
+      threadId: `thread-${task.id}`,
+      turnId: `codex-turn-${task.id}`,
+      type: "TOKEN_USAGE_UPDATED",
+      payload: tokenUsagePayload(200_000, 180_000, 0, 20_000, 0),
+    });
+    execution.emitTaskEvent({
+      taskId: task.id,
+      threadId: `thread-${task.id}`,
+      turnId: `codex-turn-${task.id}`,
+      type: "TOKEN_USAGE_UPDATED",
+      payload: tokenUsagePayload(210_000, 190_000, 0, 20_000, 0),
+    });
+    await nextTick();
+
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "BUDGET_LIMITED",
+      tokensUsed: 210_000,
+      runtimeSyncState: "SYNCED",
+    });
+    expect(execution.interruptTask).toHaveBeenCalledTimes(1);
+    expect(execution.interruptTask).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      `codex-turn-${task.id}`,
+    );
+    expect(execution.syncThreadGoal).toHaveBeenCalledTimes(1);
+    expect(execution.syncThreadGoal).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      expect.objectContaining({ status: "BUDGET_LIMITED", tokensUsed: 200_000 }),
+    );
+  });
+
+  test("interrupts an active Runtime Turn when the Goal watchdog reaches its time budget", async () => {
+    const project = await service.createProject("user-1", { name: "Goal watchdog" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "短时执行",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 1,
+    });
+    await service.startTurn(task.id, "user-1", "执行");
+    execution.interruptTask.mockClear();
+    execution.syncThreadGoal.mockClear();
+
+    await service.runMaintenance(new Date(NOW.getTime() + 2_000));
+    await service.runMaintenance(new Date(NOW.getTime() + 3_000));
+
+    expect(execution.interruptTask).toHaveBeenCalledTimes(1);
+    expect(execution.interruptTask).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      `codex-turn-${task.id}`,
+    );
+    expect(execution.syncThreadGoal).toHaveBeenCalledTimes(1);
+    expect(execution.syncThreadGoal).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      expect.objectContaining({ status: "BUDGET_LIMITED" }),
+    );
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "BUDGET_LIMITED",
+      runtimeSyncState: "SYNCED",
+    });
+  });
+
+  test("requires Goal recovery when time-budget Runtime synchronization fails", async () => {
+    const project = await service.createProject("user-1", { name: "Goal watchdog failure" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "短时执行",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 1,
+    });
+    await service.startTurn(task.id, "user-1", "执行");
+    execution.syncThreadGoal.mockRejectedValueOnce(new Error("Runtime Goal sync failed"));
+
+    await expect(service.runMaintenance(new Date(NOW.getTime() + 2_000))).resolves.toBeUndefined();
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
+    });
+  });
+
+  test.each([
+    ["PAUSE", "PAUSED"],
+    ["COMPLETE", "COMPLETE"],
+  ] as const)(
+    "interrupts an active Turn before applying and synchronizing a %s Goal mutation",
+    async (action, expectedStatus) => {
+      const project = await service.createProject("user-1", { name: `Goal ${action}` });
+      const task = await service.createTask("user-1", {
+        projectId: project.id,
+        title: `Goal ${action}`,
+      });
+      await service.putThreadGoal(task.id, "user-1", {
+        objective: "持续执行",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      });
+      await service.startTurn(task.id, "user-1", "执行");
+      execution.interruptTask.mockClear();
+      execution.syncThreadGoal.mockClear();
+
+      const goal = await service.patchThreadGoal(task.id, "user-1", { action });
+
+      expect(goal).toMatchObject({ status: expectedStatus, runtimeSyncState: "SYNCED" });
+      expect(execution.interruptTask).toHaveBeenCalledWith(
+        `thread-${task.id}`,
+        `codex-turn-${task.id}`,
+      );
+      expect(execution.syncThreadGoal).toHaveBeenCalledWith(
+        `thread-${task.id}`,
+        expect.objectContaining({ status: expectedStatus }),
+      );
+      expect(vi.mocked(execution.interruptTask).mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(execution.syncThreadGoal).mock.invocationCallOrder[0] as number,
+      );
+    },
+  );
+
+  test("interrupts an active Turn and clears the Runtime Goal before deleting platform state", async () => {
+    const project = await service.createProject("user-1", { name: "Goal clear" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal clear",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "持续执行",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await service.startTurn(task.id, "user-1", "执行");
+    execution.interruptTask.mockClear();
+    execution.clearThreadGoal.mockClear();
+
+    await expect(service.deleteThreadGoal(task.id, "user-1")).resolves.toEqual({
+      cleared: true,
+      runtimeSyncState: "SYNCED",
+    });
+    expect(execution.interruptTask).toHaveBeenCalledWith(
+      `thread-${task.id}`,
+      `codex-turn-${task.id}`,
+    );
+    expect(execution.clearThreadGoal).toHaveBeenCalledWith(`thread-${task.id}`);
+    expect(vi.mocked(execution.interruptTask).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(execution.clearThreadGoal).mock.invocationCallOrder[0] as number,
+    );
+    expect(await service.getThreadGoal(task.id, "user-1")).toBeNull();
+  });
+
+  test("does not report SQLite success when an attached Runtime rejects a Goal update", async () => {
+    const project = await service.createProject("user-1", { name: "Goal sync rejection" });
+    const task = await service.createTask("user-1", {
+      projectId: project.id,
+      title: "Goal sync rejection",
+    });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "原目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await service.startTurn(task.id, "user-1", "执行");
+    execution.syncThreadGoal.mockRejectedValueOnce(new Error("Runtime rejected Goal"));
+
+    await expect(
+      service.patchThreadGoal(task.id, "user-1", { objective: "不应静默成功" }),
+    ).rejects.toThrow("Runtime rejected Goal");
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
+    });
+  });
+
+  test.each(["PATCH_DELETE", "PUT_DELETE"] as const)(
+    "serializes attached Runtime Goal mutation chain for %s",
+    async (scenario) => {
+      const project = await service.createProject("user-1", { name: scenario });
+      const task = await service.createTask("user-1", { projectId: project.id, title: scenario });
+      await service.putThreadGoal(task.id, "user-1", {
+        objective: "原目标",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      });
+      await service.startTurn(task.id, "user-1", "建立 Runtime Thread");
+      execution.syncThreadGoal.mockClear();
+      execution.clearThreadGoal.mockClear();
+      const gate = deferred<AttachedGoalRuntimeResult<RuntimeGoalProjection>>();
+      execution.syncThreadGoal.mockImplementationOnce(async () => gate.promise);
+
+      const first =
+        scenario === "PATCH_DELETE"
+          ? service.patchThreadGoal(task.id, "user-1", { objective: "先提交的修改" })
+          : service.putThreadGoal(task.id, "user-1", {
+              objective: "先提交的替换",
+              tokenBudget: 100_000,
+              timeBudgetSeconds: 1_800,
+            });
+      await nextTick();
+      const deletion = service.deleteThreadGoal(task.id, "user-1");
+      await nextTick();
+      expect(execution.clearThreadGoal).not.toHaveBeenCalled();
+
+      const stored = await service.getThreadGoal(task.id, "user-1");
+      gate.resolve({
+        attachment: "ATTACHED",
+        goal: {
+          objective: stored?.objective ?? "",
+          status: stored?.status ?? "ACTIVE",
+          tokenBudget: stored?.tokenBudget ?? 1,
+          tokensUsed: stored?.tokensUsed ?? 0,
+          timeBudgetSeconds: stored?.timeBudgetSeconds ?? 1,
+          timeUsedSeconds: stored?.timeUsedSeconds ?? 0,
+        },
+        runtimeUpdatedAt: NOW.getTime() + 10,
+      });
+      await first;
+      await deletion;
+
+      expect(execution.clearThreadGoal).toHaveBeenCalledTimes(1);
+      expect(await service.getThreadGoal(task.id, "user-1")).toBeNull();
+    },
+  );
+
+  test.each([
+    ["PUT", "ALLOCATING"],
+    ["PATCH", "QUEUED"],
+    ["DELETE", "QUEUED"],
+  ] as const)(
+    "rejects Goal %s while a %s Turn owns an immutable input snapshot",
+    async (operation, turnStatus) => {
+      const project = await service.createProject("user-1", { name: "Frozen Goal" });
+      const task = await service.createTask("user-1", {
+        projectId: project.id,
+        title: "Frozen Goal",
+      });
+      await service.putThreadGoal(task.id, "user-1", {
+        objective: "已冻结的目标",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      });
+      const turn = store.createTurn({
+        id: `pending-goal-${operation.toLowerCase()}`,
+        taskId: task.id,
+        ownerId: "user-1",
+        prompt: "使用旧 Goal 执行",
+        status: turnStatus,
+        now: NOW,
+      });
+      execution.interruptTask.mockClear();
+      execution.syncThreadGoal.mockClear();
+      execution.clearThreadGoal.mockClear();
+
+      const mutation =
+        operation === "PUT"
+          ? service.putThreadGoal(task.id, "user-1", {
+              objective: "不能覆盖",
+              tokenBudget: 100_000,
+              timeBudgetSeconds: 1_800,
+            })
+          : operation === "PATCH"
+            ? service.patchThreadGoal(task.id, "user-1", { objective: "不能修改" })
+            : service.deleteThreadGoal(task.id, "user-1");
+      await expect(mutation).rejects.toMatchObject({
+        code: "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN",
+      });
+
+      expect(store.getThreadGoal(task.id, "user-1")).toMatchObject({
+        objective: "已冻结的目标",
+        status: "ACTIVE",
+      });
+      expect(store.getTurnInputSnapshot(turn.id)?.goal).toMatchObject({
+        objective: "已冻结的目标",
+      });
+      expect(store.getTurn(turn.id)).toMatchObject({ status: turnStatus });
+      expect(execution.interruptTask).not.toHaveBeenCalled();
+      expect(execution.syncThreadGoal).not.toHaveBeenCalled();
+      expect(execution.clearThreadGoal).not.toHaveBeenCalled();
+    },
+  );
+
+  test("keeps a durable cleanup job when file deletion fails and maintenance retries it", async () => {
+    const project = await service.createProject("user-1", { name: "Cleanup retry" });
+    const draft = await service.createDraft("user-1", { projectId: project.id });
+    const attachment = await service.uploadAttachment(draft.id, "user-1", {
+      files: [
+        {
+          name: "notes.txt",
+          relativePath: "notes.txt",
+          mimeType: "text/plain",
+          content: Buffer.from("hello"),
+        },
+      ],
+    });
+    const workspace = join("/tmp/codexplatform-test", "workspaces", draft.id);
+    const privateRoot = join(workspace, ".codexplatform");
+    const backupRoot = join(workspace, ".codexplatform-backup");
+    const escapeRoot = join("/tmp", `codexplatform-cleanup-escape-${draft.id}`);
+    const attachmentRoot = join(privateRoot, "attachments", attachment.id);
+    await rename(privateRoot, backupRoot);
+    await mkdir(escapeRoot, { recursive: true });
+    await symlink(escapeRoot, privateRoot);
+
+    try {
+      await expect(
+        service.deleteAttachment(draft.id, attachment.id, "user-1"),
+      ).resolves.toBeUndefined();
+      expect(store.getAttachment(attachment.id, draft.id, "user-1")).toBeNull();
+      expect(store.listAttachmentCleanupJobs()).toEqual([
+        expect.objectContaining({ attachmentId: attachment.id, status: "FAILED", attempts: 1 }),
+      ]);
+      await access(join(backupRoot, "attachments", attachment.id));
+
+      await unlink(privateRoot);
+      await rename(backupRoot, privateRoot);
+      await service.runMaintenance(NOW);
+
+      await expect(access(attachmentRoot)).rejects.toThrow();
+      expect(store.listAttachmentCleanupJobs()).toEqual([]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+      await rm(escapeRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a symlink in the staging ancestry without writing outside the workspace", async () => {
+    const project = await service.createProject("user-1", { name: "Symlink safety" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    const workspace = join("/tmp/codexplatform-test", "workspaces", task.id);
+    const escapeRoot = join("/tmp", `codexplatform-escape-${task.id}`);
+    await mkdir(workspace, { recursive: true });
+    await mkdir(escapeRoot, { recursive: true });
+    await symlink(escapeRoot, join(workspace, ".codexplatform"));
+
+    try {
+      await expect(
+        service.uploadAttachment(task.id, "user-1", {
+          files: [
+            {
+              name: "notes.txt",
+              relativePath: "notes.txt",
+              mimeType: "text/plain",
+              content: Buffer.from("must stay contained"),
+            },
+          ],
+        }),
+      ).rejects.toThrow("Unsafe attachment staging path");
+      expect(await readdir(escapeRoot)).toEqual([]);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+      await rm(escapeRoot, { recursive: true, force: true });
+    }
   });
 
   test("returns strict public task DTOs with the latest prompt and live queue state", async () => {
@@ -516,7 +1594,7 @@ describe("LocalPlatformService", () => {
       currentTurn: {
         configSnapshot: {
           model: "fake-codex-standard",
-          reasoningEffort: "MEDIUM",
+          reasoningEffort: "medium",
         },
       },
     });
@@ -721,7 +1799,7 @@ describe("LocalPlatformService", () => {
           id: schedulerTurn.id,
           prompt: "Inspect the repository",
           configSnapshot: expect.objectContaining({
-            reasoningEffort: "MEDIUM",
+            reasoningEffort: "medium",
             approvalMode: "ASK",
           }),
         }),
@@ -793,6 +1871,27 @@ describe("LocalPlatformService", () => {
     expect((await service.listThreads("user-1")).map((thread) => thread.id)).toEqual(
       expect.arrayContaining([visible.id, archived.id]),
     );
+  });
+
+  test("rejects archive and unarchive for hidden and expired Drafts without audit", async () => {
+    const project = await service.createProject("user-1", { name: "Hidden archive guard" });
+    const expired = await service.createDraft("user-1", { projectId: project.id });
+    await service.cleanupExpiredDrafts(new Date(NOW.getTime() + 2 * 60 * 60_000));
+    const draft = await service.createDraft("user-1", { projectId: project.id });
+
+    for (const threadId of [draft.id, expired.id]) {
+      await expect(service.archiveThread(threadId, "user-1")).rejects.toThrow("Thread not found");
+      await expect(service.unarchiveThread(threadId, "user-1")).rejects.toThrow("Thread not found");
+    }
+
+    expect(
+      database.sqlite
+        .prepare(
+          `SELECT COUNT(*) AS count FROM audit_events
+           WHERE task_id IN (?, ?)`,
+        )
+        .get(draft.id, expired.id),
+    ).toEqual({ count: 0 });
   });
 
   test("refuses to archive a Thread while its Turn is running", async () => {
@@ -970,7 +2069,7 @@ describe("LocalPlatformService", () => {
       1,
       expect.objectContaining({
         effectiveConfig: expect.objectContaining({
-          reasoningEffort: "HIGH",
+          reasoningEffort: "high",
           permissionMode: "READ_ONLY",
           approvalMode: "ASK",
           personality: "FRIENDLY",
@@ -983,6 +2082,8 @@ describe("LocalPlatformService", () => {
           toolScopes: [
             "feishu_wiki_search",
             "feishu_doc_read",
+            "feishu_doc_create",
+            "feishu_doc_update",
             "demo_db_query",
             "demo_business_get",
           ],
@@ -994,7 +2095,7 @@ describe("LocalPlatformService", () => {
       2,
       expect.objectContaining({
         effectiveConfig: expect.objectContaining({
-          reasoningEffort: "LOW",
+          reasoningEffort: "low",
           permissionMode: "WORKSPACE_WRITE",
           approvalMode: "ASK",
           personality: "NONE",
@@ -1046,6 +2147,21 @@ describe("LocalPlatformService", () => {
       instructions:
         "Apply organization policy and use the authenticated employee identity for enterprise tools.",
       sourceVersion: "org-policy-1.1a-v1",
+      requestedConfig: {
+        model: "fake-codex-deep",
+        reasoningEffort: "xhigh",
+        instructions:
+          "Apply organization policy and use the authenticated employee identity for enterprise tools.",
+      },
+      collaborationPreset: {
+        name: "Default",
+        mode: "default",
+        settings: {
+          model: "fake-codex-deep",
+          reasoningEffort: "xhigh",
+          developerInstructions: null,
+        },
+      },
     });
     expect(execution.startTask).toHaveBeenLastCalledWith(
       expect.objectContaining({
@@ -1630,6 +2746,45 @@ describe("LocalPlatformService", () => {
     expect(leases.getQueue()).toEqual([]);
   });
 
+  test("keeps a queued Turn and its frozen Goal unchanged when a mutation is rejected", async () => {
+    const project = await service.createProject("user-1", { name: "Queued Goal" });
+    const tasks = await Promise.all(
+      [1, 2, 3].map((index) =>
+        service.createTask("user-1", {
+          projectId: project.id,
+          title: `Queued Goal ${index}`,
+        }),
+      ),
+    );
+    const queuedTask = tasks[2];
+    if (!queuedTask) throw new Error("Missing queued task");
+    await service.putThreadGoal(queuedTask.id, "user-1", {
+      objective: "排队时冻结",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await service.startTurn(tasks[0]?.id ?? "missing", "user-1", "占用槽位 1");
+    await service.startTurn(tasks[1]?.id ?? "missing", "user-1", "占用槽位 2");
+    const queued = await service.startTurn(queuedTask.id, "user-1", "稍后执行");
+    expect(queued).toMatchObject({ status: "QUEUED", position: 1 });
+    const queuedTurn = store.getActiveTurnForTask(queuedTask.id, "user-1");
+    expect(queuedTurn).toMatchObject({ status: "QUEUED" });
+
+    await expect(
+      service.patchThreadGoal(queuedTask.id, "user-1", { objective: "不得穿透队列快照" }),
+    ).rejects.toMatchObject({ code: "GOAL_MUTATION_BLOCKED_BY_PENDING_TURN" });
+
+    expect(leases.getQueue()).toEqual([
+      expect.objectContaining({ taskId: queuedTask.id, turnId: queuedTurn?.id }),
+    ]);
+    expect(store.getTurnInputSnapshot(queuedTurn?.id ?? "")?.goal).toMatchObject({
+      objective: "排队时冻结",
+    });
+    expect(store.getThreadGoal(queuedTask.id, "user-1")).toMatchObject({
+      objective: "排队时冻结",
+    });
+  });
+
   test("never returns the private CODEX_HOME from account administration", async () => {
     const added = await service.addAccount({ alias: "Codex B" }, "user-1");
     const restored = await service.setAccountState("account-1", "AVAILABLE", "user-1");
@@ -2123,6 +3278,11 @@ describe("LocalPlatformService", () => {
   test("immediately recovers all persisted running Turns after a process restart", async () => {
     const project = await service.createProject("user-1", { name: "Restart recovery" });
     const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.putThreadGoal(task.id, "user-1", {
+      objective: "跨重启目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
     await service.startTurn(task.id, "user-1", "Run once");
 
     expect(service.recoverInterruptedTurns()).toBe(1);
@@ -2138,8 +3298,67 @@ describe("LocalPlatformService", () => {
         (event) => event.type === "RECOVERY_REQUIRED",
       ),
     ).toHaveLength(1);
+    expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
+    });
+    await expect(service.startTurn(task.id, "user-1", "不得在恢复前继续")).rejects.toThrow(
+      "does not accept new Turns",
+    );
     expect(accounts.list()[0]).toMatchObject({ activeTurns: 0 });
   });
+
+  test.each(["ACTIVE", "PAUSED", "BUDGET_LIMITED"] as const)(
+    "recovers a persisted %s Runtime Goal at startup without a running Turn",
+    async (goalStatus) => {
+      const project = await service.createProject("user-1", { name: `Startup ${goalStatus}` });
+      const task = await service.createTask("user-1", {
+        projectId: project.id,
+        title: `Startup ${goalStatus}`,
+      });
+      await service.putThreadGoal(task.id, "user-1", {
+        objective: "跨重启未完成目标",
+        tokenBudget: 200_000,
+        timeBudgetSeconds: 3_600,
+      });
+      await service.startTurn(task.id, "user-1", "建立 Runtime 绑定");
+      execution.emitTaskEvent({
+        taskId: task.id,
+        threadId: `thread-${task.id}`,
+        turnId: `codex-turn-${task.id}`,
+        type: "TURN_COMPLETED",
+        payload: { status: "completed" },
+      });
+      if (goalStatus === "PAUSED") {
+        await service.patchThreadGoal(task.id, "user-1", { action: "PAUSE" });
+      } else if (goalStatus === "BUDGET_LIMITED") {
+        store.updateThreadGoalTokens(task.id, "user-1", 200_000, NOW);
+      }
+
+      expect(service.recoverInterruptedTurns()).toBe(0);
+      expect(await service.getThreadGoal(task.id, "user-1")).toMatchObject({
+        status: "NEEDS_RECOVERY",
+        runtimeSyncState: "NEEDS_RECOVERY",
+      });
+      expect(await service.getTask(task.id, "user-1")).toMatchObject({
+        status: "NEEDS_RECOVERY",
+      });
+      expect(
+        (await service.listTaskEvents(task.id, "user-1", 0))?.filter(
+          (event) => event.type === "RECOVERY_REQUIRED",
+        ),
+      ).toHaveLength(1);
+      await expect(service.startTurn(task.id, "user-1", "不得继续")).rejects.toThrow(
+        "does not accept new Turns",
+      );
+      expect(service.recoverInterruptedTurns()).toBe(0);
+      expect(
+        (await service.listTaskEvents(task.id, "user-1", 0))?.filter(
+          (event) => event.type === "RECOVERY_REQUIRED",
+        ),
+      ).toHaveLength(1);
+    },
+  );
 
   test("recovers an orphaned ALLOCATING Turn left before lease acquisition", async () => {
     const project = await service.createProject("user-1", { name: "Allocating recovery" });
@@ -2271,6 +3490,60 @@ describe("LocalPlatformService", () => {
     expect(
       (await service.listTaskEvents(task.id, "user-1", 0))?.map((event) => event.type),
     ).toEqual(["LEASE_ACQUIRED", "TURN_COMPLETED"]);
+  });
+
+  test("reconciles a terminal event that omits the Runtime Turn identity", async () => {
+    const project = await service.createProject("user-1", { name: "Implicit terminal" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    await service.startTurn(task.id, "user-1", "Finish without an event Turn id");
+
+    execution.emitTaskEvent({
+      taskId: task.id,
+      threadId: `thread-${task.id}`,
+      turnId: null,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed" },
+    });
+
+    expect(await service.getTask(task.id, "user-1")).toMatchObject({ status: "COMPLETED" });
+    expect(
+      database.sqlite.prepare("SELECT status FROM turns WHERE task_id = ?").get(task.id),
+    ).toEqual({
+      status: "COMPLETED",
+    });
+    expect(accounts.list()[0]).toMatchObject({ activeTurns: 0 });
+    expect(await service.listTaskEvents(task.id, "user-1", 0)).toEqual([
+      expect.objectContaining({ type: "LEASE_ACQUIRED" }),
+      expect.objectContaining({ type: "TURN_COMPLETED", turnId: expect.any(String) }),
+    ]);
+  });
+
+  test("reconciles an identity-free terminal event emitted before startTask resolves", async () => {
+    const project = await service.createProject("user-1", { name: "Implicit early terminal" });
+    const task = await service.createTask("user-1", { projectId: project.id, title: "Task" });
+    execution.startTask.mockImplementationOnce(async () => {
+      execution.emitTaskEvent({
+        taskId: task.id,
+        threadId: `thread-${task.id}`,
+        turnId: null,
+        type: "TURN_COMPLETED",
+        payload: { status: "completed" },
+      });
+      return {
+        threadId: `thread-${task.id}`,
+        turnId: `codex-turn-${task.id}`,
+      };
+    });
+
+    await expect(service.startTurn(task.id, "user-1", "Finish immediately")).resolves.toMatchObject(
+      {
+        status: "COMPLETED",
+      },
+    );
+    expect(
+      database.sqlite.prepare("SELECT status FROM turns WHERE task_id = ?").get(task.id),
+    ).toEqual({ status: "COMPLETED" });
+    expect(accounts.list()[0]).toMatchObject({ activeTurns: 0 });
   });
 
   test("reconciles an approval emitted before startTask resolves", async () => {
@@ -2480,9 +3753,27 @@ describe("LocalPlatformService", () => {
       projectId: project2.id,
       title: "Task 2",
     });
+    await service.putThreadGoal(task1.id, "user-1", {
+      objective: "用户一未完成目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
+    await service.putThreadGoal(task2.id, "user-2", {
+      objective: "用户二未完成目标",
+      tokenBudget: 200_000,
+      timeBudgetSeconds: 3_600,
+    });
     await service.startTurn(task1.id, "user-1", "Run one");
     await service.startTurn(task2.id, "user-2", "Run two");
-    expect(accounts.list()[0]).toMatchObject({ activeTurns: 2 });
+    execution.emitTaskEvent({
+      taskId: task2.id,
+      threadId: `thread-${task2.id}`,
+      turnId: `codex-turn-${task2.id}`,
+      type: "TURN_COMPLETED",
+      payload: { status: "completed" },
+    });
+    await service.patchThreadGoal(task2.id, "user-2", { action: "PAUSE" });
+    expect(accounts.list()[0]).toMatchObject({ activeTurns: 1 });
 
     execution.emit("accountCrashed", {
       accountId: "account-1",
@@ -2498,6 +3789,14 @@ describe("LocalPlatformService", () => {
     expect(accounts.list()[0]).toMatchObject({
       status: "QUARANTINED",
       activeTurns: 0,
+    });
+    expect(await service.getThreadGoal(task1.id, "user-1")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
+    });
+    expect(await service.getThreadGoal(task2.id, "user-2")).toMatchObject({
+      status: "NEEDS_RECOVERY",
+      runtimeSyncState: "NEEDS_RECOVERY",
     });
     for (const [task, userId] of [
       [task1, "user-1"],
@@ -2586,11 +3885,84 @@ describe("LocalPlatformService", () => {
 });
 
 class FakeExecution extends EventEmitter implements TaskExecutionAdapter {
+  private goalRuntimeVersion = NOW.getTime();
   readonly listModels = vi.fn<TaskExecutionAdapter["listModels"]>(async () => [STANDARD_MODEL]);
-  readonly startTask = vi.fn(async (input: { taskId: string }) => ({
-    threadId: `thread-${input.taskId}`,
-    turnId: `codex-turn-${input.taskId}`,
+  readonly readGoalCapability = vi.fn<TaskExecutionAdapter["readGoalCapability"]>(async () => ({
+    availability: "AVAILABLE",
+    reasonCode: null,
+    reason: null,
   }));
+  readonly readPlanModeCatalog = vi.fn<TaskExecutionAdapter["readPlanModeCatalog"]>(
+    async (_account, requested = { model: "fake-codex-standard", reasoningEffort: "medium" }) => {
+      const model = requested.model ?? "fake-codex-standard";
+      return {
+        availability: "AVAILABLE",
+        reasonCode: null,
+        reason: null,
+        presets: [
+          {
+            name: "Default",
+            mode: "default",
+            settings: {
+              model,
+              reasoningEffort: requested.reasoningEffort.toLowerCase(),
+              developerInstructions: null,
+            },
+          },
+          {
+            name: "Plan",
+            mode: "plan",
+            settings: {
+              model,
+              reasoningEffort: "high",
+              developerInstructions: null,
+            },
+          },
+        ],
+      };
+    },
+  );
+  readonly setThreadGoal = vi.fn<TaskExecutionAdapter["setThreadGoal"]>(
+    async (_threadId, goal) => ({
+      attachment: "ATTACHED",
+      goal: { ...goal },
+      runtimeUpdatedAt: ++this.goalRuntimeVersion,
+    }),
+  );
+  readonly getThreadGoal = vi.fn<TaskExecutionAdapter["getThreadGoal"]>(async () => ({
+    attachment: "ATTACHED",
+    goal: null,
+    runtimeUpdatedAt: null,
+  }));
+  readonly clearThreadGoal = vi.fn<TaskExecutionAdapter["clearThreadGoal"]>(async () => ({
+    attachment: "ATTACHED",
+    cleared: true,
+  }));
+  readonly syncThreadGoal = vi.fn<TaskExecutionAdapter["syncThreadGoal"]>(
+    async (_threadId, goal) => ({
+      attachment: "ATTACHED",
+      goal: { ...goal },
+      runtimeUpdatedAt: ++this.goalRuntimeVersion,
+    }),
+  );
+  readonly startTask = vi.fn<TaskExecutionAdapter["startTask"]>(async (input) => {
+    const threadId = `thread-${input.taskId}`;
+    input.onThreadPrepared?.(threadId);
+    if (input.goal) {
+      this.emit("goalUpdated", {
+        taskId: input.taskId,
+        threadId,
+        status: input.goal.status,
+        tokensUsed: input.goal.tokensUsed,
+        timeUsedSeconds: input.goal.timeUsedSeconds,
+        runtimeUpdatedAt: ++this.goalRuntimeVersion,
+      });
+    }
+    return {
+      threadId,
+      turnId: `codex-turn-${input.taskId}`,
+    };
+  });
   readonly steerTask = vi.fn(async () => undefined);
   readonly interruptTask = vi.fn(async () => undefined);
   readonly respondApproval = vi.fn(async (): Promise<void> => undefined);
@@ -2621,6 +3993,37 @@ function seedUser(database: PlatformDatabase, id: string, role: "ADMIN" | "MEMBE
        ) VALUES (?, 'tenant-1', ?, ?, ?, ?, ?)`,
     )
     .run(id, `ou_${id}`, id, role, NOW.getTime(), NOW.getTime());
+}
+
+function planCatalog(
+  planModel = "fake-codex-standard",
+  planReasoningEffort = "high",
+): PlanModeCatalogCapability {
+  return {
+    availability: "AVAILABLE",
+    reasonCode: null,
+    reason: null,
+    presets: [
+      {
+        name: "Default",
+        mode: "default",
+        settings: {
+          model: "fake-codex-standard",
+          reasoningEffort: "medium",
+          developerInstructions: null,
+        },
+      },
+      {
+        name: "Plan",
+        mode: "plan",
+        settings: {
+          model: planModel,
+          reasoningEffort: planReasoningEffort,
+          developerInstructions: null,
+        },
+      },
+    ],
+  };
 }
 
 function deferred<T>(): {

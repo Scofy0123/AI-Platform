@@ -1,4 +1,5 @@
 import type {
+  CollaborationModePreset,
   EffectiveThreadConfigSnapshot,
   ExecutionPermissionSelection,
 } from "@codexplatform/contracts";
@@ -6,6 +7,7 @@ import type { Personality } from "./generated/Personality.js";
 import type { JsonValue } from "./generated/serde_json/JsonValue.js";
 import type { ApprovalsReviewer } from "./generated/v2/ApprovalsReviewer.js";
 import type { AskForApproval } from "./generated/v2/AskForApproval.js";
+import type { CollaborationModeListResponse } from "./generated/v2/CollaborationModeListResponse.js";
 import type { Model } from "./generated/v2/Model.js";
 import type { ModelListParams } from "./generated/v2/ModelListParams.js";
 import type { ModelListResponse } from "./generated/v2/ModelListResponse.js";
@@ -13,12 +15,21 @@ import type { SandboxMode } from "./generated/v2/SandboxMode.js";
 import type { SandboxPolicy } from "./generated/v2/SandboxPolicy.js";
 import type { ThreadBackgroundTerminalsListResponse } from "./generated/v2/ThreadBackgroundTerminalsListResponse.js";
 import type { ThreadBackgroundTerminalsTerminateResponse } from "./generated/v2/ThreadBackgroundTerminalsTerminateResponse.js";
+import type { ThreadGoal } from "./generated/v2/ThreadGoal.js";
+import type { ThreadGoalClearParams } from "./generated/v2/ThreadGoalClearParams.js";
+import type { ThreadGoalClearResponse } from "./generated/v2/ThreadGoalClearResponse.js";
+import type { ThreadGoalGetParams } from "./generated/v2/ThreadGoalGetParams.js";
+import type { ThreadGoalGetResponse } from "./generated/v2/ThreadGoalGetResponse.js";
+import type { ThreadGoalSetParams } from "./generated/v2/ThreadGoalSetParams.js";
+import type { ThreadGoalSetResponse } from "./generated/v2/ThreadGoalSetResponse.js";
+import type { ThreadGoalStatus } from "./generated/v2/ThreadGoalStatus.js";
 import type { ThreadMemoryModeSetParams } from "./generated/v2/ThreadMemoryModeSetParams.js";
 import type { ThreadMemoryModeSetResponse } from "./generated/v2/ThreadMemoryModeSetResponse.js";
 import type { ThreadResumeParams } from "./generated/v2/ThreadResumeParams.js";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse.js";
 import type { ThreadStartParams } from "./generated/v2/ThreadStartParams.js";
 import type { TurnStartParams } from "./generated/v2/TurnStartParams.js";
+import type { UserInput } from "./generated/v2/UserInput.js";
 
 export interface RpcPeer {
   request<T>(method: string, params?: unknown): Promise<T>;
@@ -63,9 +74,23 @@ interface RateLimitsResponse {
 }
 
 const MAX_MODEL_CATALOG_PAGES = 100;
+export const LOCKED_GOAL_PROTOCOL_VERSION = "0.144.6";
+export const LOCKED_PLAN_PROTOCOL_VERSION = "0.144.6";
+
+interface LockedProtocolCapability {
+  availability: "AVAILABLE" | "UNAVAILABLE";
+  reasonCode: string | null;
+  reason: string | null;
+}
 
 export class CodexAppServerRuntime {
   private readonly memoryDisabledThreadIds = new Set<string>();
+  private initializeResponse: {
+    userAgent: string;
+    codexHome: string;
+    platformFamily: string;
+    platformOs: string;
+  } | null = null;
 
   constructor(private readonly rpc: RpcPeer) {}
 
@@ -87,8 +112,42 @@ export class CodexAppServerRuntime {
         requestAttestation: false,
       },
     });
+    this.initializeResponse = response;
     this.rpc.notify("initialized");
     return response;
+  }
+
+  readGoalProtocolCapability(): LockedProtocolCapability {
+    return this.readLockedProtocolCapability("Goal", LOCKED_GOAL_PROTOCOL_VERSION);
+  }
+
+  readPlanProtocolCapability(): LockedProtocolCapability {
+    return this.readLockedProtocolCapability("Plan", LOCKED_PLAN_PROTOCOL_VERSION);
+  }
+
+  private readLockedProtocolCapability(
+    featureName: string,
+    lockedVersion: string,
+  ): LockedProtocolCapability {
+    const userAgent = this.initializeResponse?.userAgent;
+    if (!userAgent) {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "RUNTIME_HANDSHAKE_MISSING",
+        reason: "Codex App Server initialize handshake is unavailable",
+      };
+    }
+    const version = /(?:^|[/ ])(\d+\.\d+\.\d+)(?:$|[ )])/.exec(userAgent)?.[1] ?? null;
+    if (version !== lockedVersion) {
+      return {
+        availability: "UNAVAILABLE",
+        reasonCode: "RUNTIME_VERSION_UNSUPPORTED",
+        reason: version
+          ? `Codex App Server ${version} does not match the locked ${featureName} protocol ${lockedVersion}`
+          : `Codex App Server did not report a compatible version for ${featureName} protocol ${lockedVersion}`,
+      };
+    }
+    return { availability: "AVAILABLE", reasonCode: null, reason: null };
   }
 
   async startChatGptLogin(): Promise<{ loginId: string; authUrl: string }> {
@@ -159,6 +218,44 @@ export class CodexAppServerRuntime {
     return models;
   }
 
+  async listCollaborationModes(input: {
+    model: string | null;
+    reasoningEffort: string;
+  }): Promise<CollaborationModePreset[]> {
+    const response = await this.rpc.request<CollaborationModeListResponse>(
+      "collaborationMode/list",
+      {},
+    );
+    if (!isStrictRecord(response, ["data"]) || !Array.isArray(response.data)) {
+      throw new Error("Invalid collaborationMode/list response");
+    }
+    return response.data.map((value) => {
+      if (
+        !isStrictRecord(value, ["name", "mode", "model", "reasoning_effort"]) ||
+        typeof value.name !== "string" ||
+        value.name.trim().length === 0 ||
+        (value.mode !== "default" && value.mode !== "plan") ||
+        (value.model !== null && typeof value.model !== "string") ||
+        (value.reasoning_effort !== null && typeof value.reasoning_effort !== "string")
+      ) {
+        throw new Error("Invalid collaborationMode/list response");
+      }
+      const model = value.model ?? input.model;
+      if (!model) {
+        throw new Error(`Collaboration mode ${value.name} cannot resolve a model`);
+      }
+      return {
+        name: value.name,
+        mode: value.mode,
+        settings: {
+          model,
+          reasoningEffort: value.reasoning_effort ?? input.reasoningEffort.toLowerCase(),
+          developerInstructions: null,
+        },
+      } satisfies CollaborationModePreset;
+    });
+  }
+
   async startThread(input: {
     cwd: string;
     dynamicTools: DynamicToolDefinition[];
@@ -171,6 +268,7 @@ export class CodexAppServerRuntime {
         ? threadConfigParams(input.effectiveConfig)
         : { approvalPolicy: "on-request" as const, sandbox: "workspace-write" as const }),
       ephemeral: false,
+      experimentalRawEvents: true,
     } satisfies ThreadStartParams;
     const response = await this.rpc.request("thread/start", params);
     const threadId = extractResponseThreadId(response);
@@ -181,14 +279,18 @@ export class CodexAppServerRuntime {
   async startTurn(
     threadId: string,
     prompt: string,
-    options?: { cwd: string; effectiveConfig: EffectiveThreadConfigSnapshot },
+    options?: {
+      cwd: string;
+      effectiveConfig: EffectiveThreadConfigSnapshot;
+      attachments?: Array<{ name: string; path: string; mimeType: string }>;
+    },
   ): Promise<unknown> {
     if (!this.memoryDisabledThreadIds.has(threadId)) {
       throw new Error("Thread native memory must be disabled before turn/start");
     }
     const params = {
       threadId,
-      input: [textInput(prompt)],
+      input: buildUserInput(prompt, options?.attachments ?? []),
       ...(options ? turnConfigParams(options.cwd, options.effectiveConfig) : {}),
     } satisfies TurnStartParams;
     return this.rpc.request("turn/start", params);
@@ -210,11 +312,46 @@ export class CodexAppServerRuntime {
     return response;
   }
 
-  steerTurn(threadId: string, turnId: string, prompt: string): Promise<unknown> {
+  async setThreadGoal(
+    threadId: string,
+    input: { objective: string; status: ThreadGoalStatus; tokenBudget: number | null },
+  ): Promise<ThreadGoal> {
+    const params = { threadId, ...input } satisfies ThreadGoalSetParams;
+    const response = await this.rpc.request<ThreadGoalSetResponse>("thread/goal/set", params);
+    if (!isThreadGoalResponse(response, threadId)) {
+      throw new Error("Invalid thread/goal/set response");
+    }
+    return response.goal;
+  }
+
+  async getThreadGoal(threadId: string): Promise<ThreadGoal | null> {
+    const params = { threadId } satisfies ThreadGoalGetParams;
+    const response = await this.rpc.request<ThreadGoalGetResponse>("thread/goal/get", params);
+    if (!isThreadGoalGetResponse(response, threadId)) {
+      throw new Error("Invalid thread/goal/get response");
+    }
+    return response.goal;
+  }
+
+  async clearThreadGoal(threadId: string): Promise<boolean> {
+    const params = { threadId } satisfies ThreadGoalClearParams;
+    const response = await this.rpc.request<ThreadGoalClearResponse>("thread/goal/clear", params);
+    if (!isRecord(response) || typeof response.cleared !== "boolean") {
+      throw new Error("Invalid thread/goal/clear response");
+    }
+    return response.cleared;
+  }
+
+  steerTurn(
+    threadId: string,
+    turnId: string,
+    prompt: string,
+    attachments: Array<{ name: string; path: string; mimeType: string }> = [],
+  ): Promise<unknown> {
     return this.rpc.request("turn/steer", {
       threadId,
       expectedTurnId: turnId,
-      input: [textInput(prompt)],
+      input: buildUserInput(prompt, attachments),
     });
   }
 
@@ -286,6 +423,22 @@ function codexBucketPriority(key: string, snapshot: RateLimitSnapshot): number {
 
 function textInput(text: string) {
   return { type: "text" as const, text, text_elements: [] };
+}
+
+function buildUserInput(
+  prompt: string,
+  attachments: Array<{ name: string; path: string; mimeType: string }>,
+): UserInput[] {
+  const input: UserInput[] = [];
+  if (prompt.length > 0) input.push(textInput(prompt));
+  for (const attachment of attachments) {
+    input.push(
+      attachment.mimeType.startsWith("image/")
+        ? { type: "localImage", path: attachment.path }
+        : { type: "mention", name: attachment.name, path: attachment.path },
+    );
+  }
+  return input;
 }
 
 export function codexPermissionParams(
@@ -384,6 +537,52 @@ function isEmptyJsonObject(value: unknown): value is Record<string, never> {
   );
 }
 
+const THREAD_GOAL_STATUSES = new Set<ThreadGoalStatus>([
+  "active",
+  "paused",
+  "blocked",
+  "usageLimited",
+  "budgetLimited",
+  "complete",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isThreadGoal(value: unknown, threadId: string): value is ThreadGoal {
+  if (!isRecord(value)) return false;
+  return (
+    value.threadId === threadId &&
+    typeof value.objective === "string" &&
+    value.objective.length > 0 &&
+    typeof value.status === "string" &&
+    THREAD_GOAL_STATUSES.has(value.status as ThreadGoalStatus) &&
+    (value.tokenBudget === null ||
+      (typeof value.tokenBudget === "number" &&
+        Number.isInteger(value.tokenBudget) &&
+        value.tokenBudget > 0)) &&
+    typeof value.tokensUsed === "number" &&
+    Number.isInteger(value.tokensUsed) &&
+    value.tokensUsed >= 0 &&
+    typeof value.timeUsedSeconds === "number" &&
+    Number.isInteger(value.timeUsedSeconds) &&
+    value.timeUsedSeconds >= 0 &&
+    typeof value.createdAt === "number" &&
+    Number.isFinite(value.createdAt) &&
+    typeof value.updatedAt === "number" &&
+    Number.isFinite(value.updatedAt)
+  );
+}
+
+function isThreadGoalResponse(value: unknown, threadId: string): value is ThreadGoalSetResponse {
+  return isRecord(value) && isThreadGoal(value.goal, threadId);
+}
+
+function isThreadGoalGetResponse(value: unknown, threadId: string): value is ThreadGoalGetResponse {
+  return isRecord(value) && (value.goal === null || isThreadGoal(value.goal, threadId));
+}
+
 function threadConfigParams(config: EffectiveThreadConfigSnapshot) {
   if (config.permissionMode === "READ_ONLY") {
     return {
@@ -405,6 +604,18 @@ function threadConfigParams(config: EffectiveThreadConfigSnapshot) {
 }
 
 function turnConfigParams(cwd: string, config: EffectiveThreadConfigSnapshot) {
+  const collaborationMode = config.collaborationPreset
+    ? {
+        collaborationMode: {
+          mode: config.collaborationPreset.mode,
+          settings: {
+            model: config.collaborationPreset.settings.model,
+            reasoning_effort: config.collaborationPreset.settings.reasoningEffort,
+            developer_instructions: config.collaborationPreset.settings.developerInstructions,
+          },
+        },
+      }
+    : {};
   if (config.permissionMode === "READ_ONLY") {
     return {
       model: config.model,
@@ -414,6 +625,7 @@ function turnConfigParams(cwd: string, config: EffectiveThreadConfigSnapshot) {
       approvalsReviewer: "user" as const,
       sandboxPolicy: { type: "readOnly" as const, networkAccess: false },
       personality: personality(config),
+      ...collaborationMode,
     } satisfies Partial<TurnStartParams>;
   }
   const permission = codexPermissionParams(selectionFromConfig(config), cwd);
@@ -423,7 +635,15 @@ function turnConfigParams(cwd: string, config: EffectiveThreadConfigSnapshot) {
     summary: "auto" as const,
     ...permission.turn,
     personality: personality(config),
+    ...collaborationMode,
   } satisfies Partial<TurnStartParams>;
+}
+
+function isStrictRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
 function selectionFromConfig(config: EffectiveThreadConfigSnapshot): ExecutionPermissionSelection {

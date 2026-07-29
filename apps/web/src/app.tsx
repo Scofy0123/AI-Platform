@@ -38,6 +38,7 @@ import { ApiError, httpApi } from "./api.js";
 import { ThreadNavItem } from "./components/navigation/ThreadNavItem.js";
 import { BottomPanel } from "./components/thread/BottomPanel.js";
 import { ComposerAddMenu } from "./components/thread/ComposerAddMenu.js";
+import { ComposerResources } from "./components/thread/ComposerResources.js";
 import { ComposerSubmitControl } from "./components/thread/ComposerSubmitControl.js";
 import {
   ModelEffortPicker,
@@ -49,8 +50,10 @@ import {
   PermissionModePicker,
 } from "./components/thread/PermissionModePicker.js";
 import { PinnedExecutionSummary } from "./components/thread/PinnedExecutionSummary.js";
+import { SafeMarkdown } from "./components/thread/SafeMarkdown.js";
 import { SidePanel } from "./components/thread/SidePanel.js";
 import { Transcript } from "./components/thread/Transcript.js";
+import { useComposerSession } from "./components/thread/useComposerSession.js";
 import { WorkspaceHeader } from "./components/thread/WorkspaceHeader.js";
 import { subscribeTaskEvents } from "./event-stream.js";
 import { Icon } from "./icons.js";
@@ -385,6 +388,16 @@ function NewThreadPage() {
   const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
   const [permission, setPermission] = useState<ExecutionPermissionSelection | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const resolveTargetProjectId = async () =>
+    projectId ||
+    routeProjectId ||
+    settings.data?.general.defaultProjectId ||
+    projects.data?.[0]?.id ||
+    (await api.createProject("默认项目")).id;
+  const composer = useComposerSession({
+    api,
+    resolveProjectId: resolveTargetProjectId,
+  });
   const selectedModel = resolveCatalogSelection(
     models.data,
     modelSelection?.model ?? settings.data?.execution.model,
@@ -402,22 +415,35 @@ function NewThreadPage() {
   const create = useMutation({
     mutationFn: async () => {
       if (!turnConfig) throw new Error("Runtime 模型目录不可用");
-      const targetProjectId =
-        projectId ||
-        routeProjectId ||
-        settings.data?.general.defaultProjectId ||
-        projects.data?.[0]?.id ||
-        (await api.createProject("默认项目")).id;
-      const title = deriveThreadTitle(prompt);
-      const created = api.createThread
-        ? await api.createThread({ projectId: targetProjectId, title, config: turnConfig })
-        : await api.createTask({ projectId: targetProjectId, title });
+      const existingDraftId = composer.resourceThreadId;
+      const created = existingDraftId
+        ? { id: existingDraftId }
+        : api.createThread
+          ? await api.createThread({
+              projectId: await resolveTargetProjectId(),
+              title: deriveThreadTitle(prompt),
+              config: turnConfig,
+            })
+          : await api.createTask({
+              projectId: await resolveTargetProjectId(),
+              title: deriveThreadTitle(prompt),
+            });
       if (api.startThreadTurn) {
-        await api.startThreadTurn(created.id, prompt.trim(), turnConfig);
+        if (composer.readyAttachmentIds.length > 0) {
+          await api.startThreadTurn(
+            created.id,
+            prompt.trim(),
+            turnConfig,
+            composer.readyAttachmentIds,
+          );
+        } else {
+          await api.startThreadTurn(created.id, prompt.trim(), turnConfig);
+        }
       } else await api.startTurn(created.id, prompt.trim());
       return created.id;
     },
     onSuccess: async (id) => {
+      composer.markActivated();
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["projects"] }),
         queryClient.invalidateQueries({ queryKey: ["threads"] }),
@@ -429,7 +455,7 @@ function NewThreadPage() {
   });
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (!prompt.trim()) {
+    if (!prompt.trim() && composer.readyAttachmentIds.length === 0) {
       setError("请描述要完成的工作");
       return;
     }
@@ -462,11 +488,27 @@ function NewThreadPage() {
             }
           }}
         />
+        <ComposerResources
+          attachments={composer.attachments}
+          goal={composer.goal}
+          goalEditorOpen={composer.goalEditorOpen}
+          onChooseFiles={(files) => void composer.chooseFiles(files)}
+          onDropError={composer.reportError}
+          onRemoveAttachment={(attachment) => void composer.removeAttachment(attachment)}
+          onSaveGoal={(input) => void composer.saveGoal(input)}
+          onGoalAction={(action) => void composer.goalAction(action)}
+          onClearGoal={() => void composer.clearGoal()}
+          onCloseGoal={composer.closeGoal}
+          goalBusy={composer.busy}
+        />
         <div className="v11-composer-toolbar">
           <ComposerAddMenu
             capabilities={capabilities.data ?? EMPTY_COMPOSER_CAPABILITIES}
-            onSelect={(capability) => applyComposerCapability(capability, setPrompt)}
-            disabled={create.isPending}
+            onChooseFiles={(files) => void composer.chooseFiles(files)}
+            onOpenGoal={() => void composer.openGoal()}
+            onTogglePlanMode={() => void composer.togglePlanMode()}
+            planMode={composer.planMode}
+            disabled={create.isPending || composer.busy}
           />
           <PermissionModePicker
             value={selectedPermission}
@@ -500,6 +542,8 @@ function NewThreadPage() {
             aria-label="Send message"
             disabled={
               create.isPending ||
+              composer.busy ||
+              composer.submissionBlocked ||
               settings.isPending ||
               settings.isError ||
               models.isPending ||
@@ -511,6 +555,8 @@ function NewThreadPage() {
           </button>
         </div>
         {settings.isError ? <p role="alert">无法读取个人执行配置，请刷新后重试。</p> : null}
+        {composer.planMode ? <p className="composer-plan-status">Plan mode · On</p> : null}
+        {composer.error ? <p role="alert">{composer.error}</p> : null}
         {error ? <p role="alert">{error}</p> : null}
       </form>
     </section>
@@ -534,6 +580,7 @@ interface ThreadView {
   currentTurnStatus: string | null;
   lastModel: string | null;
   lastReasoningEffort: string | null;
+  composerState: Thread["composerState"];
   turns: Turn[];
   queue: Thread["queue"];
   events: TaskEvent[];
@@ -556,6 +603,7 @@ async function loadThread(api: PlatformApi, threadId: string): Promise<ThreadVie
     currentTurnStatus: null,
     lastModel: null,
     lastReasoningEffort: null,
+    composerState: undefined,
     turns: [],
     queue: task.queue,
     events: task.events ?? [],
@@ -576,6 +624,7 @@ function projectThreadView(thread: Thread): ThreadView {
     currentTurnStatus: thread.currentTurn?.status ?? null,
     lastModel: latestTurn?.configSnapshot.model ?? null,
     lastReasoningEffort: latestTurn?.configSnapshot.reasoningEffort ?? null,
+    composerState: thread.composerState,
     turns: thread.turns,
     queue: thread.queue,
     events: thread.items.map((item) => threadItemToEvent(thread.id, item)),
@@ -642,6 +691,25 @@ function ThreadPage() {
   const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
   const [permission, setPermission] = useState<ExecutionPermissionSelection | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const goalRefreshKey = events.reduce(
+    (latest, event) =>
+      ["TURN_COMPLETED", "TURN_FAILED", "TURN_INTERRUPTED", "RECOVERY_REQUIRED"].includes(
+        event.type,
+      )
+        ? Math.max(latest, event.sequence)
+        : latest,
+    0,
+  );
+  const composer = useComposerSession({
+    api,
+    threadId,
+    initialComposerState: thread.data?.composerState,
+    goalRefreshKey,
+    resolveProjectId: async () => {
+      if (!thread.data?.projectId) throw new Error("Thread project is unavailable");
+      return thread.data.projectId;
+    },
+  });
   const selectedModel = resolveCatalogSelection(
     models.data,
     modelSelection?.model ?? thread.data?.lastModel ?? settings.data?.execution.model,
@@ -712,16 +780,38 @@ function ThreadPage() {
   }, [initialLastEventId, queryClient, subscriber, thread.isSuccess, threadId]);
 
   const action = useMutation({
-    mutationFn: async ({ name, input }: { name: "interrupt" | "steer"; input?: string }) => {
-      if (api.threadAction) return api.threadAction(threadId, name, input);
+    mutationFn: async ({
+      name,
+      input,
+      attachmentIds = [],
+    }: {
+      name: "interrupt" | "steer";
+      input?: string;
+      attachmentIds?: readonly string[];
+    }) => {
+      if (api.threadAction) {
+        return attachmentIds.length > 0
+          ? api.threadAction(threadId, name, input, attachmentIds)
+          : api.threadAction(threadId, name, input);
+      }
       return api.taskAction(threadId, name, input);
     },
     onError: (cause) => setRuntimeError(runtimeErrorMessage(cause)),
   });
   const start = useMutation({
-    mutationFn: async (prompt: string) => {
+    mutationFn: async ({
+      prompt,
+      attachmentIds,
+    }: {
+      prompt: string;
+      attachmentIds: readonly string[];
+    }) => {
       if (!turnConfig) throw new Error("Runtime 模型目录不可用");
-      if (api.startThreadTurn) return api.startThreadTurn(threadId, prompt, turnConfig);
+      if (api.startThreadTurn) {
+        return attachmentIds.length > 0
+          ? api.startThreadTurn(threadId, prompt, turnConfig, attachmentIds)
+          : api.startThreadTurn(threadId, prompt, turnConfig);
+      }
       return api.startTurn(threadId, prompt);
     },
     onError: (cause) => setRuntimeError(runtimeErrorMessage(cause)),
@@ -759,6 +849,13 @@ function ThreadPage() {
   const waitingForAllocation = ["ALLOCATING", "QUEUED"].includes(
     thread.data.currentTurnStatus ?? status,
   );
+  const planLockedReason = ["ALLOCATING", "QUEUED"].includes(
+    thread.data.currentTurnStatus ?? status,
+  )
+    ? ("QUEUED" as const)
+    : ["RUNNING", "WAITING_APPROVAL"].includes(thread.data.currentTurnStatus ?? status)
+      ? ("ACTIVE_TURN" as const)
+      : null;
   const canStartTurn =
     ["DRAFT", "READY", "COMPLETED", "FAILED", "INTERRUPTED", "NEEDS_RECOVERY"].includes(status) &&
     !archived;
@@ -803,19 +900,29 @@ function ThreadPage() {
   const send = (event: FormEvent) => {
     event.preventDefault();
     const prompt = message.trim();
-    if (!prompt) return;
+    const attachmentIds = composer.readyAttachmentIds;
+    if (!prompt && attachmentIds.length === 0) return;
     setRuntimeError(null);
     if (canSteer) {
       action.mutate(
-        { name: "steer", input: prompt },
+        { name: "steer", input: prompt, attachmentIds },
         {
           onSuccess: () => {
             setMessage("");
+            composer.clearSubmittedAttachments();
           },
         },
       );
     } else if (canStartTurn) {
-      start.mutate(prompt, { onSuccess: () => setMessage("") });
+      start.mutate(
+        { prompt, attachmentIds },
+        {
+          onSuccess: () => {
+            setMessage("");
+            composer.clearSubmittedAttachments();
+          },
+        },
+      );
     }
   };
   return (
@@ -944,11 +1051,28 @@ function ThreadPage() {
                   }
                 }}
               />
+              <ComposerResources
+                attachments={composer.attachments}
+                goal={composer.goal}
+                goalEditorOpen={composer.goalEditorOpen}
+                onChooseFiles={(files) => void composer.chooseFiles(files)}
+                onDropError={composer.reportError}
+                onRemoveAttachment={(attachment) => void composer.removeAttachment(attachment)}
+                onSaveGoal={(input) => void composer.saveGoal(input)}
+                onGoalAction={(goalAction) => void composer.goalAction(goalAction)}
+                onClearGoal={() => void composer.clearGoal()}
+                onCloseGoal={composer.closeGoal}
+                goalBusy={composer.busy}
+              />
               <div className="v11-composer-toolbar">
                 <ComposerAddMenu
                   capabilities={capabilities.data ?? EMPTY_COMPOSER_CAPABILITIES}
-                  onSelect={(capability) => applyComposerCapability(capability, setMessage)}
-                  disabled={configLocked || archived}
+                  onChooseFiles={(files) => void composer.chooseFiles(files)}
+                  onOpenGoal={() => void composer.openGoal()}
+                  onTogglePlanMode={() => void composer.togglePlanMode()}
+                  planMode={composer.planMode}
+                  planLockedReason={planLockedReason}
+                  disabled={archived || waitingForAllocation || composer.busy}
                 />
                 <PermissionModePicker
                   value={selectedPermission}
@@ -968,23 +1092,35 @@ function ThreadPage() {
                   {waitingForAllocation
                     ? "正在排队，暂不能提交新的 Turn"
                     : canSteer
-                      ? "Steer 沿用当前 Turn 的执行设置"
+                      ? "Steer 沿用当前 Turn 的执行设置与 Plan 快照"
                       : capabilities.isPending
                         ? "正在读取可用能力"
-                        : "Capabilities follow organization policy"}
+                        : composer.planMode
+                          ? "Plan mode · On"
+                          : "Capabilities follow organization policy"}
                 </span>
                 <ComposerSubmitControl
-                  mode={canSteer && message.trim().length === 0 ? "stop" : "send"}
+                  mode={
+                    canSteer &&
+                    message.trim().length === 0 &&
+                    composer.readyAttachmentIds.length === 0
+                      ? "stop"
+                      : "send"
+                  }
                   steer={canSteer}
                   disabled={
                     action.isPending ||
                     start.isPending ||
+                    composer.busy ||
+                    composer.submissionBlocked ||
                     settings.isPending ||
                     settings.isError ||
                     (!canSteer && (models.isPending || models.isError || !selectedModel)) ||
                     waitingForAllocation ||
                     (!canSteer && !canStartTurn) ||
-                    (message.trim().length === 0 && !canSteer)
+                    (message.trim().length === 0 &&
+                      composer.readyAttachmentIds.length === 0 &&
+                      !canSteer)
                   }
                   onStop={() => {
                     setRuntimeError(null);
@@ -1003,6 +1139,12 @@ function ThreadPage() {
               <div className="v11-runtime-error" role="alert">
                 <Icon name="activity" />
                 <span>{runtimeError}</span>
+              </div>
+            ) : null}
+            {composer.error ? (
+              <div className="v11-runtime-error" role="alert">
+                <Icon name="activity" />
+                <span>{composer.error}</span>
               </div>
             ) : null}
           </section>
@@ -1448,7 +1590,7 @@ function PinnedSummaryContent({
           onClick={() => onOpenSide({ kind: "plan" })}
         >
           {summary?.plan
-            ? summary.plan.explanation || `${summary.plan.steps.length} steps`
+            ? summary.plan.title || summary.plan.explanation || `${summary.plan.steps.length} steps`
             : "No plan yet"}
         </button>
       </section>
@@ -1508,7 +1650,7 @@ function PlanPanel({ plan }: { plan: ThreadPresentation["side"]["plan"] }) {
   const steps = plan.steps.map((item, index) => readPlanStep(item, index));
   return (
     <div className="v11-rail-list">
-      <p>{plan.explanation}</p>
+      {plan.markdown ? <SafeMarkdown content={plan.markdown} /> : <p>{plan.explanation}</p>}
       {steps.map((step, index) => (
         <div key={step.label}>
           <span>{index + 1}</span> {step.label}
@@ -3385,14 +3527,6 @@ function permissionOptions(
       unavailableReason: "No permission profile is available",
     },
   ];
-}
-
-function applyComposerCapability(
-  capability: ComposerCapability,
-  setText: (update: (current: string) => string) => void,
-): void {
-  if (capability.kind !== "THREAD_REFERENCE" && capability.kind !== "SKILL") return;
-  setText((current) => `${current}${current.trim() ? " " : ""}@${capability.label} `);
 }
 
 function deriveThreadTitle(prompt: string): string {

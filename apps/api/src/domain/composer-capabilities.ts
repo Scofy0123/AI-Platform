@@ -15,8 +15,10 @@ export interface ComposerCapabilityContext {
   stagingUnavailableReason?: string;
   goalAvailable: boolean;
   goalUnavailableReason?: string;
+  goalUnavailableReasonCode?: string;
   planModeAvailable: boolean;
   planModeUnavailableReason?: string;
+  planModeUnavailableReasonCode?: string;
   skillRecorderAvailable: boolean;
   skillRecorderUnavailableReason?: string;
   approvedSkills: readonly CatalogItem[];
@@ -45,6 +47,9 @@ export function listComposerCapabilities(context: ComposerCapabilityContext): Co
       description: "Set a goal to keep pursuing",
       available: context.goalAvailable,
       unavailableReason: context.goalUnavailableReason ?? "Goal is unavailable for this Runtime",
+      ...(context.goalUnavailableReasonCode
+        ? { unavailableReasonCode: context.goalUnavailableReasonCode }
+        : {}),
       unavailableAvailability: "UNSUPPORTED",
     }),
     capability({
@@ -56,64 +61,12 @@ export function listComposerCapabilities(context: ComposerCapabilityContext): Co
       available: context.planModeAvailable,
       unavailableReason:
         context.planModeUnavailableReason ?? "Runtime version does not support plan mode",
-      unavailableAvailability: "UNSUPPORTED",
-    }),
-    capability({
-      id: "record-a-skill",
-      kind: "SKILL_RECORDER",
-      section: "ADD",
-      label: "Record a skill",
-      description: "Record a reusable workflow",
-      available: context.skillRecorderAvailable,
-      unavailableReason:
-        context.skillRecorderUnavailableReason ?? "Requires an isolated Computer Use Worker",
+      ...(context.planModeUnavailableReasonCode
+        ? { unavailableReasonCode: context.planModeUnavailableReasonCode }
+        : {}),
       unavailableAvailability: "UNSUPPORTED",
     }),
   ];
-
-  for (const skill of context.approvedSkills) {
-    capabilities.push(
-      ComposerCapabilitySchema.parse({
-        id: `skill:${skill.id}`,
-        kind: "SKILL",
-        section: "PLUGINS",
-        label: skill.label,
-        description: skill.description,
-        availability: "AVAILABLE",
-        unavailableReason: null,
-      }),
-    );
-  }
-
-  for (const app of context.approvedApps) {
-    capabilities.push(
-      ComposerCapabilitySchema.parse({
-        id: `app:${app.id}`,
-        kind: "APP",
-        section: "APPS",
-        label: app.label,
-        description: app.description,
-        availability: app.connected ? "AVAILABLE" : "AUTH_REQUIRED",
-        unavailableReason: app.connected
-          ? null
-          : "Connect this app with your own enterprise identity",
-      }),
-    );
-  }
-
-  for (const thread of context.recentThreads) {
-    capabilities.push(
-      ComposerCapabilitySchema.parse({
-        id: `thread:${thread.id}`,
-        kind: "THREAD_REFERENCE",
-        section: "FILES_AND_CHATS",
-        label: thread.label,
-        description: thread.description,
-        availability: "AVAILABLE",
-        unavailableReason: null,
-      }),
-    );
-  }
 
   return capabilities;
 }
@@ -126,6 +79,7 @@ function capability(input: {
   description: string;
   available: boolean;
   unavailableReason: string;
+  unavailableReasonCode?: string;
   unavailableAvailability: "POLICY_BLOCKED" | "UNSUPPORTED";
 }): ComposerCapability {
   return ComposerCapabilitySchema.parse({
@@ -136,5 +90,6 @@ function capability(input: {
     description: input.description,
     availability: input.available ? "AVAILABLE" : input.unavailableAvailability,
     unavailableReason: input.available ? null : input.unavailableReason,
+    unavailableReasonCode: input.available ? null : (input.unavailableReasonCode ?? null),
   });
 }

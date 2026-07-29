@@ -176,6 +176,10 @@ export const tasks = sqliteTable("tasks", {
   currentTurnId: text("current_turn_id"),
   threadConfigJson: text("thread_config_json"),
   archivedAt: integer("archived_at", { mode: "timestamp_ms" }),
+  lifecycleState: text("lifecycle_state").notNull().default("ACTIVE"),
+  draftExpiresAt: integer("draft_expires_at", { mode: "timestamp_ms" }),
+  planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
+  composerRevision: integer("composer_revision").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
 });
@@ -193,6 +197,94 @@ export const turns = sqliteTable("turns", {
   completedAt: integer("completed_at", { mode: "timestamp_ms" }),
   durationMs: integer("duration_ms"),
 });
+
+export const draftAttachments = sqliteTable("draft_attachments", {
+  id: text("id").primaryKey(),
+  taskId: text("task_id")
+    .notNull()
+    .references(() => tasks.id, { onDelete: "cascade" }),
+  ownerId: text("owner_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(),
+  name: text("name").notNull(),
+  relativePath: text("relative_path").notNull(),
+  mimeType: text("mime_type").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  fileCount: integer("file_count").notNull(),
+  scanStatus: text("scan_status").notNull(),
+  blockedReason: text("blocked_reason"),
+  claimedTurnId: text("claimed_turn_id").references(() => turns.id),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const turnInputSnapshots = sqliteTable("turn_input_snapshots", {
+  turnId: text("turn_id")
+    .primaryKey()
+    .references(() => turns.id, { onDelete: "cascade" }),
+  prompt: text("prompt").notNull(),
+  attachmentsJson: text("attachments_json").notNull(),
+  goalJson: text("goal_json"),
+  planMode: integer("plan_mode", { mode: "boolean" }).notNull().default(false),
+  capturedAt: integer("captured_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const threadGoals = sqliteTable("thread_goals", {
+  taskId: text("task_id")
+    .primaryKey()
+    .references(() => tasks.id, { onDelete: "cascade" }),
+  ownerId: text("owner_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  objective: text("objective").notNull(),
+  status: text("status").notNull(),
+  tokenBudget: integer("token_budget").notNull(),
+  tokensUsed: integer("tokens_used").notNull().default(0),
+  timeBudgetSeconds: integer("time_budget_seconds").notNull(),
+  timeUsedSeconds: integer("time_used_seconds").notNull().default(0),
+  runtimeSyncState: text("runtime_sync_state").notNull().default("PENDING"),
+  runtimeThreadId: text("runtime_thread_id"),
+  runtimeUpdatedAt: integer("runtime_updated_at"),
+  activatedAt: integer("activated_at", { mode: "timestamp_ms" }),
+  revision: integer("revision").notNull().default(1),
+  deletedAt: integer("deleted_at", { mode: "timestamp_ms" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const steerInputSnapshots = sqliteTable("steer_input_snapshots", {
+  id: text("id").primaryKey(),
+  turnId: text("turn_id")
+    .notNull()
+    .references(() => turns.id, { onDelete: "cascade" }),
+  prompt: text("prompt").notNull(),
+  attachmentsJson: text("attachments_json").notNull(),
+  deliveryStatus: text("delivery_status").notNull().default("PENDING"),
+  deliveryError: text("delivery_error"),
+  deliveredAt: integer("delivered_at", { mode: "timestamp_ms" }),
+  failedAt: integer("failed_at", { mode: "timestamp_ms" }),
+  unknownAt: integer("unknown_at", { mode: "timestamp_ms" }),
+  capturedAt: integer("captured_at", { mode: "timestamp_ms" }).notNull(),
+});
+
+export const attachmentCleanupJobs = sqliteTable(
+  "attachment_cleanup_jobs",
+  {
+    id: text("id").primaryKey(),
+    threadId: text("thread_id").notNull(),
+    attachmentId: text("attachment_id").notNull(),
+    relativePath: text("relative_path").notNull(),
+    status: text("status").notNull().default("PENDING"),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("last_error"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+    updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("attachment_cleanup_jobs_target_idx").on(table.threadId, table.attachmentId),
+  ],
+);
 
 export const taskEvents = sqliteTable(
   "task_events",

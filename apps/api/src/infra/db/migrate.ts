@@ -158,6 +158,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   current_turn_id TEXT,
   thread_config_json TEXT,
   archived_at INTEGER,
+  lifecycle_state TEXT NOT NULL DEFAULT 'ACTIVE'
+    CHECK(lifecycle_state IN ('DRAFT', 'ACTIVE', 'EXPIRED')),
+  draft_expires_at INTEGER,
+  plan_mode INTEGER NOT NULL DEFAULT 0 CHECK(plan_mode IN (0, 1)),
+  composer_revision INTEGER NOT NULL DEFAULT 0 CHECK(composer_revision >= 0),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -175,6 +180,91 @@ CREATE TABLE IF NOT EXISTS turns (
   completed_at INTEGER,
   duration_ms INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS draft_attachments (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('FILE', 'FOLDER')),
+  name TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+  file_count INTEGER NOT NULL CHECK(file_count BETWEEN 1 AND 500),
+  scan_status TEXT NOT NULL
+    CHECK(scan_status IN ('UPLOADING', 'SCANNING', 'READY', 'BLOCKED', 'FAILED')),
+  blocked_reason TEXT,
+  claimed_turn_id TEXT REFERENCES turns(id),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS draft_attachments_task_idx
+  ON draft_attachments(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS turn_input_snapshots (
+  turn_id TEXT PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
+  prompt TEXT NOT NULL,
+  attachments_json TEXT NOT NULL,
+  goal_json TEXT,
+  plan_mode INTEGER NOT NULL DEFAULT 0 CHECK(plan_mode IN (0, 1)),
+  captured_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS thread_goals (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  objective TEXT NOT NULL,
+  status TEXT NOT NULL
+    CHECK(status IN ('ACTIVE', 'PAUSED', 'COMPLETE', 'BUDGET_LIMITED', 'NEEDS_RECOVERY')),
+  token_budget INTEGER NOT NULL CHECK(token_budget > 0),
+  tokens_used INTEGER NOT NULL DEFAULT 0 CHECK(tokens_used >= 0),
+  time_budget_seconds INTEGER NOT NULL CHECK(time_budget_seconds > 0),
+  time_used_seconds INTEGER NOT NULL DEFAULT 0 CHECK(time_used_seconds >= 0),
+  runtime_sync_state TEXT NOT NULL DEFAULT 'PENDING'
+    CHECK(runtime_sync_state IN ('PENDING', 'SYNCED', 'NEEDS_RECOVERY')),
+  runtime_thread_id TEXT,
+  runtime_updated_at INTEGER,
+  activated_at INTEGER,
+  revision INTEGER NOT NULL DEFAULT 1,
+  deleted_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS steer_input_snapshots (
+  id TEXT PRIMARY KEY,
+  turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+  prompt TEXT NOT NULL,
+  attachments_json TEXT NOT NULL,
+  delivery_status TEXT NOT NULL DEFAULT 'PENDING'
+    CHECK(delivery_status IN ('PENDING', 'DELIVERED', 'FAILED', 'UNKNOWN')),
+  delivery_error TEXT,
+  delivered_at INTEGER,
+  failed_at INTEGER,
+  unknown_at INTEGER,
+  captured_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS steer_input_snapshots_turn_idx
+  ON steer_input_snapshots(turn_id, captured_at, id);
+
+CREATE TABLE IF NOT EXISTS attachment_cleanup_jobs (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  attachment_id TEXT NOT NULL,
+  relative_path TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PENDING'
+    CHECK(status IN ('PENDING', 'FAILED')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(thread_id, attachment_id)
+);
+
+CREATE INDEX IF NOT EXISTS attachment_cleanup_jobs_status_idx
+  ON attachment_cleanup_jobs(status, created_at, id);
 
 CREATE TABLE IF NOT EXISTS task_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,6 +373,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   status TEXT NOT NULL,
   input_digest TEXT NOT NULL,
   output_digest TEXT,
+  response_json TEXT,
   started_at INTEGER NOT NULL,
   completed_at INTEGER
 );
@@ -314,25 +405,175 @@ CREATE TABLE IF NOT EXISTS platform_settings (
 `;
 
 export function migrateDatabase(sqlite: Database.Database): void {
+  const existingSteerSnapshotTable = sqlite
+    .prepare(
+      `SELECT sql FROM sqlite_master
+       WHERE type = 'table' AND name = 'steer_input_snapshots'`,
+    )
+    .get() as { sql: string } | undefined;
+  const steerSnapshotNeedsUnknownMigration =
+    existingSteerSnapshotTable !== undefined && !/\bUNKNOWN\b/.test(existingSteerSnapshotTable.sql);
   sqlite.exec(INITIAL_SCHEMA);
   ensureColumn(sqlite, "codex_accounts", "codex_home", "TEXT");
   ensureColumn(sqlite, "codex_accounts", "quota_resets_at", "INTEGER");
   ensureColumn(sqlite, "task_events", "item_id", "TEXT");
   ensureColumn(sqlite, "tasks", "thread_config_json", "TEXT");
   ensureColumn(sqlite, "tasks", "archived_at", "INTEGER");
+  ensureColumn(sqlite, "tasks", "lifecycle_state", "TEXT NOT NULL DEFAULT 'ACTIVE'");
+  ensureColumn(sqlite, "tasks", "draft_expires_at", "INTEGER");
+  ensureColumn(sqlite, "tasks", "plan_mode", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(sqlite, "tasks", "composer_revision", "INTEGER NOT NULL DEFAULT 0");
   sqlite.exec(
     `CREATE INDEX IF NOT EXISTS tasks_owner_archived_updated_idx
        ON tasks(owner_id, archived_at, updated_at DESC)`,
   );
   ensureColumn(sqlite, "turns", "config_snapshot_json", "TEXT");
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS draft_attachments (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      owner_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('FILE', 'FOLDER')),
+      name TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+      file_count INTEGER NOT NULL CHECK(file_count BETWEEN 1 AND 500),
+      scan_status TEXT NOT NULL
+        CHECK(scan_status IN ('UPLOADING', 'SCANNING', 'READY', 'BLOCKED', 'FAILED')),
+      blocked_reason TEXT,
+      claimed_turn_id TEXT REFERENCES turns(id),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS draft_attachments_task_idx
+      ON draft_attachments(task_id, created_at);
+    CREATE TABLE IF NOT EXISTS turn_input_snapshots (
+      turn_id TEXT PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
+      prompt TEXT NOT NULL,
+      attachments_json TEXT NOT NULL,
+      goal_json TEXT,
+      captured_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS thread_goals (
+      task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+      owner_id TEXT NOT NULL,
+      objective TEXT NOT NULL,
+      status TEXT NOT NULL,
+      token_budget INTEGER NOT NULL,
+      tokens_used INTEGER NOT NULL DEFAULT 0,
+      time_budget_seconds INTEGER NOT NULL,
+      time_used_seconds INTEGER NOT NULL DEFAULT 0,
+      runtime_sync_state TEXT NOT NULL DEFAULT 'PENDING',
+      runtime_thread_id TEXT,
+      runtime_updated_at INTEGER,
+      activated_at INTEGER,
+      revision INTEGER NOT NULL DEFAULT 1,
+      deleted_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS steer_input_snapshots (
+      id TEXT PRIMARY KEY,
+      turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+      prompt TEXT NOT NULL,
+      attachments_json TEXT NOT NULL,
+      delivery_status TEXT NOT NULL DEFAULT 'PENDING',
+      delivery_error TEXT,
+      delivered_at INTEGER,
+      failed_at INTEGER,
+      unknown_at INTEGER,
+      captured_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS steer_input_snapshots_turn_idx
+      ON steer_input_snapshots(turn_id, captured_at, id);
+    CREATE TABLE IF NOT EXISTS attachment_cleanup_jobs (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      attachment_id TEXT NOT NULL,
+      relative_path TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(thread_id, attachment_id)
+    );
+    CREATE INDEX IF NOT EXISTS attachment_cleanup_jobs_status_idx
+      ON attachment_cleanup_jobs(status, created_at, id);
+  `);
+  ensureColumn(
+    sqlite,
+    "steer_input_snapshots",
+    "delivery_status",
+    "TEXT NOT NULL DEFAULT 'PENDING'",
+  );
+  ensureColumn(sqlite, "turn_input_snapshots", "goal_json", "TEXT");
+  ensureColumn(sqlite, "turn_input_snapshots", "plan_mode", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(sqlite, "thread_goals", "runtime_updated_at", "INTEGER");
+  ensureColumn(sqlite, "thread_goals", "revision", "INTEGER NOT NULL DEFAULT 1");
+  ensureColumn(sqlite, "thread_goals", "deleted_at", "INTEGER");
+  ensureColumn(sqlite, "steer_input_snapshots", "delivery_error", "TEXT");
+  ensureColumn(sqlite, "steer_input_snapshots", "delivered_at", "INTEGER");
+  ensureColumn(sqlite, "steer_input_snapshots", "failed_at", "INTEGER");
+  if (steerSnapshotNeedsUnknownMigration) {
+    rebuildSteerInputSnapshotsForUnknownDelivery(sqlite);
+  } else {
+    ensureColumn(sqlite, "steer_input_snapshots", "unknown_at", "INTEGER");
+  }
   ensureColumn(sqlite, "queue_entries", "required_account_id", "TEXT");
   ensureColumn(sqlite, "sessions", "persistent_at", "INTEGER");
   ensureColumn(sqlite, "feishu_credentials", "status", "TEXT NOT NULL DEFAULT 'CONNECTED'");
   ensureColumn(sqlite, "feishu_credentials", "last_refresh_error_code", "TEXT");
   ensureColumn(sqlite, "feishu_credentials", "reauth_required_at", "INTEGER");
+  ensureColumn(sqlite, "tool_calls", "response_json", "TEXT");
   backfillQueuedThreadAccountAffinity(sqlite);
   backfillTaskEventItemIds(sqlite);
   migrateApprovalsTable(sqlite);
+}
+
+function rebuildSteerInputSnapshotsForUnknownDelivery(sqlite: Database.Database): void {
+  sqlite.exec("BEGIN IMMEDIATE");
+  try {
+    sqlite.exec(`
+      DROP INDEX IF EXISTS steer_input_snapshots_turn_idx;
+      ALTER TABLE steer_input_snapshots RENAME TO steer_input_snapshots_legacy;
+      CREATE TABLE steer_input_snapshots (
+        id TEXT PRIMARY KEY,
+        turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+        prompt TEXT NOT NULL,
+        attachments_json TEXT NOT NULL,
+        delivery_status TEXT NOT NULL DEFAULT 'PENDING'
+          CHECK(delivery_status IN ('PENDING', 'DELIVERED', 'FAILED', 'UNKNOWN')),
+        delivery_error TEXT,
+        delivered_at INTEGER,
+        failed_at INTEGER,
+        unknown_at INTEGER,
+        captured_at INTEGER NOT NULL
+      );
+      INSERT INTO steer_input_snapshots (
+        id, turn_id, prompt, attachments_json, delivery_status, delivery_error,
+        delivered_at, failed_at, unknown_at, captured_at
+      )
+      SELECT
+        id, turn_id, prompt, attachments_json,
+        CASE WHEN delivery_status = 'PENDING' THEN 'UNKNOWN' ELSE delivery_status END,
+        CASE
+          WHEN delivery_status = 'PENDING'
+            THEN 'Legacy Steer delivery outcome is unknown'
+          ELSE delivery_error
+        END,
+        delivered_at, failed_at, NULL, captured_at
+      FROM steer_input_snapshots_legacy;
+      DROP TABLE steer_input_snapshots_legacy;
+      CREATE INDEX steer_input_snapshots_turn_idx
+        ON steer_input_snapshots(turn_id, captured_at, id);
+    `);
+    sqlite.exec("COMMIT");
+  } catch (error) {
+    sqlite.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 function backfillQueuedThreadAccountAffinity(sqlite: Database.Database): void {
@@ -462,7 +703,11 @@ function ensureColumn(
     | "tasks"
     | "turns"
     | "sessions"
-    | "feishu_credentials",
+    | "feishu_credentials"
+    | "steer_input_snapshots"
+    | "turn_input_snapshots"
+    | "thread_goals"
+    | "tool_calls",
   column:
     | "codex_home"
     | "quota_resets_at"
@@ -470,12 +715,33 @@ function ensureColumn(
     | "item_id"
     | "thread_config_json"
     | "archived_at"
+    | "lifecycle_state"
+    | "draft_expires_at"
     | "config_snapshot_json"
     | "persistent_at"
     | "status"
     | "last_refresh_error_code"
-    | "reauth_required_at",
-  definition: "TEXT" | "INTEGER" | "TEXT NOT NULL DEFAULT 'CONNECTED'",
+    | "reauth_required_at"
+    | "delivery_status"
+    | "delivery_error"
+    | "delivered_at"
+    | "failed_at"
+    | "unknown_at"
+    | "goal_json"
+    | "plan_mode"
+    | "composer_revision"
+    | "runtime_updated_at"
+    | "revision"
+    | "deleted_at"
+    | "response_json",
+  definition:
+    | "TEXT"
+    | "INTEGER"
+    | "INTEGER NOT NULL DEFAULT 1"
+    | "INTEGER NOT NULL DEFAULT 0"
+    | "TEXT NOT NULL DEFAULT 'CONNECTED'"
+    | "TEXT NOT NULL DEFAULT 'ACTIVE'"
+    | "TEXT NOT NULL DEFAULT 'PENDING'",
 ): void {
   const columns = sqlite.pragma(`table_info(${table})`) as Array<{ name: string }>;
   if (columns.some((entry) => entry.name === column)) return;
@@ -519,6 +785,7 @@ function deriveEventItemId(
 ): string {
   if (typeof payload.itemId === "string" && payload.itemId.length > 0) return payload.itemId;
   if (type === "PLAN_UPDATED") return `plan:${turnId ?? taskId}`;
+  if (type === "PROPOSED_PLAN_PUBLISHED") return `proposed-plan:${turnId ?? taskId}`;
   if (type === "DIFF_UPDATED") return `diff:${turnId ?? taskId}`;
   if (type === "QUEUED") return `queue:${taskId}`;
   if (type === "APPROVAL_DECIDED" && typeof payload.approvalId === "string") {

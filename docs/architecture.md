@@ -38,9 +38,47 @@ flowchart LR
 | `apps/api/src/auth` | 飞书 OAuth、租户校验、用户/Session、Token 刷新 |
 | `apps/api/src/domain` | Project/Thread/Turn/Item 投影、用户设置、审批、账号状态、租约、排队、用量与审计 |
 | `apps/api/src/infra/codex` | JSONL RPC、账号级 App Server、协议类型、Thread/Turn/Item/Subagent 事件规范化 |
-| `apps/api/src/tools` | `ActorContext` 绑定、飞书只读 Tool、安全 Demo SQL、Mock 业务 Tool |
+| `apps/api/src/tools` | `ActorContext` 绑定、飞书搜索/读取/受控 Docx 写 Tool、安全 Demo SQL、Mock 业务 Tool |
 | `apps/api/src/security` | AES-GCM Token 加密、运行环境白名单和 Codex 凭证隔离探针 |
 | `packages/contracts` | CODEX bootstrap、Thread/Turn/Item、Settings、Subagent、用量和事件 DTO |
+
+## Composer Draft、附件、Goal 与 Plan
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant W as Composer
+    participant A as Platform API
+    participant S as SQLite / Staging
+    participant R as Codex App Server
+
+    U->>W: 选择文件或设置 Goal
+    W->>A: 创建隐藏 Draft
+    A->>S: 保存 DRAFT 与隔离附件
+    A->>S: 扫描、ACL、配额与路径校验
+    U->>W: 提交文本或纯附件 Turn
+    W->>A: TurnInputBundle
+    A->>S: DRAFT 原子转 ACTIVE\n保存不可变输入快照
+    A->>R: thread/start 或 resume
+    A->>R: memoryMode=disabled
+    A->>R: goal/set（如有变更）
+    A->>R: turn/start + collaborationMode + inputs
+```
+
+- 隐藏 Draft 使用 `DRAFT → ACTIVE | EXPIRED` 生命周期，不进入用户历史列表。
+- 附件只存入 `<RUNTIME_DATA_DIR>/workspaces/<threadId>/.codexplatform/attachments/<attachmentId>/`；
+  目录为 `0700`、文件为 `0600`，浏览器永远不获得服务器绝对路径。
+- 单个附件根最多 50 MiB，单 Turn 200 MiB、32 个附件根、目录最多 500 个文件；不自动解压。
+- Goal 原生 Token 预算与平台 60 分钟 Watchdog 同时生效；预算到达后暂停，不自动重复外部副作用。
+- Plan mode 为 Thread sticky，使用锁定协议中的 collaboration preset；能力探测失败时拒绝启用。
+- Plan Adapter 同时接收增量 Plan 事件和最终 Agent Message 中的
+  `<proposed_plan>...</proposed_plan>`，归一化为可重放 `PROPOSED_PLAN_PUBLISHED` Item；标签本身
+  不进入 Agent 正文，右侧 Plan 使用独立 Markdown 投影。锁定版本对部分最终 Plan 只发送
+  `rawResponseItem/completed`，因此 `thread/start` 显式开启 `experimentalRawEvents`；Normalizer
+  仅接收最终 assistant `output_text`，丢弃 Raw reasoning、加密内容和未知 Item。
+- App Server 某些传输通知中的 Turn ID 与 `turn/start` 返回的规范 ID 可能不同。Adapter 以
+  `turn/start` 返回值作为根 Turn 的 canonical identity；平台仅在任务存在唯一活跃 Turn 时对缺失
+  identity 做安全回填，确保完成事件原子释放槽位并结束计时。
 
 ## 用户端与管理后台
 
@@ -97,7 +135,16 @@ GET  /api/projects
 POST /api/projects
 GET  /api/threads
 POST /api/threads
+POST /api/threads/drafts
 GET  /api/threads/:id
+DELETE /api/threads/:id/draft
+POST /api/threads/:id/attachments
+DELETE /api/threads/:id/attachments/:attachmentId
+GET /api/threads/:id/goal
+PUT /api/threads/:id/goal
+PATCH /api/threads/:id/goal
+DELETE /api/threads/:id/goal
+PATCH /api/threads/:id/composer
 POST /api/threads/:id/turns
 POST /api/threads/:id/steer
 POST /api/threads/:id/interrupt
@@ -240,6 +287,9 @@ sequenceDiagram
 使用 `thread/start/resume` 和 `turn/start/steer/interrupt`。协议类型锁定在仓库中，通过 `pnpm codex:verify-protocol` 检查漂移。
 HTTPS-only Provider 是当前固定 Codex 版本下的显式传输适配，不改变模型、账号或额度身份；Codex
 未来提供正式 transport 配置后再替换，替换前仍须通过模型目录、认证、额度和真实 Turn 合约回归。
+JSONL RPC 的默认等待窗口为 120 秒。`thread/start/resume` 超时会被归类为暂时 Runtime 不可用并
+返回 503；平台停止该 App Server 清理未知状态，但不会把账号隔离为协议安全故障，也不会自动重放
+尚未确认是否产生副作用的调用。
 
 ### active Turn fail closed
 
@@ -346,7 +396,11 @@ fail-closed 恢复；它降低共享 Home 的原生 Memory 串用风险，但不
 | --- | --- | --- |
 | `feishu_wiki_search` | 真实飞书搜索 | 当前用户 Token；只读 |
 | `feishu_doc_read` | 真实 Wiki/Docx | 当前用户 Token；只读文本块和引用 |
+| `feishu_doc_create` | 真实飞书 Docx | 当前用户 Token；仅自动审批权限模式；持久幂等回执 |
+| `feishu_doc_update` | 真实飞书 Docx | 当前用户 Token；append-only；仅自动审批权限模式；持久幂等回执 |
 | `demo_db_query` | 本地 Demo SQLite | 单条 allowlist `SELECT`，最多 100 行、256 KiB |
 | `demo_business_get` | 确定性 Mock | 仅 `order` / `customer`，不是实际业务系统 |
 
-Dynamic Tools 是 1.1A 的锁版本过渡适配层。生产版计划替换为正式 MCP Gateway。所有企业外部写操作在当前 MVP 中均未接入。
+Dynamic Tools 是 1.1A 的锁版本过渡适配层。生产版计划替换为正式 MCP Gateway。当前只开放飞书
+Docx 创建和追加写入，不支持块级替换、评论、Sheet/Base/Slides 写入。`Ask for approval` 暂未提供
+Tool 级交互审批卡，因此写 Tool 在该模式下 Fail Closed。
