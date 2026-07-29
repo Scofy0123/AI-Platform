@@ -2082,6 +2082,8 @@ describe("LocalPlatformService", () => {
           toolScopes: [
             "feishu_wiki_search",
             "feishu_doc_read",
+            "feishu_doc_create",
+            "feishu_doc_update",
             "demo_db_query",
             "demo_business_get",
           ],

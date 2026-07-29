@@ -143,7 +143,10 @@ pnpm test:e2e
 7. 打开 Composer 的 Model / Effort 选择器：选择 `Fake Deep` 后默认 Effort 应切换到 `high`，再选择 `xhigh` 并提交。
 8. Turn 完成后读取 `/api/threads/:id`，确认该 Turn 的 `model=fake-codex-deep`、`effort=xhigh`、
    `configSnapshot.permissionMode=APPROVE_FOR_ME`；只看选择器文案不能判定通过。
-9. 确认 Transcript 连续展示用户消息、Plan 更新、命令/Tool/Diff 活动摘要和最终回复；Markdown 粗体与代码应正确渲染，正文中不得出现独立的 `fake-codexplatform` 原始输出。
+9. 确认 Transcript 连续展示用户消息、Plan 更新、命令/Tool/Diff 活动摘要和最终回复；当 Runtime
+   以 `<proposed_plan>` 返回完整计划时，Transcript 不显示协议标签，右侧 Plan 展示标题与完整
+   Markdown，并且刷新页面后仍可从 SSE/数据库历史恢复。Markdown 粗体与代码应正确渲染，正文中
+   不得出现独立的 `fake-codexplatform` 原始输出。
 10. 点击命令活动行打开 Bottom Panel 的 Terminal，确认其中能看到 `fake-codexplatform`；Bottom Panel 不出现 Changes、Files 或 Tool details 标签。
 11. 依次打开 Pinned Summary、Side Panel 和 Bottom Panel，确认三者同时可见；单独关闭 Pinned Summary 后，Side 与 Bottom 仍保持打开。
 12. Side Panel 切换 Plan、Outputs、Subagents、Sources；再分别点击 Transcript 的 Tool 与 Diff/文件活动行，确认 Side Panel 进入对应详情并能返回父 Tab。Pinned Summary 打开时不改变正文宽度，Side Panel 打开时才压缩正文。
@@ -323,6 +326,29 @@ https://example.feishu.cn/wiki/replace-with-test-node
 
 注意：当前只支持 Wiki 指向的 Docx 和直接 Docx URL；Sheet/Base/Slides 不在本轮范围。
 
+### 创建与追加写入
+
+先在 Composer 将权限切换为 `Approve for me` 或 `Full access`，并关闭 Plan mode。提交：
+
+```text
+必须调用 feishu_doc_create 创建飞书文档，标题为“CodexPlatform Feishu Write UAT <时间戳>”，
+正文必须包含唯一哨兵 WRITE_UAT_<UUID>。完成后只返回文档 URL 和 revisionId。
+```
+
+检查：
+
+1. Transcript 出现 `feishu_doc_create` 紧凑 Tool 行，返回 URL 可打开。
+2. 使用当前飞书用户读取该文档，标题、哨兵和 revision 一致。
+3. 以同一 `callId` 重放不会产生第二份文档；数据库只保存参数摘要和脱敏回执，不保存 OAuth Token。
+4. 将权限切回 `Ask for approval` 后再次要求写入，必须明确拒绝且不产生文档；这是 1.1A 在 Tool
+   级交互审批卡交付前的 Fail Closed 边界。
+5. 对已有 UAT 文档调用 `feishu_doc_update` 时只允许追加正文；块级替换、评论和删除不属于当前能力。
+
+2026-07-29 已完成一次真实创建纵切：页面中的 Luna Turn 返回飞书 Docx URL 与 revision 2；
+`tool_calls` 为 `feishu_doc_create / SUCCEEDED`，审计为 `TOOL_INVOKED / SUCCESS`；再通过
+`lark-doc`/`lark-cli docs +fetch --scope full` 复读线上文档，标题、唯一哨兵和 revision 一致。
+该记录不代替后续每个 commit 的重复 Smoke。
+
 ## Demo Tool 验收
 
 在 real Codex Thread 中要求调用：
@@ -420,9 +446,10 @@ pnpm test:real-feishu
 | active Turn fail-closed | 自动测试 | 2026-07-27 | Codex | 自动通过 | adapter / service 测试 |
 | 5 人争抢 / 第 5 人排队 | fake + 自动测试 | 2026-07-27 | Codex | 自动通过 | lease / service 测试 |
 | 同用户 3 Turn | 自动测试 | 2026-07-27 | Codex | 自动通过 | lease / service 测试 |
-| 飞书 OAuth | fake/real 共用 |  |  | 未执行 | 回调与角色截图 |
+| 飞书 OAuth | fake/real 共用 | 2026-07-29 | Codex | 已通过（单用户） | 持久 Session + 当前用户 Tool 纵切 |
 | Feishu Tool 搜索/读取 | real |  |  | 未执行 | Tool 时间线 + 审计 |
-| Real Codex Smoke | real / 单 operator |  |  | 未执行 | 完整命令输出 |
+| Feishu Tool Docx 创建 | real | 2026-07-29 | Codex | 已通过（单用户） | 页面结果 + Tool/审计 + lark-cli 复读 |
+| Real Codex Smoke | real / 单 operator | 2026-07-29 | Codex | 已通过 | Plan / Goal / 文件 / 飞书写入纵切 |
 | Real Feishu Smoke | direct client |  |  | 未执行 | 脱敏命令输出 |
 | 凭证隔离探针 | real gate |  |  | 未执行 | 带时间与 commit 的脱敏探针 JSON |
 

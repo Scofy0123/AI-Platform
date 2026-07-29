@@ -142,6 +142,7 @@ export const TASK_EVENT_TYPES = [
   "AGENT_MESSAGE_PHASE",
   "REASONING_SUMMARY_DELTA",
   "PLAN_UPDATED",
+  "PROPOSED_PLAN_PUBLISHED",
   "COMMAND_STARTED",
   "COMMAND_OUTPUT",
   "COMMAND_COMPLETED",
@@ -423,6 +424,7 @@ export interface TaskEventPayloadMap {
   AGENT_MESSAGE_PHASE: { itemId: string; phase: AgentMessagePhase | null };
   REASONING_SUMMARY_DELTA: { itemId: string; delta: string };
   PLAN_UPDATED: { explanation: string | null; plan: unknown[] };
+  PROPOSED_PLAN_PUBLISHED: { itemId: string; title: string; markdown: string };
   COMMAND_STARTED: { itemId: string; command: string; cwd: string };
   COMMAND_OUTPUT: { itemId: string; delta: string };
   COMMAND_COMPLETED: {

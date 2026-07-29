@@ -208,6 +208,14 @@ describe("CodexEventNormalizer", () => {
           delta: "<proposed_plan>Final plan</proposed_plan>",
         },
       }),
+      expect.objectContaining({
+        type: "PROPOSED_PLAN_PUBLISHED",
+        payload: {
+          itemId: "message-final",
+          markdown: "Final plan",
+          title: "Final plan",
+        },
+      }),
     ]);
     expect(JSON.stringify(events)).not.toMatch(/private content|ciphertext/);
   });
@@ -280,8 +288,53 @@ describe("CodexEventNormalizer", () => {
           delta: "<proposed_plan>Final plan</proposed_plan>",
         },
       }),
+      expect.objectContaining({
+        type: "PROPOSED_PLAN_PUBLISHED",
+        payload: {
+          itemId: "message-final",
+          markdown: "Final plan",
+          title: "Final plan",
+        },
+      }),
     ]);
     expect(JSON.stringify(events)).not.toMatch(/private input|ciphertext/);
+  });
+
+  test("publishes a complete Markdown Plan without leaking content outside the envelope", () => {
+    const normalizer = new CodexEventNormalizer({ taskId: "task-1" });
+
+    const events = normalizer.normalizeNotification({
+      method: "item/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        item: {
+          type: "agentMessage",
+          id: "message-final",
+          text: [
+            "<proposed_plan>",
+            "# 华东出差计划",
+            "",
+            "## 行程",
+            "- 上海",
+            "- 杭州",
+            "</proposed_plan>",
+          ].join("\n"),
+          phase: "final_answer",
+        },
+      },
+    });
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "PROPOSED_PLAN_PUBLISHED",
+        payload: {
+          itemId: "message-final",
+          markdown: "# 华东出差计划\n\n## 行程\n- 上海\n- 杭州",
+          title: "华东出差计划",
+        },
+      }),
+    );
   });
 
   test("normalizes command completion, dynamic tools, approvals, and turn failure", () => {

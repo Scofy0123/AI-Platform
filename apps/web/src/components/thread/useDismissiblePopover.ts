@@ -29,7 +29,7 @@ export function useDismissiblePopover<TRoot extends HTMLElement>() {
   useEffect(() => {
     if (!open) return;
 
-    const handlePointerDown = (event: PointerEvent) => {
+    const handleOutsideInteraction = (event: Event) => {
       const target = event.target;
       if (target instanceof Node && !rootRef.current?.contains(target)) {
         close();
@@ -46,11 +46,13 @@ export function useDismissiblePopover<TRoot extends HTMLElement>() {
       }
     };
 
-    document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("pointerdown", handleOutsideInteraction, true);
+    document.addEventListener("click", handleOutsideInteraction, true);
     document.addEventListener("keydown", handleKeyDown);
     document.addEventListener(POPOVER_OPEN_EVENT, handleAnotherPopover);
     return () => {
-      document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("pointerdown", handleOutsideInteraction, true);
+      document.removeEventListener("click", handleOutsideInteraction, true);
       document.removeEventListener("keydown", handleKeyDown);
       document.removeEventListener(POPOVER_OPEN_EVENT, handleAnotherPopover);
     };

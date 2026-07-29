@@ -112,6 +112,8 @@ export async function createApplication(
     createFeishuClient: (accessToken) => new FeishuContentClient(accessToken),
     demoDatabase,
     onInvocation: (event) => platformStore.recordToolInvocation(event),
+    claimWriteInvocation: (event) => platformStore.claimToolWriteInvocation(event),
+    completeWriteInvocation: (event) => platformStore.completeToolWriteInvocation(event),
   });
 
   const execution = createExecutionAdapter(config, actors, tools);

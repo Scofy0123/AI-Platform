@@ -2872,6 +2872,113 @@ export class SQLitePlatformStore {
     });
   }
 
+  claimToolWriteInvocation(input: {
+    callId: string;
+    taskId: string;
+    turnId: string;
+    userId: string;
+    tool: string;
+    arguments: unknown;
+    startedAt: Date;
+  }):
+    | { kind: "CLAIMED" }
+    | { kind: "IN_PROGRESS" }
+    | { kind: "CONFLICT" }
+    | { kind: "REPLAY"; response: unknown } {
+    return this.immediateTransaction(() => {
+      const task = this.getTaskRow(input.taskId);
+      if (task.owner_id !== input.userId) throw new Error("Task not found");
+      const inputDigest = digestJson({ tool: input.tool, arguments: input.arguments });
+      const existing = this.sqlite
+        .prepare("SELECT * FROM tool_calls WHERE call_id = ?")
+        .get(input.callId) as Record<string, unknown> | undefined;
+      if (!existing) {
+        this.sqlite
+          .prepare(
+            `INSERT INTO tool_calls (
+              id, call_id, task_id, turn_id, user_id, tool, status, input_digest,
+              output_digest, response_json, started_at, completed_at
+             ) VALUES (?, ?, ?, ?, ?, ?, 'IN_PROGRESS', ?, NULL, NULL, ?, NULL)`,
+          )
+          .run(
+            randomUUID(),
+            input.callId,
+            input.taskId,
+            input.turnId,
+            input.userId,
+            input.tool,
+            inputDigest,
+            input.startedAt.getTime(),
+          );
+        return { kind: "CLAIMED" };
+      }
+      if (
+        existing.task_id !== input.taskId ||
+        existing.turn_id !== input.turnId ||
+        existing.user_id !== input.userId ||
+        existing.tool !== input.tool ||
+        existing.input_digest !== inputDigest
+      ) {
+        return { kind: "CONFLICT" };
+      }
+      if (existing.status === "IN_PROGRESS") return { kind: "IN_PROGRESS" };
+      if (typeof existing.response_json !== "string") return { kind: "CONFLICT" };
+      return { kind: "REPLAY", response: JSON.parse(existing.response_json) as unknown };
+    });
+  }
+
+  completeToolWriteInvocation(input: {
+    callId: string;
+    taskId: string;
+    turnId: string;
+    userId: string;
+    tool: string;
+    arguments: unknown;
+    response: unknown;
+    success: boolean;
+    startedAt: Date;
+    completedAt: Date;
+  }): void {
+    this.immediateTransaction(() => {
+      const task = this.getTaskRow(input.taskId);
+      if (task.owner_id !== input.userId) throw new Error("Task not found");
+      const toolCall = this.sqlite
+        .prepare("SELECT id, status FROM tool_calls WHERE call_id = ?")
+        .get(input.callId) as { id: string; status: string } | undefined;
+      if (toolCall?.status !== "IN_PROGRESS") {
+        throw new Error("Tool write claim is not active");
+      }
+      const update = this.sqlite
+        .prepare(
+          `UPDATE tool_calls
+             SET status = ?, output_digest = ?, response_json = ?, completed_at = ?
+           WHERE call_id = ? AND status = 'IN_PROGRESS'`,
+        )
+        .run(
+          input.success ? "SUCCEEDED" : "FAILED",
+          digestJson(input.response),
+          JSON.stringify(input.response),
+          input.completedAt.getTime(),
+          input.callId,
+        );
+      if (update.changes !== 1) throw new Error("Tool write claim completion lost");
+      this.insertAudit({
+        actorUserId: input.userId,
+        accountId: task.account_id,
+        accountAlias: task.account_alias,
+        leaseId: task.lease_id,
+        taskId: input.taskId,
+        threadId: task.thread_id,
+        turnId: input.turnId,
+        toolCallId: toolCall.id,
+        action: "TOOL_INVOKED",
+        outcome: input.success ? "SUCCESS" : "FAILED",
+        summary: `Enterprise tool invoked: ${input.tool}`,
+        now: input.completedAt,
+      });
+    });
+  }
+
   private requireUser(userId: string): void {
     const user = this.sqlite.prepare("SELECT 1 FROM users WHERE id = ?").get(userId);
     if (!user) throw new Error("User not found");
@@ -3203,6 +3310,7 @@ function deriveEventItemId(
 ): string {
   if (typeof payload.itemId === "string" && payload.itemId.length > 0) return payload.itemId;
   if (type === "PLAN_UPDATED") return `plan:${turnId ?? taskId}`;
+  if (type === "PROPOSED_PLAN_PUBLISHED") return `proposed-plan:${turnId ?? taskId}`;
   if (type === "DIFF_UPDATED") return `diff:${turnId ?? taskId}`;
   if (type === "QUEUED") return `queue:${taskId}`;
   if (type === "APPROVAL_DECIDED" && typeof payload.approvalId === "string") {
@@ -3222,6 +3330,7 @@ const PUBLIC_EVENT_PAYLOAD_KEYS = {
   AGENT_MESSAGE_PHASE: ["itemId", "phase"],
   REASONING_SUMMARY_DELTA: ["itemId", "delta"],
   PLAN_UPDATED: ["explanation", "plan"],
+  PROPOSED_PLAN_PUBLISHED: ["itemId", "title", "markdown"],
   COMMAND_STARTED: ["itemId", "command", "cwd"],
   COMMAND_OUTPUT: ["itemId", "delta"],
   COMMAND_COMPLETED: ["itemId", "command", "aggregatedOutput", "exitCode", "durationMs"],

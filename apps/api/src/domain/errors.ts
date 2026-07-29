@@ -89,3 +89,14 @@ export class PlanPresetModelUnavailableError extends DomainError {
     this.name = "PlanPresetModelUnavailableError";
   }
 }
+
+export class RuntimeRequestTimeoutError extends DomainError {
+  constructor(readonly method: string) {
+    super(
+      "RUNTIME_REQUEST_TIMEOUT",
+      "Codex Runtime took too long to prepare. Retry this Turn.",
+      503,
+    );
+    this.name = "RuntimeRequestTimeoutError";
+  }
+}

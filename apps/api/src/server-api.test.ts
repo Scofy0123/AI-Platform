@@ -14,6 +14,7 @@ import {
   GoalCapabilityUnavailableError,
   GoalMutationBlockedByPendingTurnError,
   PlanModeMutationBlockedError,
+  RuntimeRequestTimeoutError,
 } from "./domain/errors.js";
 import {
   ActiveTurnResumeConflictError,
@@ -854,6 +855,28 @@ describe("CodexPlatform HTTP API", () => {
     });
     expect(response.body).not.toContain("thread-internal");
     expect(response.body).not.toContain("turn-internal");
+  });
+
+  test("returns a retryable 503 when the App Server request times out", async () => {
+    const { auth, platform } = services();
+    platform.startTurn.mockRejectedValueOnce(new RuntimeRequestTimeoutError("thread/start"));
+    const app = buildApp({ auth, platform });
+    apps.push(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/tasks/task-1/turns",
+      cookies: { codexplatform_session: "valid-session" },
+      headers: { "x-csrf-token": "valid-csrf" },
+      payload: { prompt: "Retry when the Runtime is ready" },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: "RUNTIME_REQUEST_TIMEOUT",
+      code: "RUNTIME_REQUEST_TIMEOUT",
+      message: "Codex Runtime took too long to prepare. Retry this Turn.",
+    });
   });
 
   test("serves the 1.1 bootstrap and actor-aware Thread routes while preserving task routes", async () => {

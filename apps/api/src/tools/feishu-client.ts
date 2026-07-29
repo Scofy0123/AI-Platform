@@ -31,6 +31,17 @@ export interface FeishuDocument {
   blocks: FeishuDocumentBlock[];
 }
 
+export interface FeishuDocumentWriteResult {
+  documentId: string;
+  revisionId: number;
+  url: string;
+  blockCount: number;
+}
+
+export interface FeishuCreatedDocument extends FeishuDocumentWriteResult {
+  title: string;
+}
+
 export class FeishuContentError extends Error {
   readonly name = "FeishuContentError";
 
@@ -152,6 +163,83 @@ export class FeishuContentClient {
     };
   }
 
+  async createDocument(input: {
+    title: string;
+    content: string;
+    folderToken?: string;
+  }): Promise<FeishuCreatedDocument> {
+    const title = validateDocumentTitle(input.title);
+    const content = validateDocumentContent(input.content);
+    const body = await this.request("/open-apis/docx/v1/documents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        title,
+        ...(input.folderToken ? { folder_token: validateFolderToken(input.folderToken) } : {}),
+      }),
+    });
+    const document = asRecord(asRecord(body.data).document);
+    const documentId = requiredString(document.document_id, "document_id");
+    const createdRevisionId = numberOr(document.revision_id, 0);
+    const appended = await this.appendTextBlocks(documentId, content);
+    return {
+      documentId,
+      revisionId: appended.revisionId || createdRevisionId,
+      title: stringOr(document.title, title),
+      url: `https://feishu.cn/docx/${documentId}`,
+      blockCount: appended.blockCount,
+    };
+  }
+
+  async updateDocument(input: {
+    url: string;
+    content: string;
+  }): Promise<FeishuDocumentWriteResult> {
+    const parsed = parseDocumentUrl(input.url);
+    if (parsed.type !== "docx") {
+      throw new Error("Feishu document update currently requires a Docx URL");
+    }
+    const appended = await this.appendTextBlocks(
+      parsed.token,
+      validateDocumentContent(input.content),
+    );
+    return {
+      documentId: parsed.token,
+      revisionId: appended.revisionId,
+      url: input.url,
+      blockCount: appended.blockCount,
+    };
+  }
+
+  private async appendTextBlocks(
+    documentId: string,
+    content: string,
+  ): Promise<{ revisionId: number; blockCount: number }> {
+    const textBlocks = contentToTextBlocks(content);
+    let revisionId = 0;
+    for (let index = 0; index < textBlocks.length; index += 50) {
+      const batch = textBlocks.slice(index, index + 50);
+      const body = await this.request(
+        `/open-apis/docx/v1/documents/${encodeURIComponent(documentId)}/blocks/${encodeURIComponent(documentId)}/children`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+          body: JSON.stringify({
+            index: -1,
+            children: batch.map((text) => ({
+              block_type: 2,
+              text: {
+                elements: [{ text_run: { content: text } }],
+              },
+            })),
+          }),
+        },
+      );
+      revisionId = numberOr(asRecord(body.data).document_revision_id, revisionId);
+    }
+    return { revisionId, blockCount: textBlocks.length };
+  }
+
   private async request(path: string, init: RequestInit = {}): Promise<Record<string, unknown>> {
     const response = await this.fetch(`https://open.feishu.cn${path}`, {
       ...init,
@@ -190,6 +278,42 @@ function parseDocumentUrl(input: string): { type: "wiki" | "docx"; token: string
     throw new Error("Feishu document input must be a Wiki or Docx URL");
   }
   return { type: match[1] as "wiki" | "docx", token: match[2] };
+}
+
+function validateDocumentTitle(value: string): string {
+  const title = value.trim();
+  if (title.length < 1 || title.length > 800) {
+    throw new Error("Feishu document title must contain between 1 and 800 characters");
+  }
+  return title;
+}
+
+function validateDocumentContent(value: string): string {
+  const content = value.trim();
+  if (content.length < 1 || content.length > 100_000) {
+    throw new Error("Feishu document content must contain between 1 and 100000 characters");
+  }
+  return content;
+}
+
+function validateFolderToken(value: string): string {
+  if (!/^[A-Za-z0-9_-]{4,256}$/.test(value)) {
+    throw new Error("Invalid Feishu folder token");
+  }
+  return value;
+}
+
+function contentToTextBlocks(content: string): string[] {
+  const blocks: string[] = [];
+  for (const line of content.split(/\r?\n/).map((item) => item.trim())) {
+    if (!line) continue;
+    for (let offset = 0; offset < line.length; offset += 2_000) {
+      blocks.push(line.slice(offset, offset + 2_000));
+    }
+  }
+  if (blocks.length === 0) throw new Error("Feishu document content contains no readable text");
+  if (blocks.length > 500) throw new Error("Feishu document content exceeds the 500 block limit");
+  return blocks;
 }
 
 function extractBlockText(block: Record<string, unknown>): string {

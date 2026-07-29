@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import type { ActorContext, EffectiveThreadConfigSnapshot } from "@codexplatform/contracts";
 import { describe, expect, test, vi } from "vitest";
+import { RuntimeRequestTimeoutError } from "../../domain/errors.js";
 import {
   ActiveTurnResumeConflictError,
   type ApprovalDraft,
@@ -14,6 +15,7 @@ import {
 } from "./app-server-execution-adapter.js";
 import type { Model } from "./generated/v2/Model.js";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse.js";
+import { RpcRequestTimeoutError } from "./jsonl-rpc-client.js";
 
 const TEST_EXECUTION_CONTEXT: {
   effectiveConfig: EffectiveThreadConfigSnapshot;
@@ -234,6 +236,60 @@ describe("AppServerExecutionAdapter", () => {
       vi.mocked(runtime.startTurn).mock.invocationCallOrder[0] as number,
     );
   });
+
+  test.each([
+    ["thread/start", null],
+    ["thread/resume", "thread-1"],
+  ] as const)(
+    "treats a %s timeout as temporary Runtime unavailability instead of quarantining the account",
+    async (method, existingThreadId) => {
+      const rpc = new FakeRpc();
+      const runtime = runtimePort();
+      if (existingThreadId) {
+        vi.mocked(runtime.resumeThread).mockRejectedValue(
+          new RpcRequestTimeoutError(method, 120_000),
+        );
+      } else {
+        vi.mocked(runtime.startThread).mockRejectedValue(
+          new RpcRequestTimeoutError(method, 120_000),
+        );
+      }
+      const stopAccount = vi.fn(async () => undefined);
+      const adapter = new AppServerExecutionAdapter({
+        supervisor: {
+          startAccount: async () => ({ accountId: "account-1", rpc, runtime }),
+          stopAccount,
+          stopAll: async () => undefined,
+        },
+        tools: { definitions: () => [], invoke: async () => ({ success: true, contentItems: [] }) },
+        actors: new ActorRegistry(),
+      });
+      const crashes: unknown[] = [];
+      adapter.on("accountCrashed", (event) => crashes.push(event));
+
+      const error = await adapter
+        .startTask({
+          accountId: "account-1",
+          codexHome: "/tmp/account-1",
+          taskId: "task-1",
+          userId: "user-1",
+          cwd: "/workspace",
+          prompt: "Try after a temporary timeout",
+          existingThreadId,
+          ...TEST_EXECUTION_CONTEXT,
+        })
+        .catch((cause: unknown) => cause);
+
+      expect(error).toBeInstanceOf(RuntimeRequestTimeoutError);
+      expect(error).toMatchObject({
+        code: "RUNTIME_REQUEST_TIMEOUT",
+        httpStatus: 503,
+      });
+      expect(stopAccount).toHaveBeenCalledWith("account-1");
+      expect(crashes).toEqual([]);
+      expect(runtime.startTurn).not.toHaveBeenCalled();
+    },
+  );
 
   test("starts a new Turn after resuming a system-error Thread with no in-progress Turn", async () => {
     const rpc = new FakeRpc();

@@ -2195,6 +2195,60 @@ describe("SQLitePlatformStore", () => {
       ]),
     );
   });
+
+  test("claims Feishu writes before side effects and replays only the persisted receipt", () => {
+    const project = store.createProject({ ownerId: "user-1", name: "Platform", now: NOW });
+    const task = store.createTask({
+      ownerId: "user-1",
+      projectId: project.id,
+      title: "Write enterprise data",
+      now: NOW,
+    });
+    const input = {
+      callId: "write-call-1",
+      taskId: task.id,
+      turnId: "turn-1",
+      userId: "user-1",
+      tool: "feishu_doc_create",
+      arguments: { title: "confidential-title", content: "confidential-body" },
+      startedAt: NOW,
+    };
+
+    expect(store.claimToolWriteInvocation(input)).toEqual({ kind: "CLAIMED" });
+    expect(store.claimToolWriteInvocation(input)).toEqual({ kind: "IN_PROGRESS" });
+
+    const response = {
+      success: true,
+      contentItems: [
+        {
+          type: "inputText",
+          text: JSON.stringify({
+            documentId: "doc-1",
+            url: "https://feishu.cn/docx/doc-1",
+            revisionId: 2,
+          }),
+        },
+      ],
+    };
+    store.completeToolWriteInvocation({
+      ...input,
+      response,
+      success: true,
+      completedAt: new Date(NOW.getTime() + 5),
+    });
+
+    expect(store.claimToolWriteInvocation(input)).toEqual({ kind: "REPLAY", response });
+    expect(
+      store.claimToolWriteInvocation({
+        ...input,
+        arguments: { title: "different", content: "different" },
+      }),
+    ).toEqual({ kind: "CONFLICT" });
+    const persisted = database.sqlite
+      .prepare("SELECT input_digest, response_json FROM tool_calls WHERE call_id = ?")
+      .get(input.callId);
+    expect(JSON.stringify(persisted)).not.toMatch(/confidential-title|confidential-body/);
+  });
 });
 
 function seedUser(

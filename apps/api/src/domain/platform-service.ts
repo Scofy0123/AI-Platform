@@ -1695,12 +1695,19 @@ export class LocalPlatformService implements PlatformApi {
     });
   }
 
-  private actorContextFor(userId: string): ActorContext {
+  private actorContextFor(
+    userId: string,
+    effectiveConfig: EffectiveThreadConfigSnapshot,
+  ): ActorContext {
     const identity = this.options.store.getUserIdentity(userId);
     return {
       ...identity,
       toolScopes: [...ORGANIZATION_TOOL_SCOPES],
-      approvalPolicy: "ASK",
+      approvalPolicy:
+        effectiveConfig.permissionMode === "APPROVE_FOR_ME" ||
+        effectiveConfig.permissionMode === "FULL_ACCESS"
+          ? "AUTO"
+          : "ASK",
     };
   }
 
@@ -2347,7 +2354,7 @@ export class LocalPlatformService implements PlatformApi {
         prompt: queuedTurn.prompt,
         existingThreadId: task.threadId,
         effectiveConfig,
-        actorContext: this.actorContextFor(queuedTurn.ownerId),
+        actorContext: this.actorContextFor(queuedTurn.ownerId, effectiveConfig),
         goal: this.options.store.getTurnInputSnapshot(allocation.turnId)?.goal ?? null,
         onThreadPrepared: (threadId) => {
           this.options.store.bindTaskRuntime(queuedTurn.taskId, {
@@ -2706,6 +2713,8 @@ const ORGANIZATION_DEFAULT_CONFIG: EffectiveConfigOverride = {
 const ORGANIZATION_TOOL_SCOPES = [
   "feishu_wiki_search",
   "feishu_doc_read",
+  "feishu_doc_create",
+  "feishu_doc_update",
   "demo_db_query",
   "demo_business_get",
 ] as const;

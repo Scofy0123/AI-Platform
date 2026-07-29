@@ -50,6 +50,7 @@ import {
   PermissionModePicker,
 } from "./components/thread/PermissionModePicker.js";
 import { PinnedExecutionSummary } from "./components/thread/PinnedExecutionSummary.js";
+import { SafeMarkdown } from "./components/thread/SafeMarkdown.js";
 import { SidePanel } from "./components/thread/SidePanel.js";
 import { Transcript } from "./components/thread/Transcript.js";
 import { useComposerSession } from "./components/thread/useComposerSession.js";
@@ -1589,7 +1590,7 @@ function PinnedSummaryContent({
           onClick={() => onOpenSide({ kind: "plan" })}
         >
           {summary?.plan
-            ? summary.plan.explanation || `${summary.plan.steps.length} steps`
+            ? summary.plan.title || summary.plan.explanation || `${summary.plan.steps.length} steps`
             : "No plan yet"}
         </button>
       </section>
@@ -1649,7 +1650,7 @@ function PlanPanel({ plan }: { plan: ThreadPresentation["side"]["plan"] }) {
   const steps = plan.steps.map((item, index) => readPlanStep(item, index));
   return (
     <div className="v11-rail-list">
-      <p>{plan.explanation}</p>
+      {plan.markdown ? <SafeMarkdown content={plan.markdown} /> : <p>{plan.explanation}</p>}
       {steps.map((step, index) => (
         <div key={step.label}>
           <span>{index + 1}</span> {step.label}

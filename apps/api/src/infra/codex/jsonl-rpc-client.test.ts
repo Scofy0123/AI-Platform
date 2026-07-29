@@ -1,8 +1,17 @@
 import { PassThrough, Writable } from "node:stream";
 import { describe, expect, test, vi } from "vitest";
-import { JsonlRpcClient, type RpcError } from "./jsonl-rpc-client.js";
+import {
+  DEFAULT_RPC_REQUEST_TIMEOUT_MS,
+  JsonlRpcClient,
+  type RpcError,
+  RpcRequestTimeoutError,
+} from "./jsonl-rpc-client.js";
 
 describe("JsonlRpcClient", () => {
+  test("allows slow real App Server requests to run for two minutes by default", () => {
+    expect(DEFAULT_RPC_REQUEST_TIMEOUT_MS).toBe(120_000);
+  });
+
   test("correlates requests and responses over newline-delimited JSON", async () => {
     const serverOutput = new PassThrough();
     const clientOutput = new PassThrough();
@@ -135,6 +144,20 @@ describe("JsonlRpcClient", () => {
     });
     secondWritable.emit("close");
     await expect(closedWrite).rejects.toThrow("writable transport closed");
+  });
+
+  test("returns a typed timeout without misclassifying it as a protocol safety failure", async () => {
+    const client = new JsonlRpcClient({
+      readable: new PassThrough(),
+      writable: new PassThrough(),
+      requestTimeoutMs: 5,
+    });
+
+    const error = await client.request("thread/start").catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(RpcRequestTimeoutError);
+    expect(error).toMatchObject({ method: "thread/start", timeoutMs: 5 });
+    client.close();
   });
 });
 

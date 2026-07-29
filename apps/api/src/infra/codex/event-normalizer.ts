@@ -344,6 +344,16 @@ export class CodexEventNormalizer {
         }),
       );
     }
+    const proposedPlan = phase === "final_answer" ? extractProposedPlan(completedText) : null;
+    if (proposedPlan) {
+      events.push(
+        this.event("PROPOSED_PLAN_PUBLISHED", threadId, turnId, {
+          itemId,
+          title: proposedPlan.title,
+          markdown: proposedPlan.markdown,
+        }),
+      );
+    }
     return events;
   }
 
@@ -508,6 +518,25 @@ function normalizeAgentMessagePhase(
   value: unknown,
 ): TaskEventPayloadMap["AGENT_MESSAGE_PHASE"]["phase"] {
   return value === "commentary" || value === "final_answer" ? value : null;
+}
+
+function extractProposedPlan(text: string): { title: string; markdown: string } | null {
+  const match = text.match(/<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i);
+  const markdown = match?.[1]?.trim();
+  if (!markdown) return null;
+  const heading = markdown
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^#{1,6}\s+\S/.test(line));
+  const firstLine =
+    markdown
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) ?? "Plan";
+  return {
+    markdown,
+    title: (heading?.replace(/^#{1,6}\s+/, "").trim() ?? firstLine).slice(0, 200),
+  };
 }
 
 function normalizeModelRerouteReason(

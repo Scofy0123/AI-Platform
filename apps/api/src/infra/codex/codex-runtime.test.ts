@@ -400,6 +400,7 @@ describe("CodexAppServerRuntime", () => {
           approvalPolicy: "on-request",
           sandbox: "workspace-write",
           ephemeral: false,
+          experimentalRawEvents: true,
         },
       },
       {
@@ -687,6 +688,7 @@ describe("CodexAppServerRuntime", () => {
           developerInstructions: "Use the employee's Feishu identity.",
           personality: "friendly",
           ephemeral: false,
+          experimentalRawEvents: true,
         },
       },
       {

@@ -8,7 +8,7 @@ import {
   type ThreadGoalView,
 } from "@codexplatform/contracts";
 import type { InternalAccount } from "../../domain/account-admin-store.js";
-import { GoalSyncConflictError } from "../../domain/errors.js";
+import { GoalSyncConflictError, RuntimeRequestTimeoutError } from "../../domain/errors.js";
 import type {
   ApprovalDraft,
   AttachedGoalRuntimeResult,
@@ -39,6 +39,7 @@ import type { FileChangeRequestApprovalResponse } from "./generated/v2/FileChang
 import type { Model } from "./generated/v2/Model.js";
 import type { PermissionsRequestApprovalResponse } from "./generated/v2/PermissionsRequestApprovalResponse.js";
 import type { ThreadResumeResponse } from "./generated/v2/ThreadResumeResponse.js";
+import { RpcRequestTimeoutError } from "./jsonl-rpc-client.js";
 
 interface RpcPort extends EventEmitter {
   respond(id: number | string, result: unknown): Promise<void>;
@@ -366,6 +367,10 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         }
         assertMemoryDisabledResponse(await managed.runtime.disableThreadMemory(threadId));
       } catch (error) {
+        if (error instanceof RpcRequestTimeoutError) {
+          await this.options.supervisor.stopAccount?.(input.accountId).catch(() => undefined);
+          throw new RuntimeRequestTimeoutError(error.method);
+        }
         const safetyError =
           error instanceof ThreadResumeSafetyError
             ? error
@@ -391,6 +396,10 @@ export class AppServerExecutionAdapter extends EventEmitter implements TaskExecu
         );
         assertMemoryDisabledResponse(await managed.runtime.disableThreadMemory(threadId));
       } catch (error) {
+        if (error instanceof RpcRequestTimeoutError) {
+          await this.options.supervisor.stopAccount?.(input.accountId).catch(() => undefined);
+          throw new RuntimeRequestTimeoutError(error.method);
+        }
         const safetyError =
           error instanceof ThreadResumeSafetyError
             ? error

@@ -76,6 +76,53 @@ function subagent(parentTurnId: string): SubagentThread {
 }
 
 describe("Thread presentation projection", () => {
+  test("projects a final proposed Plan into the transcript and pinned Plan panel", () => {
+    const events = [
+      event({
+        sequence: 1,
+        turnId: "turn-1",
+        itemId: "message-final",
+        type: "AGENT_MESSAGE_DELTA",
+        payload: {
+          itemId: "message-final",
+          delta: "<proposed_plan>\n# 华东出差计划\n\n- 上海\n- 杭州\n</proposed_plan>",
+        },
+      }),
+      event({
+        sequence: 2,
+        turnId: "turn-1",
+        itemId: "message-final",
+        type: "AGENT_MESSAGE_PHASE",
+        payload: { itemId: "message-final", phase: "final_answer" },
+      }),
+      event({
+        sequence: 3,
+        turnId: "turn-1",
+        itemId: "message-final",
+        type: "PROPOSED_PLAN_PUBLISHED",
+        payload: {
+          itemId: "message-final",
+          markdown: "# 华东出差计划\n\n- 上海\n- 杭州",
+          title: "华东出差计划",
+        },
+      }),
+    ];
+
+    const presentation = projectThreadPresentation(events, [turn("turn-1", "制定出差计划")], []);
+
+    expect(presentation.transcript.groups[0]?.finalAnswer?.text).toBe(
+      "# 华东出差计划\n\n- 上海\n- 杭州",
+    );
+    expect(presentation.side.plan).toEqual(
+      expect.objectContaining({
+        itemId: "message-final",
+        title: "华东出差计划",
+        markdown: "# 华东出差计划\n\n- 上海\n- 杭州",
+      }),
+    );
+    expect(presentation.pinned?.plan?.title).toBe("华东出差计划");
+  });
+
   test("separates Codex commentary execution from the final answer independent of phase arrival order", () => {
     const presentation = projectThreadPresentation(
       [

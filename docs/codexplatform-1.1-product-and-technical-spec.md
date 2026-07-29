@@ -110,7 +110,12 @@ Composer：
 - Goal：使用稳定的 `thread/goal/set|get|clear`，属于 Thread 持久状态，跨 Turn 保留；支持编辑、
   暂停、恢复、完成和清除。原生 Token 预算默认为 200k，平台 Watchdog 默认 60 分钟，先到者暂停。
 - Plan mode：使用锁定版本的实验性 `collaborationMode=plan`。选择为 Thread sticky，对当前及后续
-  新 Turn 生效，直到用户关闭；活动 Turn 期间禁止切换，Steer 继承当前 Turn 快照。
+  新 Turn 生效，直到用户关闭；活动 Turn 期间禁止切换，Steer 继承当前 Turn 快照。Runtime 既可能
+  发送增量 `turn/plan/updated`，也可能在最终 Agent Message 中返回完整
+  `<proposed_plan>...</proposed_plan>`；Adapter 将两者统一投影为 Plan Item。协议标签不会进入
+  Transcript，最终 Plan 的标题与 Markdown 正文会进入右侧 Plan 和 SSE 历史重放。当前锁定版本
+  必须在 `thread/start` 开启 `experimentalRawEvents` 才能收到部分最终 Plan；该内部事件桥只接受
+  `assistant` 的最终 `output_text`，原始推理、加密内容和未知 Raw Item 一律丢弃。
 - 在 `/threads/new` 首次选择文件或设置 Goal 时创建隐藏 Draft；Draft 不出现在左侧历史中，首次发送
   原子转为正式 Thread，废弃 Draft 与暂存文件自动过期清理。
 - Record a skill、Plugins、Apps、Skills 和 Files and chats 属于后续能力，本轮不展示。它们只有在
@@ -346,7 +351,7 @@ Tenant
 - `ProductMode = CODEX | CHAT | WORK`；1.1 的 enabled modes 只有 `CODEX`。
 - `Thread`：Project、用户、Runtime、账号粘性、父子关系和配置。
 - `Turn`：Prompt、模型、Effort、权限模式、状态和 Token。
-- `ThreadItem`：Message、Plan、ReasoningSummary、Command、Tool、Diff、Approval、SubagentActivity、Result。
+- `ThreadItem`：Message、Plan、ProposedPlan、ReasoningSummary、Command、Tool、Diff、Approval、SubagentActivity、Result。
 - `ModelOption`：Runtime 模型 ID、显示名、默认值、支持的 Effort、输入模态、Personality 与可见性。
 - `ModelCatalog`：账号或 Runtime 作用域的模型列表、读取时间、缓存状态和目录版本。
 - `TranscriptEntry`：由一个或多个 Item 事件投影出的用户消息、Agent 正文或紧凑活动行。
@@ -436,6 +441,10 @@ flowchart TB
 - Transcript Markdown 禁用原始 HTML和远程图片，链接只允许受控协议，不能使用 `dangerouslySetInnerHTML`。
 - 子 Thread 不能被其他用户复用；所有列表、详情、SSE 和审批接口执行 owner ACL。
 - 外部写操作要求审批和幂等键；副作用已经发生时不自动重试。
+- 1.1A 已接入 `feishu_doc_create` 与 append-only `feishu_doc_update`。它们只使用当前飞书用户
+  OAuth Token；`Ask for approval` 下 Fail Closed，选择 `Approve for me` 或 `Full access` 后才允许
+  Runtime 发起写调用。平台以 `callId + argument digest` 持久化写入占位和脱敏回执：相同调用重放
+  返回原回执，不再次写入；结果未知时进入恢复态，不把“再试一次”当作安全重试。
 
 ## 8. 账号调度与额度
 
@@ -457,6 +466,8 @@ operator”门禁约束。只有 1.1B 通过 OpenAI 许可、独立 Worker / `CO
 
 - 固定使用 `@openai/codex@0.144.6`。
 - 平台到 App Server 的传输固定为 stdio JSONL，不使用实验性的网络监听模式。
+- stdio RPC 默认等待窗口为 120 秒；超时返回可重试的 `RUNTIME_REQUEST_TIMEOUT`，停止当前
+  App Server 进程以清理未知启动状态，但不会把账号误标为协议安全异常或自动重放 Turn。
 - App Server 到 OpenAI 使用平台内部 HTTPS-only Provider，复用现有 ChatGPT 登录认证，并声明
   `supports_websockets=false`；它用于消除当前环境 WebSocket 握手超时后的回退等待，不改变模型、
   额度和账号归属。
@@ -595,9 +606,13 @@ flowchart LR
 - 本轮 PR Head 已实现并通过 Runtime 模型目录、模型/Effort 联动、连续 Transcript、三个独立
   Workspace Surface、安全 Markdown、复合 Item 详情边界和运行路径脱敏。
 - Files/Folders、隐藏 Draft、Goal 和 Plan mode 已实现并完成自动化验证；2026-07-29
-  `pnpm verify` 通过 694 项 Vitest、14 项 Playwright、协议校验和 Production Build。
+  `pnpm verify` 通过 711 项 Vitest、14 项 Playwright、协议校验和 Production Build。
 - real Runtime 单操作者纵切已完成 Plan 规划 Turn、关闭 Plan 后的真实文件创建/回读 Turn、
   Goal 跨 Turn 保留，以及页面、SSE、SQLite、工作区文件和 Runtime 结果的交叉复核。该结论不扩大
   为真实多人、正式恶意文件扫描或 1.1B 生产隔离已完成。
-- 真实飞书 Tool 需要当前飞书用户 Token 和可读测试文档，必须独立验收。
+- Plan 最终协议归一化、飞书文档创建/追加写入、当前用户身份绑定和写调用幂等已完成自动化测试。
+  2026-07-29 已完成单操作者真实纵切：Luna Turn 调用 `feishu_doc_create`，页面返回 revision 2，
+  SQLite 同时关联当前飞书用户、Codex 租约和 Tool 审计，随后使用 `lark-doc`/`lark-cli` 以用户
+  身份复读线上文档并核对标题与唯一哨兵。该证据只证明当前用户的 Docx 创建链路，不扩大为
+  `Ask for approval` 交互审批、块级编辑或真实多人隔离已交付。
 - 生产多人执行、独立 Worker、Credential Broker、正式 MCP Gateway、PostgreSQL、消息总线、KMS 和 HA 属于 1.1B 规划，不属于 1.1A 已实现能力。

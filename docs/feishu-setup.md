@@ -40,6 +40,8 @@ auth:user.id:read
 offline_access
 search:docs:read
 docx:document:readonly
+docx:document
+docx:document:create
 wiki:node:read
 wiki:node:retrieve
 wiki:space:retrieve
@@ -52,7 +54,9 @@ wiki:space:retrieve
 3. 记录 App ID、App Secret 和企业 Tenant Key。
 4. 记录首位管理员的用户 OpenID。当前 MVP 只把 `FEISHU_ADMIN_OPEN_IDS` 的第一项识别为管理员和 real 模式 operator。
 
-权限分为“应用后台已开通”和“用户已在 OAuth 页面同意”两层。任意一层缺失，飞书 Tool 都可能返回权限不足。
+权限分为“应用后台已开通”和“用户已在 OAuth 页面同意”两层。任意一层缺失，飞书 Tool 都可能返回
+权限不足。新增写权限后必须发布新的应用版本，并让测试用户重新授权；平台不会读取或复用宿主机
+`lark-cli` 的用户 Token。
 
 ## 3. 填写本机配置
 
@@ -106,6 +110,11 @@ pnpm dev
 真实 Feishu Tool 只在 `RUNTIME_MODE=real` 的 Codex Dynamic Tool 流程中被 Agent 调用。先完成 [首个 Codex 账号交互登录](security-and-operations.md#首个-codex-账号交互登录)，再按 [Feishu Tool 端到端验收](acceptance.md#feishu-tool-端到端验收)执行。
 
 如果只想独立验证飞书 API Client，可运行 gated Feishu smoke。它需要当前用户的临时 OAuth access token，默认不会运行；不要从数据库中人工解密或导出生产 Token。
+
+创建/追加写入的 Runtime UAT 必须在 Composer 选择 `Approve for me`，因为 1.1A 尚未交付
+`Ask for approval` 的 Tool 级审批卡。成功后应同时核对页面 Tool 行、SQLite Tool/审计关联，并用
+`lark-cli docs +fetch --doc <URL> --scope full --format json` 以用户身份复读线上 revision。该 CLI
+复读仅作独立验收，不会把 CLI Token 注入 CodexPlatform。
 
 ## 常见错误
 

@@ -373,6 +373,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   status TEXT NOT NULL,
   input_digest TEXT NOT NULL,
   output_digest TEXT,
+  response_json TEXT,
   started_at INTEGER NOT NULL,
   completed_at INTEGER
 );
@@ -525,6 +526,7 @@ export function migrateDatabase(sqlite: Database.Database): void {
   ensureColumn(sqlite, "feishu_credentials", "status", "TEXT NOT NULL DEFAULT 'CONNECTED'");
   ensureColumn(sqlite, "feishu_credentials", "last_refresh_error_code", "TEXT");
   ensureColumn(sqlite, "feishu_credentials", "reauth_required_at", "INTEGER");
+  ensureColumn(sqlite, "tool_calls", "response_json", "TEXT");
   backfillQueuedThreadAccountAffinity(sqlite);
   backfillTaskEventItemIds(sqlite);
   migrateApprovalsTable(sqlite);
@@ -704,7 +706,8 @@ function ensureColumn(
     | "feishu_credentials"
     | "steer_input_snapshots"
     | "turn_input_snapshots"
-    | "thread_goals",
+    | "thread_goals"
+    | "tool_calls",
   column:
     | "codex_home"
     | "quota_resets_at"
@@ -729,7 +732,8 @@ function ensureColumn(
     | "composer_revision"
     | "runtime_updated_at"
     | "revision"
-    | "deleted_at",
+    | "deleted_at"
+    | "response_json",
   definition:
     | "TEXT"
     | "INTEGER"
@@ -781,6 +785,7 @@ function deriveEventItemId(
 ): string {
   if (typeof payload.itemId === "string" && payload.itemId.length > 0) return payload.itemId;
   if (type === "PLAN_UPDATED") return `plan:${turnId ?? taskId}`;
+  if (type === "PROPOSED_PLAN_PUBLISHED") return `proposed-plan:${turnId ?? taskId}`;
   if (type === "DIFF_UPDATED") return `diff:${turnId ?? taskId}`;
   if (type === "QUEUED") return `queue:${taskId}`;
   if (type === "APPROVAL_DECIDED" && typeof payload.approvalId === "string") {

@@ -268,6 +268,7 @@ export class CodexAppServerRuntime {
         ? threadConfigParams(input.effectiveConfig)
         : { approvalPolicy: "on-request" as const, sandbox: "workspace-write" as const }),
       ephemeral: false,
+      experimentalRawEvents: true,
     } satisfies ThreadStartParams;
     const response = await this.rpc.request("thread/start", params);
     const threadId = extractResponseThreadId(response);

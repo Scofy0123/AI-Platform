@@ -55,7 +55,7 @@ describe("ModelEffortPicker", () => {
     fireEvent.click(trigger);
     expect(screen.getByRole("listbox", { name: "Runtime models" })).toBeInTheDocument();
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Outside" }));
+    fireEvent.click(screen.getByRole("button", { name: "Outside" }));
 
     expect(screen.queryByRole("listbox", { name: "Runtime models" })).not.toBeInTheDocument();
     expect(trigger).toHaveAttribute("aria-expanded", "false");

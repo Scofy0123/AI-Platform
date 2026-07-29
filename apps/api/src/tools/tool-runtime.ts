@@ -29,6 +29,8 @@ interface ActorContext extends EnterpriseActorContext {
 interface FeishuClientPort {
   search(query: string, options?: { pageSize?: number; pageToken?: string }): Promise<unknown>;
   readDocument(url: string): Promise<unknown>;
+  createDocument(input: { title: string; content: string; folderToken?: string }): Promise<unknown>;
+  updateDocument(input: { url: string; content: string }): Promise<unknown>;
 }
 
 interface EnterpriseToolRuntimeOptions {
@@ -41,6 +43,20 @@ interface EnterpriseToolRuntimeOptions {
   createFeishuClient: (accessToken: string) => FeishuClientPort | FeishuContentClient;
   demoDatabase: SafeDemoDatabase;
   onInvocation?: (event: ToolInvocationAudit) => void | Promise<void>;
+  claimWriteInvocation?: (
+    event: Omit<ToolInvocationAudit, "response" | "success" | "completedAt">,
+  ) =>
+    | Promise<
+        | { kind: "CLAIMED" }
+        | { kind: "IN_PROGRESS" }
+        | { kind: "CONFLICT" }
+        | { kind: "REPLAY"; response: unknown }
+      >
+    | { kind: "CLAIMED" }
+    | { kind: "IN_PROGRESS" }
+    | { kind: "CONFLICT" }
+    | { kind: "REPLAY"; response: unknown };
+  completeWriteInvocation?: (event: ToolInvocationAudit) => void | Promise<void>;
 }
 
 export interface ToolInvocationAudit {
@@ -85,6 +101,33 @@ export class EnterpriseToolRuntime {
         required: ["url"],
         properties: { url: { type: "string", format: "uri" } },
       }),
+      definition(
+        "feishu_doc_create",
+        "Create a Feishu Docx as the authenticated employee. This is an external write and requires an automatically approved Turn.",
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["title", "content"],
+          properties: {
+            title: { type: "string", minLength: 1, maxLength: 800 },
+            content: { type: "string", minLength: 1, maxLength: 100_000 },
+            folderToken: { type: "string", minLength: 4, maxLength: 256 },
+          },
+        },
+      ),
+      definition(
+        "feishu_doc_update",
+        "Append content to a Feishu Docx visible to the authenticated employee. This is an external write and requires an automatically approved Turn.",
+        {
+          type: "object",
+          additionalProperties: false,
+          required: ["url", "content"],
+          properties: {
+            url: { type: "string", format: "uri" },
+            content: { type: "string", minLength: 1, maxLength: 100_000 },
+          },
+        },
+      ),
       definition("demo_db_query", "Run one read-only SELECT against the demo database", {
         type: "object",
         additionalProperties: false,
@@ -114,6 +157,9 @@ export class EnterpriseToolRuntime {
     if (!actor.toolScopes.includes(call.tool)) {
       return failure("Enterprise tool is not allowed for this actor");
     }
+    if (isFeishuWriteTool(call.tool) && actor.approvalPolicy !== "AUTO") {
+      return failure("Feishu document writes require Approve for me or Full access for this Turn");
+    }
 
     const key = `${call.threadId}:${call.turnId}:${call.callId}`;
     const fingerprint = digest({
@@ -129,6 +175,27 @@ export class EnterpriseToolRuntime {
     }
 
     const startedAt = new Date();
+    let durableWriteClaimed = false;
+    if (isFeishuWriteTool(call.tool) && this.options.claimWriteInvocation) {
+      const claim = await this.options.claimWriteInvocation({
+        callId: call.callId,
+        taskId: actor.taskId,
+        threadId: call.threadId,
+        turnId: call.turnId,
+        userId: actor.userId,
+        tool: call.tool,
+        arguments: call.arguments,
+        startedAt,
+      });
+      if (claim.kind === "REPLAY") return storedDynamicToolResponse(claim.response);
+      if (claim.kind === "IN_PROGRESS") {
+        return failure("Feishu write outcome is awaiting recovery; the write was not repeated");
+      }
+      if (claim.kind === "CONFLICT") {
+        return failure("Tool callId was replayed with different arguments");
+      }
+      durableWriteClaimed = true;
+    }
     let response: DynamicToolResponse;
     try {
       const args = asRecord(call.arguments);
@@ -145,6 +212,25 @@ export class EnterpriseToolRuntime {
             await this.options
               .createFeishuClient(actor.accessToken)
               .readDocument(requiredString(args.url, "url")),
+          );
+          break;
+        case "feishu_doc_create": {
+          const folderToken = optionalString(args.folderToken, "folderToken");
+          response = success(
+            await this.options.createFeishuClient(actor.accessToken).createDocument({
+              title: requiredString(args.title, "title"),
+              content: requiredString(args.content, "content"),
+              ...(folderToken ? { folderToken } : {}),
+            }),
+          );
+          break;
+        }
+        case "feishu_doc_update":
+          response = success(
+            await this.options.createFeishuClient(actor.accessToken).updateDocument({
+              url: requiredString(args.url, "url"),
+              content: requiredString(args.content, "content"),
+            }),
           );
           break;
         case "demo_db_query":
@@ -164,21 +250,30 @@ export class EnterpriseToolRuntime {
     } catch (error) {
       response = failure(safeErrorMessage(error));
     }
-    if (this.options.onInvocation) {
+    const invocation = {
+      callId: call.callId,
+      taskId: actor.taskId,
+      threadId: call.threadId,
+      turnId: call.turnId,
+      userId: actor.userId,
+      tool: call.tool,
+      arguments: call.arguments,
+      response,
+      success: response.success,
+      startedAt,
+      completedAt: new Date(),
+    } satisfies ToolInvocationAudit;
+    if (durableWriteClaimed && this.options.completeWriteInvocation) {
       try {
-        await this.options.onInvocation({
-          callId: call.callId,
-          taskId: actor.taskId,
-          threadId: call.threadId,
-          turnId: call.turnId,
-          userId: actor.userId,
-          tool: call.tool,
-          arguments: call.arguments,
-          response,
-          success: response.success,
-          startedAt,
-          completedAt: new Date(),
-        });
+        await this.options.completeWriteInvocation(invocation);
+      } catch {
+        response = failure(
+          "Feishu write completed but its durable receipt failed; recovery is required",
+        );
+      }
+    } else if (this.options.onInvocation) {
+      try {
+        await this.options.onInvocation(invocation);
       } catch {
         response = failure("Tool audit persistence failed");
       }
@@ -227,6 +322,37 @@ function asRecord(value: unknown): Record<string, unknown> {
 function requiredString(value: unknown, field: string): string {
   if (typeof value !== "string" || value.length === 0) throw new Error(`Missing ${field}`);
   return value;
+}
+
+function optionalString(value: unknown, field: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || value.length === 0) throw new Error(`Invalid ${field}`);
+  return value;
+}
+
+function isFeishuWriteTool(tool: string): boolean {
+  return tool === "feishu_doc_create" || tool === "feishu_doc_update";
+}
+
+function storedDynamicToolResponse(value: unknown): DynamicToolResponse {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return failure("Stored Tool receipt is invalid; recovery is required");
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.success !== "boolean" || !Array.isArray(record.contentItems)) {
+    return failure("Stored Tool receipt is invalid; recovery is required");
+  }
+  const contentItems = record.contentItems.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const content = item as Record<string, unknown>;
+    return content.type === "inputText" && typeof content.text === "string"
+      ? [{ type: "inputText" as const, text: content.text }]
+      : [];
+  });
+  if (contentItems.length !== record.contentItems.length) {
+    return failure("Stored Tool receipt is invalid; recovery is required");
+  }
+  return { success: record.success, contentItems };
 }
 
 function digest(value: unknown): string {
